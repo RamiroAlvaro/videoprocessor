@@ -1821,9 +1821,32 @@ void CVideoProcessorDlg::OnBnClickedRendererRestart()
 
 	if (m_rendererState == RendererState::RENDERSTATE_FAILED)
 		m_rendererState = RendererState::RENDERSTATE_UNKNOWN;
+	if (ShouldCoalesceRendererRestart(
+		m_rendererState == RendererState::RENDERSTATE_STOPPING,
+		m_rendererRetirementPending))
+	{
+		// The combo boxes already contain the latest desired renderer and
+		// settings.  The replacement graph will consume them, so do not leave a
+		// second restart armed behind the transition already in progress.
+		m_wantToRestartRenderer = false;
+		m_rendererRestartDeferredLogged = false;
+		CString selectedRenderer;
+		const int selectedIndex = m_rendererCombo.GetCurSel();
+		if (selectedIndex >= 0)
+			m_rendererCombo.GetLBText(selectedIndex, selectedRenderer);
+		DebugLog::Log(
+			"Renderer restart coalesced: state=%d retirement_pending=%d "
+			"selected_renderer=%S action=apply-to-pending-replacement",
+			static_cast<int>(m_rendererState),
+			m_rendererRetirementPending ? 1 : 0,
+			static_cast<LPCTSTR>(selectedRenderer));
+		UpdateState();
+		return;
+	}
 
 	m_postRendererStartRequiresGraph = true;
 	m_wantToRestartRenderer = true;
+	m_rendererRestartDeferredLogged = false;
 	UpdateState();
 }
 
@@ -2896,6 +2919,17 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 		assert(oldRendererState == RendererState::RENDERSTATE_STOPPING);
 
 		m_restartQueuedBecauseEotf = false;
+		if (m_rendererStopStartedTick != 0)
+		{
+			DebugLog::Log(
+				"Renderer stop completed: renderer=%S generation=%u elapsed_ms=%llu",
+				static_cast<LPCTSTR>(m_activeRendererName),
+				m_rendererGeneration.load(std::memory_order_acquire),
+				static_cast<unsigned long long>(
+					GetTickCount64() - m_rendererStopStartedTick));
+			m_rendererStopStartedTick = 0;
+			m_rendererStopLastStatusTick = 0;
+		}
 
 		RenderRemove();
 		RenderGUIClear();
@@ -3775,20 +3809,31 @@ void CVideoProcessorDlg::UpdateState()
 		return;
 	}
 
-	// Somebody wants to restart rendering
-	if (m_rendererState == RendererState::RENDERSTATE_RENDERING &&
-		m_wantToRestartRenderer)
+	// Somebody wants to restart rendering. A reset already owns the renderer
+	// transition, so leave the intent latched until its completion calls us
+	// again. Never stop now and carry the same intent into the replacement.
+	const RendererRestartDisposition restartDisposition =
+		EvaluateRendererRestart(
+			m_rendererState == RendererState::RENDERSTATE_RENDERING,
+			m_wantToRestartRenderer,
+			RendererResetOperationInProgress());
+	if (restartDisposition ==
+		RendererRestartDisposition::DeferUntilResetCompletes)
+	{
+		if (!m_rendererRestartDeferredLogged)
+		{
+			m_rendererRestartDeferredLogged = true;
+			DebugLog::Log(
+				"Renderer restart deferred: generation=%u reason=reset-in-progress",
+				m_rendererGeneration.load(std::memory_order_acquire));
+		}
+		return;
+	}
+	if (restartDisposition == RendererRestartDisposition::BeginStop)
 	{
 		DbgLog((LOG_TRACE, 1, TEXT("CVideoProcessorDlg::UpdateState(): - Asked to restart renderer")));
-
-		if (RendererResetOperationInProgress())
-		{
-			// Keep the intent latched. Reset completion calls UpdateState again,
-			// at which point teardown can safely begin.
-			RenderStop();
-			return;
-		}
 		m_wantToRestartRenderer = false;
+		m_rendererRestartDeferredLogged = false;
 		RenderStop();
 		return;
 	}
@@ -4697,6 +4742,8 @@ void CVideoProcessorDlg::RenderStop()
 	const std::shared_ptr<RendererIngressState> ingress =
 		m_rendererIngressState;
 	const ULONGLONG stopQueuedTick = GetTickCount64();
+	m_rendererStopStartedTick = stopQueuedTick;
+	m_rendererStopLastStatusTick = stopQueuedTick;
 	DebugLog::Log(
 		"Renderer stop dispatch: phase=before-stop generation=%u renderer_state=%d foreground=%p focus=%p",
 		m_rendererGeneration.load(std::memory_order_acquire),
@@ -7043,6 +7090,26 @@ void CVideoProcessorDlg::OnTimer(UINT_PTR nIDEvent)
 {
 	const ULONGLONG uiNow = GetTickCount64();
 	m_lastUiMessageTick.store(uiNow, std::memory_order_release);
+	if (m_rendererState == RendererState::RENDERSTATE_STOPPING &&
+		m_rendererStopStartedTick != 0 &&
+		uiNow - m_rendererStopLastStatusTick >= 1000)
+	{
+		const ULONGLONG elapsedMs = uiNow - m_rendererStopStartedTick;
+		CString status;
+		status.Format(TEXT("Stopping renderer (%.1fs)"), elapsedMs / 1000.0);
+		m_rendererStateText.SetWindowText(status);
+		m_rendererStopLastStatusTick = uiNow;
+		if (elapsedMs >= 5000 && ((elapsedMs / 5000) !=
+			((elapsedMs - 1000) / 5000)))
+		{
+			DebugLog::Log(
+				"Renderer stop pending: renderer=%S generation=%u elapsed_ms=%llu "
+				"state=stopping ui-responsive=1",
+				static_cast<LPCTSTR>(m_activeRendererName),
+				m_rendererGeneration.load(std::memory_order_acquire),
+				static_cast<unsigned long long>(elapsedMs));
+		}
+	}
 	if (m_rendererResetCoordinator)
 	{
 		const RendererResetCoordinator::Diagnostics diagnostics =

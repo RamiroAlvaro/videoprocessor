@@ -479,6 +479,8 @@ protected:
 	CString m_retiringRendererName;
 	uint32_t m_retiringRendererGeneration = 0;
 	RendererState m_rendererState = RendererState::RENDERSTATE_UNKNOWN;
+	ULONGLONG m_rendererStopStartedTick = 0;
+	ULONGLONG m_rendererStopLastStatusTick = 0;
 	RendererTransitionWindow m_rendererTransitionWindow;
 	HWND m_rendererTargetHwnd = nullptr;
 	bool m_preserveFullscreenHostForProfileRestart = false;
@@ -564,6 +566,7 @@ protected:
 	//PixelValueRange m_desiredRendererPixelValueRange = PixelValueRange::PIXELVALUERANGE_UNKNOWN;  // = let render decide
 	bool m_wantToRestartCapture = false;
 	bool m_wantToRestartRenderer = false;
+	bool m_rendererRestartDeferredLogged = false;
 	bool m_wantToTerminate = false;
 
 	// Stats overlay

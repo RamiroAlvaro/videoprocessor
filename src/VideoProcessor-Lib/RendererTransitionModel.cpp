@@ -3,6 +3,27 @@
 #include <RendererTransitionModel.h>
 
 
+RendererRestartDisposition EvaluateRendererRestart(
+	bool rendererIsRendering,
+	bool restartRequested,
+	bool resetOperationInProgress)
+{
+	if (!rendererIsRendering || !restartRequested)
+		return RendererRestartDisposition::None;
+	if (resetOperationInProgress)
+		return RendererRestartDisposition::DeferUntilResetCompletes;
+	return RendererRestartDisposition::BeginStop;
+}
+
+
+bool ShouldCoalesceRendererRestart(
+	bool rendererIsStopping,
+	bool rendererRetirementPending)
+{
+	return rendererIsStopping || rendererRetirementPending;
+}
+
+
 RendererTransitionModel::Actions RendererTransitionModel::BeginReset(
 	uint32_t rendererGeneration,
 	uint64_t targetRevision)

@@ -46,6 +46,27 @@ enum class RendererTransitionActionType
 };
 
 
+// Renderer restarts requested while a queue reset owns the transition shield
+// must wait for that reset to finish.  Starting teardown immediately while
+// retaining the request starts the replacement renderer twice.
+enum class RendererRestartDisposition
+{
+	None,
+	DeferUntilResetCompletes,
+	BeginStop
+};
+
+
+RendererRestartDisposition EvaluateRendererRestart(
+	bool rendererIsRendering,
+	bool restartRequested,
+	bool resetOperationInProgress);
+
+bool ShouldCoalesceRendererRestart(
+	bool rendererIsStopping,
+	bool rendererRetirementPending);
+
+
 struct RendererTransitionAction
 {
 	RendererTransitionActionType type =

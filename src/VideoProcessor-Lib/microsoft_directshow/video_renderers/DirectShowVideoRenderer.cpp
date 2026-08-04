@@ -1586,6 +1586,19 @@ void DirectShowVideoRenderer::GraphTeardownNoThrow() noexcept
 	phaseStarted = GetTickCount64();
 	try
 	{
+		// Keep the no-throw teardown equivalent to GraphTeardown().  Releasing
+		// the graph while externally-held source and renderer filters remain
+		// connected can leave madVR waiting for its upstream pin during its final
+		// COM release.
+		LiveSourceDisconnect();
+	}
+	catch (...)
+	{
+	}
+	logPhase("live-source-disconnect", phaseStarted);
+	phaseStarted = GetTickCount64();
+	try
+	{
 		FilterGraphDestroy();
 	}
 	catch (...)
@@ -1923,19 +1936,23 @@ void DirectShowVideoRenderer::LiveSourceDisconnect()
 		IEnumPins* pEnum = nullptr;
 		IPin* pLiveSourceOutputPin = nullptr;
 
-		if (FAILED(m_liveSource->EnumPins(&pEnum)))
+		const HRESULT enumResult = m_liveSource->EnumPins(&pEnum);
+		if (FAILED(enumResult))
 			throw std::runtime_error("Failed to get livesource pin enumerator");
 
-		if (pEnum->Next(1, &pLiveSourceOutputPin, nullptr) != S_OK)
-			throw std::runtime_error("Failed to run next on livesource pin");
-
+		const HRESULT nextResult =
+			pEnum->Next(1, &pLiveSourceOutputPin, nullptr);
 		pEnum->Release();
 		pEnum = nullptr;
+		if (nextResult != S_OK)
+			throw std::runtime_error("Failed to run next on livesource pin");
 
-		if (FAILED(m_pGraph->Disconnect(pLiveSourceOutputPin)))
-			throw std::runtime_error("Failed to disconnect pins");
-
+		const HRESULT disconnectResult =
+			m_pGraph->Disconnect(pLiveSourceOutputPin);
 		pLiveSourceOutputPin->Release();
+		pLiveSourceOutputPin = nullptr;
+		if (FAILED(disconnectResult))
+			throw std::runtime_error("Failed to disconnect pins");
 	}
 }
 

@@ -46,6 +46,34 @@ namespace Tests
 	TEST_CLASS(RendererTransitionModelTests)
 	{
 	public:
+		TEST_METHOD(RestartWaitsForActiveResetThenStopsExactlyOnce)
+		{
+			Assert::IsTrue(
+				EvaluateRendererRestart(true, true, true) ==
+				RendererRestartDisposition::DeferUntilResetCompletes);
+			Assert::IsTrue(
+				EvaluateRendererRestart(true, true, false) ==
+				RendererRestartDisposition::BeginStop);
+		}
+
+		TEST_METHOD(RestartPolicyIgnoresMissingIntentOrNonRenderingState)
+		{
+			Assert::IsTrue(
+				EvaluateRendererRestart(true, false, false) ==
+				RendererRestartDisposition::None);
+			Assert::IsTrue(
+				EvaluateRendererRestart(false, true, false) ==
+				RendererRestartDisposition::None);
+		}
+
+		TEST_METHOD(RestartSelectionCoalescesIntoPendingReplacement)
+		{
+			Assert::IsTrue(ShouldCoalesceRendererRestart(true, false));
+			Assert::IsTrue(ShouldCoalesceRendererRestart(false, true));
+			Assert::IsTrue(ShouldCoalesceRendererRestart(true, true));
+			Assert::IsFalse(ShouldCoalesceRendererRestart(false, false));
+		}
+
 		TEST_METHOD(ResetCannotStartBeforeMatchingShieldAck)
 		{
 			RendererTransitionModel model;
