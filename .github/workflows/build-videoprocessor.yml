@@ -1,0 +1,125 @@
+name: Build VideoProcessor v1.2.001-beta
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show source revision
+        shell: pwsh
+        run: |
+          git log -1 --oneline
+          git status
+
+      - name: Install required VS2019 components
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          $installPath = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.Component.MSBuild `
+            -property installationPath
+
+          if (-not $installPath) {
+            throw "Visual Studio installation not found"
+          }
+
+          Write-Host "Visual Studio installation: $installPath"
+
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+
+          $arguments = @(
+            "modify",
+            "--installPath", "`"$installPath`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.MFC",
+            "--add", "Microsoft.VisualStudio.Component.Windows10SDK.19041",
+            "--add", "Microsoft.VisualStudio.Component.Windows11SDK.26100",
+            "--quiet",
+            "--norestart"
+          )
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList $arguments `
+            -Wait `
+            -PassThru
+
+          Write-Host "Visual Studio Installer exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+            throw "Visual Studio Installer failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Show MSBuild version
+        shell: pwsh
+        run: |
+          msbuild -version
+
+      - name: Build VideoProcessor GUI x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Build VP Renderer x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Write-Host "=== x64 Release output ==="
+          Get-ChildItem .\x64\Release -Recurse | Select-Object FullName
+
+          $exe = Get-ChildItem .\x64\Release -Filter "*.exe" -Recurse
+
+          if (-not $exe) {
+            throw "No executable was generated"
+          }
+
+          Write-Host "Generated executables:"
+          $exe | ForEach-Object { Write-Host $_.FullName }
+
+          git rev-parse HEAD |
+            Out-File .\x64\Release\BUILD_COMMIT.txt -Encoding ascii
+
+      - name: Package build
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path .\x64\Release\* `
+            -DestinationPath .\VideoProcessor-v1.2.001-beta-x64.zip `
+            -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoProcessor-v1.2.001-beta-x64
+          path: VideoProcessor-v1.2.001-beta-x64.zip
+          retention-days: 14
