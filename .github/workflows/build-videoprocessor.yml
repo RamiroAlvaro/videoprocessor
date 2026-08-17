@@ -9,7 +9,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout source
@@ -23,7 +23,12 @@ jobs:
           git log -1 --oneline
           git status
 
-      - name: Install required VS2019 components
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install required Visual Studio components
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -73,133 +78,209 @@ jobs:
         run: |
           msbuild -version
 
+      - name: Install Qt 6.8.3 for Config editor
+        shell: pwsh
+        run: |
+          .\scripts\bootstrap-config-editor-qt.ps1
+
       - name: Build VideoProcessor GUI x64 Release
         shell: pwsh
         run: |
-          $solutionDir = "$env:GITHUB_WORKSPACE\"
-          $outDir = "$env:GITHUB_WORKSPACE\x64\Release\"
-
           msbuild .\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj `
             /m `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            "/p:SolutionDir=$solutionDir" `
-            "/p:OutDir=$outDir" `
             /verbosity:minimal
 
       - name: Build VP Renderer x64 Release
         shell: pwsh
         run: |
-          $solutionDir = "$env:GITHUB_WORKSPACE\"
-
           msbuild .\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj `
             /m `
             /p:Configuration=Release `
             /p:Platform=x64 `
-            "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
 
-      - name: Verify compiled files
+      - name: Build Config Discovery x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\src\VideoProcessor-ConfigDiscovery\VideoProcessor-ConfigDiscovery.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Build Config Editor x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\src\VideoProcessor-Config\VideoProcessor-Config.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Prepare canonical build root
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=== x64 Release tree ==="
+          $buildRoot = Join-Path $env:GITHUB_WORKSPACE "x64\Release"
 
-          if (-not (Test-Path .\x64\Release)) {
-            throw "x64\Release directory was not generated"
+          if (Test-Path $buildRoot) {
+            Remove-Item $buildRoot -Recurse -Force
           }
 
-          Get-ChildItem .\x64\Release -Recurse |
+          New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+          Write-Host "Finding VideoProcessor GUI..."
+
+          $gui = Get-ChildItem . `
+            -Filter "VideoProcessor-GUI.exe" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $gui) {
+            $gui = Get-ChildItem . `
+              -Filter "VideoProcessor.exe" `
+              -File `
+              -Recurse |
+              Select-Object -First 1
+          }
+
+          if (-not $gui) {
+            throw "VideoProcessor GUI executable not found"
+          }
+
+          Copy-Item `
+            $gui.FullName `
+            (Join-Path $buildRoot "VideoProcessor-GUI.exe") `
+            -Force
+
+          Write-Host "Finding Config editor..."
+
+          $configExe = Get-ChildItem .\src\VideoProcessor-Config `
+            -Filter "VideoProcessorConfig.exe" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $configExe) {
+            throw "VideoProcessorConfig.exe not found"
+          }
+
+          $configDir = $configExe.Directory.FullName
+
+          Write-Host "Config runtime directory:"
+          Write-Host $configDir
+
+          # Config executable
+          Copy-Item `
+            $configExe.FullName `
+            (Join-Path $buildRoot "VideoProcessorConfig.exe") `
+            -Force
+
+          # Config discovery DLL
+          $discovery = Get-ChildItem $configDir `
+            -Filter "VideoProcessorConfigDiscovery.dll" `
+            -File |
+            Select-Object -First 1
+
+          if (-not $discovery) {
+            $discovery = Get-ChildItem .\src\VideoProcessor-ConfigDiscovery `
+              -Filter "VideoProcessorConfigDiscovery.dll" `
+              -File `
+              -Recurse |
+              Select-Object -First 1
+          }
+
+          if (-not $discovery) {
+            throw "VideoProcessorConfigDiscovery.dll not found"
+          }
+
+          Copy-Item `
+            $discovery.FullName `
+            (Join-Path $buildRoot "VideoProcessorConfigDiscovery.dll") `
+            -Force
+
+          # Qt runtime files produced by windeployqt
+          Get-ChildItem $configDir -Filter "Qt6*.dll" -File |
+            ForEach-Object {
+              Copy-Item $_.FullName $buildRoot -Force
+            }
+
+          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) {
+            Copy-Item `
+              (Join-Path $configDir "opengl32sw.dll") `
+              $buildRoot `
+              -Force
+          }
+
+          $qtPluginDirs = @(
+            "generic",
+            "iconengines",
+            "imageformats",
+            "networkinformation",
+            "platforms",
+            "styles",
+            "tls"
+          )
+
+          foreach ($dir in $qtPluginDirs) {
+            $source = Join-Path $configDir $dir
+
+            if (Test-Path $source) {
+              Copy-Item `
+                $source `
+                (Join-Path $buildRoot $dir) `
+                -Recurse `
+                -Force
+            }
+          }
+
+          # VP Renderer plugin
+          $renderer = Get-ChildItem . `
+            -Filter "VideoProcessorVPRenderer.dll" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $renderer) {
+            throw "VideoProcessorVPRenderer.dll not found"
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path (Join-Path $buildRoot "vprenderer") `
+            -Force | Out-Null
+
+          Copy-Item `
+            $renderer.FullName `
+            (Join-Path $buildRoot "vprenderer\VideoProcessorVPRenderer.dll") `
+            -Force
+
+          Write-Host "=== Canonical build root ==="
+          Get-ChildItem $buildRoot -Recurse |
             Select-Object FullName
 
-          if (-not (Test-Path .\x64\Release\VideoProcessor-GUI.exe)) {
-            throw "VideoProcessor-GUI.exe was not generated"
-          }
-
-          if (-not (Test-Path .\x64\Release\vprenderer\VideoProcessorVPRenderer.dll)) {
-            throw "VideoProcessorVPRenderer.dll was not generated"
-          }
-
-          Write-Host "Main executable OK"
-          Write-Host "VP Renderer OK"
-
-      - name: Prepare distribution
+      - name: Build official release package
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          .\tools\package_release.ps1
 
-          Remove-Item .\dist -Recurse -Force -ErrorAction SilentlyContinue
-
-          New-Item `
-            -ItemType Directory `
-            -Path .\dist `
-            -Force | Out-Null
-
-          New-Item `
-            -ItemType Directory `
-            -Path .\dist\vprenderer `
-            -Force | Out-Null
-
-          # Official release layout renames
-          # VideoProcessor-GUI.exe -> VideoProcessor.exe
-          Copy-Item `
-            .\x64\Release\VideoProcessor-GUI.exe `
-            .\dist\VideoProcessor.exe `
-            -Force
-
-          # Copy VP Renderer and all runtime dependencies
-          Copy-Item `
-            .\x64\Release\vprenderer\* `
-            .\dist\vprenderer `
-            -Recurse `
-            -Force
-
-          # Configuration template
-          if (Test-Path .\VideoProcessor.cfg) {
-            Copy-Item `
-              .\VideoProcessor.cfg `
-              .\dist\VideoProcessor.cfg `
-              -Force
-
-            Copy-Item `
-              .\VideoProcessor.cfg `
-              .\dist\VideoProcessor.cfg.example `
-              -Force
-          }
-
-          # Documentation
-          if (Test-Path .\CONFIGURATION.html) {
-            Copy-Item `
-              .\CONFIGURATION.html `
-              .\dist\CONFIGURATION.html `
-              -Force
-          }
-
-          # Shaders
-          if (Test-Path .\shaders) {
-            Copy-Item `
-              .\shaders `
-              .\dist\shaders `
-              -Recurse `
-              -Force
-          }
-
-          # Record exact source revision
-          git rev-parse HEAD |
-            Out-File `
-              .\dist\BUILD_COMMIT.txt `
-              -Encoding ascii
-
-          Write-Host "=== FINAL DISTRIBUTION ==="
-          Get-ChildItem .\dist -Recurse |
+      - name: Show official release tree
+        shell: pwsh
+        run: |
+          Get-ChildItem `
+            .\artifacts\release\VideoProcessor `
+            -Recurse |
             Select-Object FullName
 
-      - name: Package build
+      - name: Create ZIP
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path .\dist\* `
+            -Path .\artifacts\release\VideoProcessor\* `
             -DestinationPath .\VideoProcessor-v1.2.001-beta-x64.zip `
             -Force
 
