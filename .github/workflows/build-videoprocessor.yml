@@ -91,29 +91,101 @@ jobs:
             /p:Platform=x64 `
             /verbosity:minimal
 
-      - name: Show build output
+      - name: Prepare distribution
         shell: pwsh
         run: |
-          Write-Host "=== x64 Release output ==="
-          Get-ChildItem .\x64\Release -Recurse | Select-Object FullName
+          $ErrorActionPreference = "Stop"
 
-          $exe = Get-ChildItem .\x64\Release -Filter "*.exe" -Recurse
+          Write-Host "Searching compiled VideoProcessor files..."
+
+          $exe = Get-ChildItem `
+            -Path . `
+            -Filter "VideoProcessor.exe" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
 
           if (-not $exe) {
-            throw "No executable was generated"
+            throw "VideoProcessor.exe was not found"
           }
 
-          Write-Host "Generated executables:"
-          $exe | ForEach-Object { Write-Host $_.FullName }
+          $renderer = Get-ChildItem `
+            -Path . `
+            -Filter "VideoProcessorVPRenderer.dll" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $renderer) {
+            throw "VideoProcessorVPRenderer.dll was not found"
+          }
+
+          Write-Host "GUI executable found at:"
+          Write-Host $exe.FullName
+
+          Write-Host "VP Renderer found at:"
+          Write-Host $renderer.FullName
+
+          New-Item `
+            -ItemType Directory `
+            -Path .\dist `
+            -Force | Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Path .\dist\vprenderer `
+            -Force | Out-Null
+
+          Write-Host "Copying complete GUI output..."
+          Copy-Item `
+            -Path "$($exe.Directory.FullName)\*" `
+            -Destination .\dist `
+            -Recurse `
+            -Force
+
+          Write-Host "Copying complete VP Renderer output..."
+          Copy-Item `
+            -Path "$($renderer.Directory.FullName)\*" `
+            -Destination .\dist\vprenderer `
+            -Recurse `
+            -Force
+
+          if (Test-Path .\VideoProcessor.cfg) {
+            Copy-Item `
+              .\VideoProcessor.cfg `
+              .\dist\VideoProcessor.cfg `
+              -Force
+          }
+
+          if (Test-Path .\CONFIGURATION.html) {
+            Copy-Item `
+              .\CONFIGURATION.html `
+              .\dist\CONFIGURATION.html `
+              -Force
+          }
+
+          if (Test-Path .\shaders) {
+            Copy-Item `
+              .\shaders `
+              .\dist\shaders `
+              -Recurse `
+              -Force
+          }
 
           git rev-parse HEAD |
-            Out-File .\x64\Release\BUILD_COMMIT.txt -Encoding ascii
+            Out-File `
+              .\dist\BUILD_COMMIT.txt `
+              -Encoding ascii
+
+          Write-Host "=== FINAL DISTRIBUTION ==="
+          Get-ChildItem .\dist -Recurse |
+            Select-Object FullName
 
       - name: Package build
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path .\x64\Release\* `
+            -Path .\dist\* `
             -DestinationPath .\VideoProcessor-v1.2.001-beta-x64.zip `
             -Force
 
