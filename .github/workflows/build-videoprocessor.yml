@@ -76,55 +76,60 @@ jobs:
       - name: Build VideoProcessor GUI x64 Release
         shell: pwsh
         run: |
+          $solutionDir = "$env:GITHUB_WORKSPACE\"
+          $outDir = "$env:GITHUB_WORKSPACE\x64\Release\"
+
           msbuild .\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj `
             /m `
             /p:Configuration=Release `
             /p:Platform=x64 `
+            "/p:SolutionDir=$solutionDir" `
+            "/p:OutDir=$outDir" `
             /verbosity:minimal
 
       - name: Build VP Renderer x64 Release
         shell: pwsh
         run: |
+          $solutionDir = "$env:GITHUB_WORKSPACE\"
+
           msbuild .\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj `
             /m `
             /p:Configuration=Release `
             /p:Platform=x64 `
+            "/p:SolutionDir=$solutionDir" `
             /verbosity:minimal
+
+      - name: Verify compiled files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=== x64 Release tree ==="
+
+          if (-not (Test-Path .\x64\Release)) {
+            throw "x64\Release directory was not generated"
+          }
+
+          Get-ChildItem .\x64\Release -Recurse |
+            Select-Object FullName
+
+          if (-not (Test-Path .\x64\Release\VideoProcessor-GUI.exe)) {
+            throw "VideoProcessor-GUI.exe was not generated"
+          }
+
+          if (-not (Test-Path .\x64\Release\vprenderer\VideoProcessorVPRenderer.dll)) {
+            throw "VideoProcessorVPRenderer.dll was not generated"
+          }
+
+          Write-Host "Main executable OK"
+          Write-Host "VP Renderer OK"
 
       - name: Prepare distribution
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Searching compiled VideoProcessor files..."
-
-          $exe = Get-ChildItem `
-            -Path . `
-            -Filter "VideoProcessor.exe" `
-            -File `
-            -Recurse |
-            Select-Object -First 1
-
-          if (-not $exe) {
-            throw "VideoProcessor.exe was not found"
-          }
-
-          $renderer = Get-ChildItem `
-            -Path . `
-            -Filter "VideoProcessorVPRenderer.dll" `
-            -File `
-            -Recurse |
-            Select-Object -First 1
-
-          if (-not $renderer) {
-            throw "VideoProcessorVPRenderer.dll was not found"
-          }
-
-          Write-Host "GUI executable found at:"
-          Write-Host $exe.FullName
-
-          Write-Host "VP Renderer found at:"
-          Write-Host $renderer.FullName
+          Remove-Item .\dist -Recurse -Force -ErrorAction SilentlyContinue
 
           New-Item `
             -ItemType Directory `
@@ -136,27 +141,34 @@ jobs:
             -Path .\dist\vprenderer `
             -Force | Out-Null
 
-          Write-Host "Copying complete GUI output..."
+          # Official release layout renames
+          # VideoProcessor-GUI.exe -> VideoProcessor.exe
           Copy-Item `
-            -Path "$($exe.Directory.FullName)\*" `
-            -Destination .\dist `
+            .\x64\Release\VideoProcessor-GUI.exe `
+            .\dist\VideoProcessor.exe `
+            -Force
+
+          # Copy VP Renderer and all runtime dependencies
+          Copy-Item `
+            .\x64\Release\vprenderer\* `
+            .\dist\vprenderer `
             -Recurse `
             -Force
 
-          Write-Host "Copying complete VP Renderer output..."
-          Copy-Item `
-            -Path "$($renderer.Directory.FullName)\*" `
-            -Destination .\dist\vprenderer `
-            -Recurse `
-            -Force
-
+          # Configuration template
           if (Test-Path .\VideoProcessor.cfg) {
             Copy-Item `
               .\VideoProcessor.cfg `
               .\dist\VideoProcessor.cfg `
               -Force
+
+            Copy-Item `
+              .\VideoProcessor.cfg `
+              .\dist\VideoProcessor.cfg.example `
+              -Force
           }
 
+          # Documentation
           if (Test-Path .\CONFIGURATION.html) {
             Copy-Item `
               .\CONFIGURATION.html `
@@ -164,6 +176,7 @@ jobs:
               -Force
           }
 
+          # Shaders
           if (Test-Path .\shaders) {
             Copy-Item `
               .\shaders `
@@ -172,6 +185,7 @@ jobs:
               -Force
           }
 
+          # Record exact source revision
           git rev-parse HEAD |
             Out-File `
               .\dist\BUILD_COMMIT.txt `
