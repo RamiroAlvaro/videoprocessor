@@ -412,10 +412,31 @@ CString LibplaceboPluginVideoRenderer::ActiveShaderRule() const
 bool LibplaceboPluginVideoRenderer::ApplyApplicationState(
 	const UnifiedProfileRuntime::Snapshot& snapshot,
 	CString& activeState,
-	bool& rendererRestartRequired)
+	bool& rendererRestartRequired,
+	bool& liveResetRequired)
 {
 	return m_renderer->ApplyApplicationState(snapshot, activeState,
-		rendererRestartRequired);
+		rendererRestartRequired, liveResetRequired);
+}
+
+uint64_t LibplaceboPluginVideoRenderer::PresentedFrameCount() const
+{
+	return m_renderer->PresentedFrameCount();
+}
+
+bool LibplaceboPluginVideoRenderer::PersistShaderCache()
+{
+	return m_renderer->PersistShaderCache();
+}
+
+void LibplaceboPluginVideoRenderer::SetNonCapturingPreparationMode(bool enabled)
+{
+	m_renderer->SetNonCapturingPreparationMode(enabled);
+}
+
+bool LibplaceboPluginVideoRenderer::ReloadConfiguredShaderPrewarm()
+{
+	return m_renderer->ReloadConfiguredShaderPrewarm();
 }
 
 

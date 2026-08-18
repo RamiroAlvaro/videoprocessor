@@ -26,6 +26,7 @@
 #include <QDir>
 #include <QDialog>
 #include <QEvent>
+#include <QFile>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
 #include <QFormLayout>
@@ -49,6 +50,8 @@
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPointer>
+#include <QProcess>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRect>
@@ -883,6 +886,11 @@ ConfigEditorWindow::ConfigEditorWindow(QString configPath, quintptr ownerHandle,
         connect(activeProfileTimer_, &QTimer::timeout, this,
             &ConfigEditorWindow::refreshActiveProfileIndicators);
         refreshActiveProfileIndicators();
+        shaderStatusTimer_ = new QTimer(this);
+        shaderStatusTimer_->setInterval(250);
+        connect(shaderStatusTimer_, &QTimer::timeout, this,
+            &ConfigEditorWindow::refreshShaderPreparationStatus);
+        shaderStatusTimer_->start();
     }
     if (!testMode_) setupTray();
 	const std::wstring revealEventName =
@@ -951,7 +959,7 @@ void ConfigEditorWindow::selectPage(int index)
     if (!pages_ || index < 0 || index >= pages_->count()) return;
     pages_->setCurrentIndex(index);
     if (!navigation_) return;
-    const int navigationIndex = index == 4 || index == 11 ? 2 :
+    const int navigationIndex = index == 4 || index == 11 || index == 13 ? 2 :
         index == 12 ? 3 :
         index == 8 || index == 9 ? 8 : index;
     for (QAbstractButton* button : navigation_->findChildren<QAbstractButton*>())
@@ -1622,9 +1630,12 @@ bool ConfigEditorWindow::updateValidationState()
     const QStringList errors = validationErrors(fields, true, false);
     const bool valid = errors.isEmpty();
     validationValid_ = valid;
-    if (saveButton_) saveButton_->setEnabled(configurationLoaded_ && valid);
+    if (saveButton_)
+        saveButton_->setEnabled(!shaderPreparationBusy_ &&
+            configurationLoaded_ && valid);
     if (applyButton_)
-        applyButton_->setEnabled(configurationLoaded_ && dirty_ && valid);
+        applyButton_->setEnabled(!shaderPreparationBusy_ &&
+            configurationLoaded_ && dirty_ && valid);
     if (!valid)
     {
         int latest = 0;
@@ -1892,6 +1903,26 @@ bool ConfigEditorWindow::saveChanges()
         savedSnapshot_, captureDocumentSnapshot(*document_));
     const auto action = ConfigurationApplyPolicy::ClassifyChanges(changed,
         snapshotUsesDirectShowRenderer(savedSnapshot_));
+    const bool prepareShaders = std::any_of(changed.cbegin(), changed.cend(),
+        [](const ConfigurationApplyPolicy::Change& change)
+        {
+            const std::string section =
+                ConfigurationApplyPolicy::NormalizeSection(change.section);
+            const std::string key =
+                ConfigurationApplyPolicy::NormalizeSection(change.key);
+            // Selection metadata changes which profile becomes active, but it
+            // does not change any GPU program. New/deleted profiles still
+            // arrive as setting changes (or an empty section-level key) and
+            // therefore remain preparation candidates.
+            if (key == "name" || key == "shortcut" || key == "use_rule" ||
+                key == "when" || key == "label")
+                return false;
+            return (ConfigurationApplyPolicy::HasPrefix(section, "vprenderer") &&
+                    !ConfigurationApplyPolicy::HasPrefix(section,
+                        "vprenderer.output")) ||
+                ConfigurationApplyPolicy::HasPrefix(section, "shader") ||
+                ConfigurationApplyPolicy::HasPrefix(section, "shaders");
+        });
     // Persist shortcut spelling in the same canonical form used by the
     // accelerator parser. Case is not a modifier: L and l are both L, while
     // Shift+L is the distinct shifted chord.
@@ -2003,6 +2034,8 @@ bool ConfigEditorWindow::saveChanges()
             QStringLiteral("Changes saved safely. Takes effect when VideoProcessor next starts. Backup: %1")
                 .arg(QString::fromStdWString(result.backupPath)), false);
     }
+    if (prepareShaders)
+        requestShaderPreparation();
     return true;
 }
 
@@ -2018,6 +2051,10 @@ QWidget* ConfigEditorWindow::createShell()
     actionRendererTarget_ = nullptr;
     applyButton_ = nullptr;
     saveButton_ = nullptr;
+    configurationHost_ = nullptr;
+    shaderCacheStatus_ = nullptr;
+    shaderPreparationStatus_ = nullptr;
+    shaderFooterBusy_ = nullptr;
     activeProfileLists_.clear();
     auto* root = new QWidget;
     root->setObjectName(QStringLiteral("root"));
@@ -2090,6 +2127,8 @@ QWidget* ConfigEditorWindow::createShell()
         QStringLiteral("Input processing"),
         QStringLiteral("Override the General input policy for DirectShow, or inherit it."),
         QStringLiteral("directshow")));
+    pages_->addWidget(createOutputPage());
+    pages_->addWidget(createShadersSetupPage());
 
     auto* navGroup = new QButtonGroup(root);
     navGroup->setExclusive(true);
@@ -2104,7 +2143,7 @@ QWidget* ConfigEditorWindow::createShell()
     addLeaf(QStringLiteral("General"), 0);
     addLeaf(QStringLiteral("Queue"), 1);
     addLeaf(QStringLiteral("LLDV"), 5);
-    QPushButton* shadersNavigation = addLeaf(QStringLiteral("Shaders"), 8);
+    QPushButton* shadersNavigation = addLeaf(QStringLiteral("Shaders"), 14);
     addLeaf(QStringLiteral("Actions"), 7);
     addLeaf(QStringLiteral("Shortcuts"), 6);
     addLeaf(QStringLiteral("Logs"), 10);
@@ -2154,16 +2193,18 @@ QWidget* ConfigEditorWindow::createShell()
     const auto updateSectionTabs = [showSectionTabs, shadersNavigation,
         vpNavigation, directShowNavigation](int page)
     {
-        if (page == 8 || page == 9)
+        if (page == 8 || page == 9 || page == 14)
         {
             shadersNavigation->setChecked(true);
-            showSectionTabs({ { QStringLiteral("Standard"), 8 },
+            showSectionTabs({ { QStringLiteral("Setup"), 14 },
+                { QStringLiteral("Standard"), 8 },
                 { QStringLiteral("NLS"), 9 } }, page);
         }
-        else if (page == 2 || page == 4 || page == 11)
+        else if (page == 2 || page == 4 || page == 11 || page == 13)
         {
             vpNavigation->setChecked(true);
             showSectionTabs({ { QStringLiteral("Rendering"), 2 },
+                { QStringLiteral("Output"), 13 },
                 { QStringLiteral("Screen Config"), 4 },
                 { QStringLiteral("Input Processing"), 11 } }, page);
         }
@@ -2188,6 +2229,7 @@ QWidget* ConfigEditorWindow::createShell()
     updateSectionTabs(pages_->currentIndex());
     centerLayout->addWidget(navigation_);
     centerLayout->addWidget(pageHost, 1);
+    configurationHost_ = center;
     rootLayout->addWidget(center, 1);
 
     auto* footer = new QWidget;
@@ -2203,6 +2245,13 @@ QWidget* ConfigEditorWindow::createShell()
     status_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     status_->setWordWrap(true);
     footerLayout->addWidget(status_, 1);
+    shaderFooterBusy_ = new QProgressBar;
+    shaderFooterBusy_->setObjectName(QStringLiteral("shaderPreparationBusy"));
+    shaderFooterBusy_->setRange(0, 0);
+    shaderFooterBusy_->setTextVisible(false);
+    shaderFooterBusy_->setFixedSize(54, 8);
+    shaderFooterBusy_->hide();
+    footerLayout->addWidget(shaderFooterBusy_);
     effectSummary_ = new QLabel;
     effectSummary_->setObjectName(QStringLiteral("configurationEffectSummary"));
     effectSummary_->setAccessibleName(QStringLiteral("Pending configuration effect"));
@@ -2229,7 +2278,8 @@ QWidget* ConfigEditorWindow::createShell()
     {
         // A clean OK is just a close. A dirty OK must remain open if validation
         // or safe persistence fails, so the user can correct the candidate.
-        if (!dirty_ || saveChanges()) hide();
+        if (!dirty_) hide();
+        else if (saveChanges() && !shaderPreparationBusy_) hide();
     });
     connect(cancel, &QPushButton::clicked, this, [this]
     {
@@ -2559,6 +2609,83 @@ QWidget* ConfigEditorWindow::createStartupPage()
 QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QString& description,
     const QString& sectionPrefix)
 {
+    // Output transport used to live inside Rendering profiles. Move those
+    // keys into matching Output profiles in the pending document so an old
+    // configuration keeps the same shortcut/rule behavior without allowing a
+    // Rendering selection to change the device or swapchain contract.
+    if (configurationLoaded_ && document_ &&
+        sectionPrefix == QStringLiteral("vprenderer.output"))
+    {
+        const QStringList outputKeys = {
+            QStringLiteral("output_path_profile"),
+            QStringLiteral("output_presentation"),
+            QStringLiteral("output_range"),
+            QStringLiteral("output_diagnostics"),
+            QStringLiteral("diagnostic_allow_limited_g22"),
+            QStringLiteral("diagnostic_allow_full_g22"),
+            QStringLiteral("diagnostic_disable_compute"),
+            QStringLiteral("diagnostic_force_8bit_sdr_swapchain"),
+            QStringLiteral("diagnostic_vp_owned_dxgi_presenter"),
+            QStringLiteral("diagnostic_disable_shader_cache")
+        };
+        bool migrated = false;
+        for (const QString& renderingSection : profileSections(
+            QStringLiteral("vprenderer")))
+        {
+            QStringList configuredKeys;
+            for (const QString& key : outputKeys)
+                if (!value(renderingSection, key).isEmpty())
+                    configuredKeys.push_back(key);
+            if (configuredKeys.isEmpty()) continue;
+
+            const QString suffix = renderingSection == QStringLiteral("vprenderer") ?
+                QStringLiteral("Default") :
+                renderingSection.mid(QStringLiteral("vprenderer.").size());
+            const QString outputSection =
+                QStringLiteral("vprenderer.output.%1").arg(suffix);
+            document_->AddSection(outputSection.toStdString());
+            for (const QString& key : configuredKeys)
+            {
+                const QString configured = value(renderingSection, key);
+                if (value(outputSection, key).isEmpty())
+                    document_->SetKnown(outputSection.toStdString(),
+                        key.toStdString().c_str(),
+                        configured.toLocal8Bit().constData());
+                document_->RemoveKnown(renderingSection.toStdString(),
+                    key.toStdString().c_str());
+            }
+            for (const QString& selector : { QStringLiteral("shortcut"),
+                QStringLiteral("when") })
+            {
+                const QString configured = value(renderingSection, selector);
+                if (!configured.isEmpty() && value(outputSection, selector).isEmpty())
+                    document_->SetKnown(outputSection.toStdString(),
+                        selector.toStdString().c_str(),
+                        configured.toLocal8Bit().constData());
+            }
+            const QString range = value(outputSection,
+                QStringLiteral("output_range")).toLower();
+            const QString displayGamma = value(renderingSection,
+                QStringLiteral("output_gamma")).toLower();
+            if (range == QStringLiteral("limited") &&
+                (displayGamma == QStringLiteral("2.2") ||
+                    displayGamma == QStringLiteral("2.4")) &&
+                value(outputSection,
+                    QStringLiteral("output_transport_gamma")).isEmpty())
+            {
+                document_->SetKnown(outputSection.toStdString(),
+                    "output_transport_gamma",
+                    displayGamma.toLocal8Bit().constData());
+            }
+            migrated = true;
+        }
+        if (migrated)
+        {
+            dirty_ = true;
+            hasPendingMigrations_ = true;
+        }
+    }
+
     // Literal roots are the legacy unnamed form. Profiles in the editor are
     // named and their file order alone selects the default, so migrate a root
     // to a unique generated name in the pending document. Disk is unchanged
@@ -2584,9 +2711,6 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
             if (newDefault != renamed)
             {
                 QStringList defaultOnlyKeys;
-                if (sectionPrefix == QStringLiteral("vprenderer"))
-                    defaultOnlyKeys = { QStringLiteral("output_diagnostics"),
-                        QStringLiteral("diagnostic_disable_shader_cache") };
                 for (const QString& key : defaultOnlyKeys)
                 {
                     const QString configured = value(renamed, key);
@@ -3174,14 +3298,16 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         addChoice(QStringLiteral("LUT reference transfer"), QStringLiteral("lut_reference_transfer"), { QStringLiteral("AUTO"), QStringLiteral("srgb"), QStringLiteral("bt1886"), QStringLiteral("2.2"), QStringLiteral("2.4") });
         addChoice(QStringLiteral("LUT reference primaries"), QStringLiteral("lut_reference_primaries"), { QStringLiteral("AUTO"), QStringLiteral("REC709"), QStringLiteral("P3_D65"), QStringLiteral("BT2020") });
 
+    }
+    else if (sectionPrefix == QStringLiteral("vprenderer.output"))
+    {
         form = addCollapsibleSection(QStringLiteral("advancedOutput"),
             QStringLiteral("Advanced output"), QStringLiteral(
-                "Presentation preference and RGB range for this display path. "
+                "Presentation preference and RGB transport for this output path. "
                 "Windows determines the final presentation path."), false);
         form->addRow(QString(), helpLabel(QStringLiteral(
-            "Display transfer / gamma is configured in Display calibration. "
-            "Keep both controls on Auto unless the display chain has a known requirement; "
-            "the OSD reports the effective transport.")));
+            "Keep these controls on Auto unless the display chain has a known "
+            "transport requirement; the OSD reports the effective transport.")));
         auto* outputPresentation = addChoice(QStringLiteral("Presentation preference"),
             QStringLiteral("output_presentation"),
             { QStringLiteral("AUTO"), QStringLiteral("direct"),
@@ -3196,16 +3322,25 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         outputRange->setToolTip(QStringLiteral(
             "Auto normally uses Full RGB. Select Limited only for a known "
             "limited-range display chain or a transport diagnostic."));
+        auto* outputTransportGamma = addChoice(
+            QStringLiteral("Limited transport transfer"),
+            QStringLiteral("output_transport_gamma"),
+            { QStringLiteral("AUTO"), QStringLiteral("2.2"),
+                QStringLiteral("2.4") });
+        outputTransportGamma->setToolTip(QStringLiteral(
+            "Only applies when RGB output range is Limited. Auto uses the "
+            "standard limited-range transport. Display calibration remains "
+            "part of the Rendering profile."));
         auto* outputCompatibility = helpLabel(QString());
         outputCompatibility->setObjectName(
-            QStringLiteral("config.vprenderer.advanced_output.compatibility"));
+            QStringLiteral("config.vprenderer.output.advanced_output.compatibility"));
         form->addRow(QString(), outputCompatibility);
 
         form = addCollapsibleSection(QStringLiteral("outputExperiments"),
             QStringLiteral("Output Experiments (beta)"), QStringLiteral(
                 "Implementation diagnostics for repeatable renderer testing. "
                 "They do not change display calibration, presentation preference, or RGB range. "
-                "Changes are saved with this renderer profile; Apply performs "
+                "Changes are saved with this output profile; Apply performs "
                 "a hard capture-and-renderer reinitialization before they take effect."), false);
         form->addRow(QString(), helpLabel(QStringLiteral(
             "Diagnostic presets set only the beta controls below. Apply always "
@@ -3238,10 +3373,10 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         addBoolean(QStringLiteral("Disable shader cache"),
             QStringLiteral("diagnostic_disable_shader_cache"));
         const auto updateOutputCompatibility = [this, outputPresentation,
-            outputRange, outputGamma, outputCompatibility]()
+            outputRange, outputTransportGamma, outputCompatibility]()
         {
             const auto* vpOwned = findChild<QCheckBox*>(
-                QStringLiteral("config.vprenderer.diagnostic_vp_owned_dxgi_presenter"));
+                QStringLiteral("config.vprenderer.output.diagnostic_vp_owned_dxgi_presenter"));
             QStringList notices;
             if (outputPresentation->currentData().toString().compare(
                 QStringLiteral("composed"), Qt::CaseInsensitive) == 0 &&
@@ -3250,29 +3385,29 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
                 notices << QStringLiteral(
 				"Notice: VP-owned DXGI is Direct-only; Composed uses libplacebo's presenter.");
 			}
-			const QString gamma = outputGamma->currentData().toString();
+			const QString gamma = outputTransportGamma->currentData().toString();
 			const bool limited = outputRange->currentData().toString().compare(
 				QStringLiteral("limited"), Qt::CaseInsensitive) == 0;
 			if (limited)
 			{
 				const auto* limitedG22 = findChild<QCheckBox*>(
-					QStringLiteral("config.vprenderer.diagnostic_allow_limited_g22"));
+					QStringLiteral("config.vprenderer.output.diagnostic_allow_limited_g22"));
 				if (gamma == QStringLiteral("2.2") &&
 					(!limitedG22 || !limitedG22->isChecked()))
 				{
 					notices << QStringLiteral(
-						"Blocked: Limited RGB with a 2.2 display target is a diagnostic experiment. Use Full RGB for normal calibrated output.");
+						"Blocked: Limited RGB with Gamma 2.2 transport is a diagnostic experiment. Use Auto for normal output.");
 				}
 				else if (gamma != QStringLiteral("AUTO") &&
 					gamma != QStringLiteral("2.4") && gamma != QStringLiteral("2.2"))
 				{
 					notices << QStringLiteral(
-						"Blocked: Limited RGB supports Auto/2.4, plus the 2.2 diagnostic experiment. Use Full RGB for this display target.");
+						"Blocked: Limited RGB supports Auto/2.4, plus the 2.2 diagnostic experiment.");
 				}
 				else
 				{
 					notices << QStringLiteral(
-						"Limited RGB is a transport diagnostic. Display transfer is configured separately in Display calibration.");
+						"Limited RGB changes output transport only; display calibration remains in Rendering.");
 				}
 			}
             outputCompatibility->setText(notices.join(QStringLiteral("\n")));
@@ -3280,18 +3415,18 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         };
         connect(outputPresentation, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [updateOutputCompatibility](int) { updateOutputCompatibility(); });
-        connect(outputGamma, qOverload<int>(&QComboBox::currentIndexChanged), this,
+        connect(outputTransportGamma, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [updateOutputCompatibility](int) { updateOutputCompatibility(); });
         connect(outputRange, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [updateOutputCompatibility](int) { updateOutputCompatibility(); });
         if (auto* vpOwned = findChild<QCheckBox*>(
-            QStringLiteral("config.vprenderer.diagnostic_vp_owned_dxgi_presenter")))
+            QStringLiteral("config.vprenderer.output.diagnostic_vp_owned_dxgi_presenter")))
         {
             connect(vpOwned, &QCheckBox::toggled, this,
                 [updateOutputCompatibility](bool) { updateOutputCompatibility(); });
         }
 		if (auto* limitedG22 = findChild<QCheckBox*>(
-			QStringLiteral("config.vprenderer.diagnostic_allow_limited_g22")))
+			QStringLiteral("config.vprenderer.output.diagnostic_allow_limited_g22")))
 		{
 			connect(limitedG22, &QCheckBox::toggled, this,
 				[updateOutputCompatibility](bool) { updateOutputCompatibility(); });
@@ -3301,7 +3436,7 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
             outputPathProfile, updateOutputCompatibility](const QString& profile)
         {
             if (state->loading || state->section.isEmpty() || !document_ ||
-                profile == QStringLiteral("custom")) return;
+                profile.isEmpty() || profile == QStringLiteral("custom")) return;
             struct Value { const char* key; const char* value; };
 		static constexpr Value legacy[] = {
 				{ "diagnostic_allow_limited_g22", "false" },
@@ -3376,7 +3511,7 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         auto* resetOutputExperiments = new QPushButton(
             QStringLiteral("Restore Normal Diagnostics"));
         resetOutputExperiments->setObjectName(
-            QStringLiteral("config.vprenderer.output_experiments.reset_defaults"));
+            QStringLiteral("config.vprenderer.output.output_experiments.reset_defaults"));
         resetOutputExperiments->setToolTip(QStringLiteral(
             "Restore this profile's normal diagnostic settings."));
         resetOutputExperiments->setAccessibleName(
@@ -3387,7 +3522,7 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
             if (state->section.isEmpty() || !document_) return;
             if (QMessageBox::question(this,
                 QStringLiteral("Restore normal diagnostics"),
-				QStringLiteral("Restore normal diagnostic settings for this renderer "
+				QStringLiteral("Restore normal diagnostic settings for this output "
 				"profile? This leaves display calibration, presentation preference, "
                     "and RGB range unchanged."),
                 QMessageBox::Yes | QMessageBox::Cancel,
@@ -3958,9 +4093,6 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
     {
         if (from.isEmpty() || to.isEmpty() || from == to) return;
         QStringList keys;
-        if (sectionPrefix == QStringLiteral("vprenderer"))
-            keys = { QStringLiteral("output_diagnostics"),
-                QStringLiteral("diagnostic_disable_shader_cache") };
         for (const QString& keyText : keys)
         {
             const std::string key = keyText.toStdString();
@@ -4073,6 +4205,134 @@ QWidget* ConfigEditorWindow::createRendererPage()
 {
     return createProfilePage(QStringLiteral("Rendering"),
         QStringLiteral("Configure ordered rendering profiles. The first profile in the list is the default."), QStringLiteral("vprenderer"));
+}
+
+void ConfigEditorWindow::setShaderPreparationBusy(bool busy,
+    const QString& message)
+{
+    shaderPreparationBusy_ = busy;
+    if (configurationHost_) configurationHost_->setEnabled(!busy);
+    if (shaderFooterBusy_) shaderFooterBusy_->setVisible(busy);
+    if (saveButton_) saveButton_->setEnabled(!busy && configurationLoaded_);
+    if (applyButton_)
+        applyButton_->setEnabled(!busy && configurationLoaded_ && dirty_ &&
+            validationValid_);
+    if (!message.isEmpty()) setStatus(message, false);
+}
+
+void ConfigEditorWindow::requestShaderPreparation()
+{
+    if (testMode_) return;
+    const QDir rendererDirectory(QFileInfo(configPath_).absoluteDir().filePath(
+        QStringLiteral("vprenderer")));
+    if (!QDir().mkpath(rendererDirectory.absolutePath()))
+    {
+        setStatus(QStringLiteral("Could not access the VP Renderer shader folder."), true);
+        return;
+    }
+    const QString statusPath = rendererDirectory.filePath(
+        QString::fromWCharArray(
+            ConfigurationLiveApply::ShaderPreparationStatusFileName));
+    const QString temporaryPath = statusPath + QStringLiteral(".tmp");
+    QFile status(temporaryPath);
+    if (!status.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+        status.write("state=waiting\ncurrent=0\ntotal=0\nmessage=Waiting for VideoProcessor...\n") < 0)
+    {
+        setStatus(QStringLiteral("Could not create the shader preparation request."), true);
+        return;
+    }
+    status.close();
+    QFile::remove(statusPath);
+    if (!QFile::rename(temporaryPath, statusPath))
+    {
+        setStatus(QStringLiteral("Could not publish the shader preparation request."), true);
+        return;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    HANDLE requested = CreateEventW(nullptr, FALSE, FALSE,
+        ConfigurationLiveApply::ShaderPreparationEventName);
+    const bool vpWasListening = requested &&
+        GetLastError() == ERROR_ALREADY_EXISTS;
+    const bool signaled = vpWasListening && SetEvent(requested) != FALSE;
+    if (requested) CloseHandle(requested);
+    if (!signaled)
+    {
+        QDir installation = QFileInfo(configPath_).absoluteDir();
+        QString executable = installation.filePath(
+            QStringLiteral("VideoProcessor.exe"));
+        if (!QFileInfo::exists(executable))
+        {
+            QDir besideConfig(QCoreApplication::applicationDirPath());
+            besideConfig.cdUp();
+            executable = besideConfig.filePath(QStringLiteral("VideoProcessor.exe"));
+        }
+        qint64 processId = 0;
+        if (!QFileInfo::exists(executable) || !QProcess::startDetached(executable,
+            { QStringLiteral("/prepare_shaders") }, installation.absolutePath(),
+            &processId))
+        {
+            setStatus(QStringLiteral(
+                "Shader preparation could not start VideoProcessor."), true);
+            return;
+        }
+    }
+    setShaderPreparationBusy(true, QStringLiteral("Preparing shaders..."));
+    refreshShaderPreparationStatus();
+}
+
+void ConfigEditorWindow::refreshShaderPreparationStatus()
+{
+    const QDir rendererDirectory(QFileInfo(configPath_).absoluteDir().filePath(
+        QStringLiteral("vprenderer")));
+    const QFileInfo cache(rendererDirectory.filePath(
+        QStringLiteral("VideoProcessorShaderCache.bin")));
+    if (shaderCacheStatus_)
+    {
+        shaderCacheStatus_->setText(cache.exists() ?
+            QStringLiteral("Persistent cache: %1 MB · Updated %2")
+                .arg(cache.size() / (1024.0 * 1024.0), 0, 'f', 1)
+                .arg(cache.lastModified().toString(QStringLiteral("MMM d, h:mm AP"))) :
+            QStringLiteral("Persistent cache: Not created yet"));
+    }
+
+    QFile status(rendererDirectory.filePath(QString::fromWCharArray(
+        ConfigurationLiveApply::ShaderPreparationStatusFileName)));
+    if (!status.open(QIODevice::ReadOnly))
+    {
+        if (shaderPreparationStatus_)
+            shaderPreparationStatus_->setText(QStringLiteral("Shaders not prepared yet"));
+        return;
+    }
+    QString state;
+    QString message;
+    while (!status.atEnd())
+    {
+        const QString line = QString::fromUtf8(status.readLine()).trimmed();
+        const int separator = line.indexOf(u'=');
+        if (separator < 0) continue;
+        const QString key = line.left(separator);
+        const QString value = line.mid(separator + 1);
+        if (key == QStringLiteral("state")) state = value;
+        else if (key == QStringLiteral("message")) message = value;
+    }
+    const bool busy = state == QStringLiteral("waiting") ||
+        state == QStringLiteral("preparing");
+    if (shaderPreparationStatus_)
+        shaderPreparationStatus_->setText(message.isEmpty() ?
+            (busy ? QStringLiteral("Preparing shaders...") :
+                QStringLiteral("Shaders ready")) : message);
+    if (busy != shaderPreparationBusy_)
+        setShaderPreparationBusy(busy, message);
+    else if (busy && !message.isEmpty())
+        setStatus(message, false);
+}
+
+QWidget* ConfigEditorWindow::createOutputPage()
+{
+    return createProfilePage(QStringLiteral("Output"),
+        QStringLiteral("Configure output transport and diagnostic profiles separately from live rendering profiles."),
+        QStringLiteral("vprenderer.output"));
 }
 
 QWidget* ConfigEditorWindow::createInputProcessingPage(const QString& title,
@@ -4649,6 +4909,91 @@ QWidget* ConfigEditorWindow::createNlsShadersPage()
         QStringLiteral("Configure included nonlinear stretch (NLS) modes without rewriting custom shader sections."), splitter);
 }
 
+QWidget* ConfigEditorWindow::createShadersSetupPage()
+{
+    auto* content = new QWidget;
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(12);
+
+    auto* statusContent = new QWidget;
+    auto* statusLayout = new QVBoxLayout(statusContent);
+    statusLayout->setContentsMargins(0, 0, 0, 0);
+    statusLayout->setSpacing(8);
+    shaderPreparationStatus_ = new QLabel(QStringLiteral("Shaders ready"));
+    shaderPreparationStatus_->setObjectName(
+        QStringLiteral("config.shader.preparation.status"));
+    shaderPreparationStatus_->setProperty("cardTitle", true);
+    shaderCacheStatus_ = helpLabel(QStringLiteral("Checking shader cache..."));
+    shaderCacheStatus_->setObjectName(QStringLiteral("config.shader.cache.status"));
+    statusLayout->addWidget(shaderPreparationStatus_);
+    statusLayout->addWidget(shaderCacheStatus_);
+    layout->addWidget(createCard(QStringLiteral("Shader status"),
+        QStringLiteral("VP prepares missing GPU shader variants before you switch rendering profiles."),
+        statusContent));
+
+    auto* controls = new QWidget;
+    auto* controlsLayout = new QVBoxLayout(controls);
+    controlsLayout->setContentsMargins(0, 0, 0, 0);
+    controlsLayout->setSpacing(8);
+    auto* buttons = new QHBoxLayout;
+    auto* prepare = new QPushButton(QStringLiteral("Prepare shaders"));
+    prepare->setObjectName(QStringLiteral("config.shader.prepare"));
+    prepare->setAccessibleDescription(QStringLiteral(
+        "Prepare shader variants for every VP Renderer rendering profile."));
+    auto* clearCache = new QPushButton(QStringLiteral("Clear shader cache"));
+    clearCache->setObjectName(QStringLiteral("config.shader.cache.clear"));
+    clearCache->setProperty("danger", true);
+    clearCache->setAccessibleDescription(QStringLiteral(
+        "Clear the persistent VP Renderer shader cache at the next renderer start."));
+    buttons->addWidget(prepare);
+    buttons->addWidget(clearCache);
+    buttons->addStretch();
+    controlsLayout->addLayout(buttons);
+    controlsLayout->addWidget(helpLabel(QStringLiteral(
+        "Preparation runs asynchronously in VideoProcessor. If VP is closed, Config starts it in non-capturing shader-preparation mode.")));
+    layout->addWidget(createCard(QStringLiteral("Shader setup"),
+        QStringLiteral("Prepare or clear the persistent VP Renderer shader cache."),
+        controls));
+    layout->addStretch();
+
+    connect(prepare, &QPushButton::clicked, this,
+        &ConfigEditorWindow::requestShaderPreparation);
+    connect(clearCache, &QPushButton::clicked, this, [this]
+    {
+        const QDir configurationDirectory = QFileInfo(configPath_).absoluteDir();
+        const QString rendererDirectory = configurationDirectory.filePath(
+            QStringLiteral("vprenderer"));
+        if (!QDir().mkpath(rendererDirectory))
+        {
+            setStatus(QStringLiteral("Could not access the VP Renderer cache folder."), true);
+            return;
+        }
+        const QDir cacheDirectory(rendererDirectory);
+        const QString cachePath = cacheDirectory.filePath(
+            QStringLiteral("VideoProcessorShaderCache.bin"));
+        const QString temporaryPath = cachePath + QStringLiteral(".tmp");
+        const QString requestPath = cacheDirectory.filePath(
+            QStringLiteral("VideoProcessorShaderCache.clear"));
+        QFile request(requestPath);
+        if (!request.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            request.write("clear\n") < 0)
+        {
+            setStatus(QStringLiteral("Could not request a shader cache clear."), true);
+            return;
+        }
+        request.close();
+        QFile::remove(cachePath);
+        QFile::remove(temporaryPath);
+        setStatus(QStringLiteral(
+            "Shader cache will be cleared at the next VP Renderer start."));
+        refreshShaderPreparationStatus();
+    });
+    refreshShaderPreparationStatus();
+    return createPage(QStringLiteral("Shaders"),
+        QStringLiteral("Prepare and inspect VP Renderer shader storage."), content);
+}
+
 QWidget* ConfigEditorWindow::createStandardShadersPage()
 {
     auto state = std::make_shared<ShaderEditorState>();
@@ -4685,7 +5030,6 @@ QWidget* ConfigEditorWindow::createStandardShadersPage()
     selectionLayout->addWidget(list, 1);
     selectionLayout->addWidget(helpLabel(QStringLiteral(
         "These entries are independent effects. By default none has a shortcut or rule, so none is active.")));
-
     auto* details = new QWidget;
     auto* detailsLayout = new QVBoxLayout(details);
     detailsLayout->setContentsMargins(0, 0, 0, 0);

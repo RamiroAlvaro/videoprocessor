@@ -17,6 +17,7 @@ class QHideEvent;
 class QLineEdit;
 class QListWidget;
 class QPushButton;
+class QProgressBar;
 class QRect;
 class QStackedWidget;
 class QSystemTrayIcon;
@@ -62,6 +63,7 @@ private:
     QWidget* createStartupPage();
     QWidget* createQueuePage();
     QWidget* createRendererPage();
+    QWidget* createOutputPage();
     QWidget* createDirectShowPage();
     QWidget* createInputProcessingPage(const QString& title, const QString& description,
         const QString& section);
@@ -69,6 +71,7 @@ private:
     QWidget* createLldvPage();
     QWidget* createStandardShadersPage();
     QWidget* createNlsShadersPage();
+    QWidget* createShadersSetupPage();
     QWidget* createActionsPage();
     QWidget* createShortcutsPage();
     QWidget* createLogsPage();
@@ -105,6 +108,9 @@ private:
 	void rebuildConfigurationShell();
     void applyRendererVisibilityFilter(bool hideLegacyRenderers);
     bool notifyVideoProcessor();
+    void requestShaderPreparation();
+    void refreshShaderPreparationStatus();
+    void setShaderPreparationBusy(bool busy, const QString& message = {});
     void loadConfiguration();
     void migrateSharedRefreshRate();
     void loadDiscoveryCache();
@@ -153,10 +159,16 @@ private:
     QComboBox* rendererChoice_ = nullptr;
     QThread* monitorDiscoveryThread_ = nullptr;
     QTimer* activeProfileTimer_ = nullptr;
+    QTimer* shaderStatusTimer_ = nullptr;
     QComboBox* actionRendererTarget_ = nullptr;
     QFormLayout* rendererShortcutForm_ = nullptr;
     QPushButton* applyButton_ = nullptr;
     QPushButton* saveButton_ = nullptr;
+    QWidget* configurationHost_ = nullptr;
+    QLabel* shaderCacheStatus_ = nullptr;
+    QLabel* shaderPreparationStatus_ = nullptr;
+    QProgressBar* shaderFooterBusy_ = nullptr;
+    bool shaderPreparationBusy_ = false;
     QSystemTrayIcon* tray_ = nullptr;
 	void* revealEvent_ = nullptr;
 	QWinEventNotifier* revealEventNotifier_ = nullptr;

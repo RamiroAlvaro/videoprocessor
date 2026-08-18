@@ -27,6 +27,10 @@ public:
 	void OnVideoFrame(VideoFrame& videoFrame) override;
 	bool HasPresentedLiveFrame() const override;
 	const char* PresentedLiveFrameEvidence() const override;
+	uint64_t PresentedFrameCount() const override;
+	bool PersistShaderCache() override;
+	void SetNonCapturingPreparationMode(bool enabled) override;
+	bool ReloadConfiguredShaderPrewarm() override;
 	HRESULT OnWindowsEvent(LONG_PTR param1, LONG_PTR param2) override;
 	void Build() override;
 	void Start() override;
@@ -65,7 +69,8 @@ public:
 	CString ActiveShaderRule() const override;
 	bool ApplyApplicationState(const UnifiedProfileRuntime::Snapshot& snapshot,
 		CString& activeState,
-		bool& rendererRestartRequired) override;
+		bool& rendererRestartRequired,
+		bool& liveResetRequired) override;
 	size_t GetFrameQueueSize() override;
 	double EntryLatencyMs() const override;
 	double ExitLatencyMs() const override;

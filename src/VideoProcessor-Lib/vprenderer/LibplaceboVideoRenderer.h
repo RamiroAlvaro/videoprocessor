@@ -42,6 +42,16 @@ public:
 	{
 		return "swapchain-submitted";
 	}
+	uint64_t PresentedFrameCount() const override
+	{
+		return m_presentedFrameCount.load(std::memory_order_acquire);
+	}
+	bool PersistShaderCache() override;
+	void SetNonCapturingPreparationMode(bool enabled) override
+	{
+		m_nonCapturingPreparationMode = enabled;
+	}
+	bool ReloadConfiguredShaderPrewarm() override;
 	HRESULT OnWindowsEvent(LONG_PTR param1, LONG_PTR param2) override;
 	void Build() override;
 	void Start() override;
@@ -80,7 +90,8 @@ public:
 	CString ActiveShaderRule() const override;
 	bool ApplyApplicationState(const UnifiedProfileRuntime::Snapshot& snapshot,
 		CString& activeState,
-		bool& rendererRestartRequired) override;
+		bool& rendererRestartRequired,
+		bool& liveResetRequired) override;
 	size_t GetFrameQueueSize() override;
 	double EntryLatencyMs() const override;
 	double ExitLatencyMs() const override;
@@ -142,6 +153,7 @@ private:
 	HWND m_videoHwnd = nullptr;
 	ITimingClock* m_timingClock = nullptr;
 	bool m_useFrameQueue = true;
+	bool m_nonCapturingPreparationMode = false;
 	VideoConversionOverride m_videoConversionOverride =
 		VideoConversionOverride::VIDEOCONVERSION_NONE;
 
@@ -206,6 +218,7 @@ private:
 	std::atomic<uint64_t> m_frameCounter{0};
 	std::atomic<uint64_t> m_sourceSequence{0};
 	std::atomic_bool m_hasPresentedLiveFrame{false};
+	std::atomic<uint64_t> m_presentedFrameCount{0};
 	// Capture-timestamp cadence diagnostics.  This intentionally mirrors the
 	// DirectShow renderer measurement but is diagnostic-only: the optional
 	// renderer does not feed or alter source PPM correction.

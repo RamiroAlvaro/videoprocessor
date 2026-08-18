@@ -445,13 +445,11 @@ namespace RendererProfileConfig
 		}
 		if (group == "display")
 		{
-			if (key == "output_path_profile") return IsChoice(value, { "legacy", "proposed", "custom" });
 			if (key == "display_bit_depth") return IsChoice(value, { "auto", "8", "10" });
 			if (key == "sdr_target_nits") return IsNumberInRange(value, 40.0, 500.0);
 			if (key == "lut_reference_nits") return IsChoice(value, { "auto" }) || IsNumberInRange(value, 40.0, 500.0);
 			if (key == "sdr_black_nits") return IsChoice(value, { "auto" }) || IsNumberInRange(value, 0.0, 500.0, false);
-			if (key == "output_presentation") return IsChoice(value, { "auto", "composed", "direct" });
-			if (key == "output_range" || key == "lut_reference_range") return IsChoice(value, { "auto", "full", "limited" });
+			if (key == "lut_reference_range") return IsChoice(value, { "auto", "full", "limited" });
 			if (key == "output_gamma") return IsChoice(value, { "auto", "bt1886", "srgb", "1.8", "2.0", "2.2", "2.4", "2.6", "2.8" });
 			if (key == "lut_reference_transfer") return IsChoice(value, { "auto", "srgb", "bt1886", "2.2", "2.4" });
 			if (key == "sdr_target_primaries") return IsChoice(value, { "rec709", "bt2020" });
@@ -463,6 +461,22 @@ namespace RendererProfileConfig
 				return normalized.empty() || (normalized.size() > 5 && normalized.substr(normalized.size() - 5) == ".cube");
 			}
 			expected = "a display-owned setting"; return false;
+		}
+		if (group == "output")
+		{
+			if (key == "output_path_profile") return IsChoice(value, { "legacy", "proposed", "custom" });
+			if (key == "output_presentation") return IsChoice(value, { "auto", "composed", "direct" });
+			if (key == "output_range") return IsChoice(value, { "auto", "full", "limited" });
+			if (key == "output_transport_gamma") return IsChoice(value, { "auto", "2.2", "2.4" });
+			if (key == "output_diagnostics" ||
+				key == "diagnostic_disable_shader_cache" ||
+				key == "diagnostic_disable_compute" ||
+				key == "diagnostic_force_8bit_sdr_swapchain" ||
+				key == "diagnostic_allow_limited_g22" ||
+				key == "diagnostic_allow_full_g22" ||
+				key == "diagnostic_vp_owned_dxgi_presenter")
+				return IsBoolean(value);
+			expected = "an output-owned setting"; return false;
 		}
 		if (group == "viewport")
 		{
@@ -527,7 +541,7 @@ namespace RendererProfileConfig
 	inline bool ValidateBaseSetting(const std::string& key, const std::string& value)
 	{
 		std::string ignored;
-		for (const char* group : { "input", "scaling", "display", "viewport" })
+		for (const char* group : { "input", "scaling", "display", "output", "viewport" })
 			if (ValidateProfileSetting(group, key, value, ignored)) return true;
 		if (key == "video_conversion")
 			return IsChoice(value, { "none", "off", "v210_to_p010", "uyvy_to_p010" });
@@ -537,7 +551,10 @@ namespace RendererProfileConfig
 			return IsChoice(value, { "follow_input", "follow_input_lldv", "follow_container", "bt2020", "p3", "rec709" });
 		if (key == "hdr_luminance")
 			return IsChoice(value, { "follow_input", "follow_input_lldv", "hdr_luminance_user", "user" });
-		if (key == "switch_refresh_rate" || key == "output_diagnostics" ||
+		if (key == "profile_update_mode")
+			return IsChoice(value, { "rebuild", "live", "never" });
+		if (key == "live_profile_updates" ||
+			key == "switch_refresh_rate" || key == "output_diagnostics" ||
 			key == "diagnostic_disable_shader_cache" ||
 			key == "diagnostic_disable_compute" ||
 			key == "diagnostic_force_8bit_sdr_swapchain" ||
@@ -555,7 +572,9 @@ namespace RendererProfileConfig
 			key == "hdr_colorspace" || key == "hdr_luminance")
 			return ValidateBaseSetting(key, value);
 		std::string ignored;
-		for (const char* group : { "input", "scaling", "display" })
+		// Legacy [vpvr.display] and literal [vprenderer] files may still carry
+		// output transport. New target-model files use [vprenderer.output.*].
+		for (const char* group : { "input", "scaling", "display", "output" })
 			if (ValidateProfileSetting(group, key, value, ignored)) return true;
 		return key == "deband" &&
 			IsChoice(value, { "auto", "on", "off" });
@@ -579,6 +598,9 @@ namespace RendererProfileConfig
 				{ "follow_input", "follow_input_lldv", "follow_container", "bt2020", "p3", "rec709" }),
 			ConfigSchema::Choice("hdr_luminance",
 				{ "follow_input", "follow_input_lldv", "hdr_luminance_user", "user" }),
+			ConfigSchema::Choice("profile_update_mode",
+				{ "rebuild", "live", "never" }),
+			ConfigSchema::Boolean("live_profile_updates"),
 			ConfigSchema::Boolean("switch_refresh_rate"),
 			ConfigSchema::Boolean("output_diagnostics"),
 			ConfigSchema::Boolean("diagnostic_disable_shader_cache"),
@@ -710,13 +732,14 @@ namespace RendererProfileConfig
 	inline bool IsActionProfileGroup(const std::string& group)
 	{
 		return group == "input" || group == "scaling" ||
-			group == "display" || group == "viewport" || group == "queue" ||
+			group == "display" || group == "output" ||
+			group == "viewport" || group == "queue" ||
 			group == "lldv";
 	}
 
 	inline bool IsRendererChildNamespace(const std::string& name)
 	{
-		for (const char* child : { "input", "input_processing", "scaling", "viewport" })
+		for (const char* child : { "input", "input_processing", "scaling", "output", "viewport" })
 		{
 			const std::string root(child);
 			if (name == root ||
@@ -886,6 +909,7 @@ namespace RendererProfileConfig
 			{ "input", "vprenderer.input", true },
 			{ "scaling", "vprenderer.scaling", true },
 			{ "display", "vprenderer", false },
+			{ "output", "vprenderer.output", true },
 			{ "viewport", "vprenderer.viewport", true },
 			{ "queue", "queue", true },
 			{ "lldv", "lldv", true }
@@ -1242,6 +1266,9 @@ namespace RendererProfileConfig
 		std::string value;
 		const std::vector<ConfigSchema::KeyRule> generalRules = {
 			ConfigSchema::Boolean("persist_profile_selection"),
+			ConfigSchema::Choice("profile_update_mode",
+				{ "rebuild", "live", "never" }),
+			ConfigSchema::Boolean("live_profile_updates"),
 			ConfigSchema::Boolean("switch_refresh_rate"),
 			ConfigSchema::Integer("event_action_delay_seconds", 0, 30),
 			ConfigSchema::Boolean("output_diagnostics"),
@@ -1267,7 +1294,9 @@ namespace RendererProfileConfig
 			if (!display)
 				continue;
 			const std::set<std::string> baseKeys = {
-				"sdr_target_nits", "sdr_black_nits", "switch_refresh_rate",
+				"sdr_target_nits", "sdr_black_nits", "profile_update_mode",
+				"live_profile_updates",
+				"switch_refresh_rate",
 				"quality", "tone_mapping", "gamut_mapping", "peak_detection",
 				"contrast_recovery", "upscaler", "downscaler", "deband",
 				"deband_strength", "sigmoid", "dithering", "display_bit_depth", "output_presentation",
@@ -1298,7 +1327,7 @@ namespace RendererProfileConfig
 				return false;
 		}
 
-		const std::vector<std::string> expectedGroups = { "input", "scaling", "display", "viewport", "queue" };
+		const std::vector<std::string> expectedGroups = { "input", "scaling", "display", "output", "viewport", "queue" };
 		for (const std::string& groupName : expectedGroups)
 		{
 			const std::string section = "profile_groups." + groupName;

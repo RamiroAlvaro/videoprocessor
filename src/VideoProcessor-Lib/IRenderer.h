@@ -100,6 +100,10 @@ public:
 	// successful submit/present boundary.
 	virtual bool HasPresentedLiveFrame() const { return false; }
 	virtual const char* PresentedLiveFrameEvidence() const { return "unavailable"; }
+	virtual uint64_t PresentedFrameCount() const { return 0; }
+	virtual bool PersistShaderCache() { return false; }
+	virtual void SetNonCapturingPreparationMode(bool) {}
+	virtual bool ReloadConfiguredShaderPrewarm() { return true; }
 	virtual bool GetLivenessSnapshot(RendererLivenessSnapshot& snapshot) const
 	{
 		snapshot = {};
@@ -209,10 +213,12 @@ public:
 	// backends consume this state but never resolve keys or persist profiles.
 	virtual bool ApplyApplicationState(
 		const UnifiedProfileRuntime::Snapshot& snapshot,
-		CString& activeState, bool& rendererRestartRequired)
+		CString& activeState, bool& rendererRestartRequired,
+		bool& liveResetRequired)
 	{
 		activeState.Empty();
 		rendererRestartRequired = false;
+		liveResetRequired = false;
 		return false;
 	}
 	// Select a named renderer display profile, or "auto" to return to the
