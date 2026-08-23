@@ -13,6 +13,7 @@
 #include <set>
 #include <map>
 #include <atomic>
+#include <cstdint>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -30,10 +31,12 @@
 #include <RendererResetPolicy.h>
 #include <RendererRetirementService.h>
 #include <RendererTransitionModel.h>
+#include <QueueProfileRestartPolicy.h>
 #include <UnifiedProfileRuntime.h>
 #include <VideoFrame.h>
 #include <FullscreenVideoWindow.h>
 #include <RendererTransitionWindow.h>
+#include <ShaderLoadingWindow.h>
 #include <VideoConversionOverride.h>
 #include <WindowedVideoWindow.h>
 #include <microsoft_directshow/DirectShowRendererStartStopTimeMethod.h>
@@ -64,7 +67,8 @@
 #define WM_MESSAGE_RENDERER_RETIRED                     (WM_APP + 13)
 #define WM_MESSAGE_EXTERNAL_SHORTCUT                    (WM_APP + 14)
 #define WM_MESSAGE_RENDERER_INTENT_READY                (WM_APP + 15)
-#define WM_MESSAGE_RENDERER_PRESENTATION_STATUS          (WM_APP + 16)
+#define WM_MESSAGE_RENDERER_GRAPH_EVENT                 (WM_APP + 16)
+#define WM_MESSAGE_RENDERER_RESTART_REQUIRED            (WM_APP + 17)
 
 // Timer IDs
 #define TIMER_ID_1SECOND 1
@@ -83,9 +87,11 @@
 #define SHADER_SHORTCUT_DEBOUNCE_MS 75
 #define LLDV_PROFILE_APPLY_TIMER_ID 12
 #define CONFIGURATION_LIVE_APPLY_TIMER_ID 13
+#define QUEUE_PROFILE_RESTART_TIMER_ID 14
 #define CONFIGURATION_EDITOR_HOTKEY_ID 0x5650
 #define SHADER_RULE_REFRESH_INTERVAL_MS 25
 #define CONFIGURATION_LIVE_APPLY_INTERVAL_MS 250
+#define QUEUE_PROFILE_RESTART_DEBOUNCE_MS 100
 #define BACKGROUND_SHORTCUT_DUPLICATE_WINDOW_MS 250
 
 
@@ -208,7 +214,9 @@ public:
 	afx_msg LRESULT OnMessageDirectShowNotification(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnMessageRendererStateChange(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnMessageRendererDetailString(WPARAM wParam, LPARAM lParam);
-	afx_msg LRESULT OnMessageRendererPresentationStatus(WPARAM wParam, LPARAM lParam);
+	afx_msg LRESULT OnMessageRendererGraphEvent(WPARAM wParam, LPARAM lParam);
+	afx_msg LRESULT OnMessageRendererRestartRequired(
+		WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnMessageExternalShortcut(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnMessageRendererLiveFrame(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnMessageRendererResetRequest(
@@ -255,10 +263,13 @@ public:
 	void OnCaptureDeviceError(const CString& error) override;
 
 	// IRendererCallback
-	void OnRendererState(RendererState rendererState) override;
-	void OnRendererDetailString(const CString& details) override;
-	void OnRendererPresentationStatus(const CString& status, bool visible) override;
-	void OnRendererRestartRequired() override;
+	void OnRendererState(
+		RendererState rendererState, uint32_t rendererGeneration) override;
+	void OnRendererDetailString(
+		const CString& details, uint32_t rendererGeneration) override;
+	void OnRendererGraphEvent(
+		long eventCode, uint32_t rendererGeneration) override;
+	void OnRendererRestartRequired(uint32_t rendererGeneration) override;
 
 protected:
 
@@ -416,6 +427,7 @@ protected:
 	HICON m_hIcon;
 	HACCEL m_accelerator = nullptr;
 	std::vector<ACCEL> m_configuredAccelerators;
+	bool m_shortcutsForegroundOnly = false;
 	bool m_configurationEditorModal = false;
 	bool m_configurationEditorActivationPending = false;
 	bool m_configurationEditorFallbackLaunched = false;
@@ -427,20 +439,29 @@ protected:
 	ULONGLONG m_configurationEditorActivationAcknowledgedTick = 0;
 	HWND m_configurationEditorHwnd = nullptr;
 	DWORD m_configurationEditorProcessId = 0;
+	uint32_t m_configurationEditorPresentationSequence = 0;
+	uint32_t m_configurationEditorPresentationRequired = 0;
+	uint32_t m_configurationEditorPresentationAcknowledged = 0;
+	HWND m_configurationEditorPresentationEditor = nullptr;
+	HWND m_configurationEditorPresentationTarget = nullptr;
+	ULONGLONG m_configurationEditorPresentationQueuedTick = 0;
+	bool m_configurationEditorPresentationTimeoutLogged = false;
 	WORD m_lastBackgroundShortcutCommand = 0;
 	ULONGLONG m_lastBackgroundShortcutTick = 0;
 	HANDLE m_configurationChangedEvent = nullptr;
-	HANDLE m_shaderPreparationEvent = nullptr;
 	std::map<std::string, std::map<std::string, std::string>>
 		m_configurationSnapshot;
 	struct StagedRuntimeSettings
 	{
+		bool shortcutsForegroundOnly = false;
 		bool hasCaptureDevice = false;
 		CString captureDevice;
 		bool hasCaptureInput = false;
 		CString captureInput;
 		bool hasRenderer = false;
 		CString renderer;
+		bool hasFullscreenMonitorName = false;
+		CString fullscreenMonitorName;
 		bool hasFrameOffset = false;
 		bool frameOffsetAuto = false;
 		int frameOffsetMs = 0;
@@ -637,8 +658,11 @@ protected:
 
 
 	std::shared_ptr<IVideoRenderer> m_videoRenderer;
+	std::shared_ptr<IVideoRenderer> m_failedRendererRetirement;
+	ULONGLONG m_failedRendererRetirementNextRetryTick = 0;
 	RendererRetirementService m_rendererRetirementService;
 	bool m_rendererRetirementPending = false;
+	bool m_rendererRetirementRetryActive = false;
 	bool m_rendererConstructionActive = false;
 	uint64_t m_rendererRetirementToken = 0;
 	uint64_t m_rendererRetirementWaitLoggedToken = 0;
@@ -646,6 +670,8 @@ protected:
 	uint32_t m_retiringRendererGeneration = 0;
 	RendererState m_rendererState = RendererState::RENDERSTATE_UNKNOWN;
 	RendererTransitionWindow m_rendererTransitionWindow;
+	ShaderLoadingWindow m_shaderLoadingWindow;
+	ULONGLONG m_shaderLoadingPopupShownTick = 0;
 	HWND m_rendererTargetHwnd = nullptr;
 	bool m_preserveFullscreenHostForProfileRestart = false;
 	bool m_fullscreenRetargetPending = false;
@@ -725,6 +751,11 @@ protected:
 	std::map<WORD, CString> m_unifiedProfileShortcutKeys;
 	WORD m_lastUnifiedProfileCommand = 0;
 	DWORD m_lastUnifiedProfileCommandTime = 0;
+	QueueProfileRestartPolicy::PendingRequest m_queueProfileRestartRequest;
+	bool m_queueProfileRestartCompletionPending = false;
+	uint32_t m_queueProfileRestartStartingGeneration = 0;
+	std::string m_queueProfileRestartCompletionProfile;
+	std::string m_queueProfileRestartCompletionSource;
 
 	uint32_t m_timerSeconds = 0;
 
@@ -741,6 +772,11 @@ protected:
 	// Stats overlay
 	StatsOverlayWindow* m_statsOverlay = nullptr;
 	StatsData* m_lastStatsData = nullptr;
+	// Renderer telemetry getters are deliberately nonblocking. Retain their
+	// last valid values only within the same renderer/host generation when a
+	// periodic OSD read loses the render-lock race.
+	const IVideoRenderer* m_lastStatsTelemetryRenderer = nullptr;
+	uint32_t m_lastStatsTelemetryGeneration = 0;
 	bool m_statsOverlayRequestedVisible = false;
 
 	struct ActiveOutputSweepCase
@@ -860,11 +896,6 @@ protected:
 	void ApplyStatsOverlayForActiveRenderer();
 	void LoadDisplayRefreshRateOverrides();
 	void ApplySavedConfiguration();
-	void StartShaderPreparation();
-	void AdvanceShaderPreparation();
-	void FinishShaderPreparation(bool succeeded, const char* detail);
-	void PublishShaderPreparationStatus(const char* state, size_t current,
-		size_t total, const char* message) const;
 	void UpdateActiveOutputSweep(ULONGLONG now);
 	bool StartActiveOutputSweep();
 	bool ApplyActiveOutputSweepCase(size_t index);
@@ -884,6 +915,7 @@ protected:
 	bool PublishStagedShortcutsOnly();
 	bool ReplaceStagedAccelerators();
 	bool StageRuntimeSettings(const ConfigFile& config, std::string& error);
+	void PublishStagedFullscreenMonitorSelection();
 	void PublishStagedRuntimeSettings();
 	void RestoreAcceptedRendererSelectionAfterReloadFailure();
 	bool EstablishSessionRendererOverrideFromSelection(const char* reason);
@@ -891,6 +923,7 @@ protected:
 	void ReloadConfiguredAccelerators();
 	void StartGlobalShortcutObserver();
 	void StopGlobalShortcutObserver();
+	void RequestPresentationFocus(const char* reason, unsigned int generation);
 	void ToggleConfigurationEditor();
 	void StartConfigurationEditorInTray();
 	// Legacy activation-intent cleanup retained for source compatibility only;
@@ -899,8 +932,7 @@ protected:
 	void TrackConfigurationEditor(HWND editor);
 	HWND VisibleAssociatedConfigurationEditor() const;
 	bool RequestConfigurationEditorReveal(HWND editor);
-	bool PublishConfigurationEditorPresentationTarget(HWND editor,
-		bool synchronous = false);
+	bool PublishConfigurationEditorPresentationTarget(HWND editor);
 	bool RequestConfigurationEditorOneShotReassert(HWND editor,
 		HWND presentationTarget);
 	HWND ConfigurationEditorOwner();
@@ -928,16 +960,11 @@ protected:
 	void PublishActiveProfileStatus();
 	void ApplyUnifiedProfileSnapshot(
 		const std::shared_ptr<const UnifiedProfileRuntime::Snapshot>& snapshot,
-		bool allowRestart);
-	bool ApplyShaderPreparationSnapshot(
-		const std::shared_ptr<const UnifiedProfileRuntime::Snapshot>& snapshot);
-	bool m_shaderPreparationActive = false;
-	bool m_shaderPreparationRestoring = false;
-	std::vector<std::shared_ptr<const UnifiedProfileRuntime::Snapshot>>
-		m_shaderPreparationSnapshots;
-	std::shared_ptr<const UnifiedProfileRuntime::Snapshot>
-		m_shaderPreparationOriginalSnapshot;
-	size_t m_shaderPreparationIndex = 0;
+		bool allowRestart, bool queueProfileRestart = false);
+	void QueueUnifiedQueueProfileRendererRestart(
+		const std::shared_ptr<const UnifiedProfileRuntime::Snapshot>& snapshot,
+		const std::string& source);
+	void DispatchQueuedQueueProfileRendererRestart();
 	void ScheduleUnifiedProfileActions(
 		const std::vector<UnifiedProfileRuntime::ActionInvocation>& actions);
 	void PublishUnifiedProfileEvent(const std::string& event,
@@ -966,6 +993,7 @@ protected:
 	void OnOK() override;
 	afx_msg void OnPaint();
 	afx_msg void OnSize(UINT nType, int cx, int cy);
+	afx_msg void OnMove(int x, int y);
 	afx_msg void OnSetFocus(CWnd* pOldWnd);
 	afx_msg void OnClose();
 	afx_msg void OnSysCommand(UINT command, LPARAM lParam);
@@ -973,6 +1001,8 @@ protected:
 	afx_msg LRESULT OnConfigurationEditorHotkey(WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnConfigurationEditorAssociation(WPARAM wParam,
 		LPARAM lParam);
+	afx_msg LRESULT OnConfigurationEditorPresentationTargetAcknowledgement(
+		WPARAM wParam, LPARAM lParam);
 	afx_msg void OnCommandToggleNoUi();
 	afx_msg HCURSOR	OnQueryDragIcon();
 	afx_msg void OnGetMinMaxInfo(MINMAXINFO* minMaxInfo);

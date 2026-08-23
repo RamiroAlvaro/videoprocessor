@@ -54,6 +54,7 @@
 #include <EventActionLauncher.h>
 #include <DisplayRefreshRateEstimator.h>
 #include <DisplayRefreshRatePolicy.h>
+#include <RendererGenerationGate.h>
 #include <RendererProfileConfig.h>
 #include <MainConfigSchema.h>
 #include <UnifiedProfileRuntime.h>
@@ -86,6 +87,19 @@ bool GetApplicationDirectory(std::wstring& directory)
 std::wstring ConfigurationEditorPath(const std::wstring& applicationDirectory)
 {
 	return applicationDirectory + ConfigurationEditorRelativePath;
+}
+
+bool ReadShortcutsForegroundOnly(const ConfigFile& config, bool& enabled,
+	std::string& error)
+{
+	enabled = false;
+	std::string raw;
+	if (!config.TryGetString("shortcuts", "foreground_only", raw))
+		return true;
+	if (config.TryGetBool("shortcuts", "foreground_only", enabled))
+		return true;
+	error = "unsupported value for shortcuts.foreground_only: " + raw;
+	return false;
 }
 
 std::wstring ConfigurationEditorDirectory(
@@ -1807,12 +1821,16 @@ DisplayTimingSnapshot GetDisplayTimingSnapshot(HWND hwnd)
 
 static UINT WM_CONFIGURATION_EDITOR_ASSOCIATION =
 	::RegisterWindowMessageW(L"VideoProcessor.ConfigEditor.Association.v1");
+static UINT WM_CONFIGURATION_EDITOR_PRESENTATION_TARGET_ACKNOWLEDGEMENT =
+	::RegisterWindowMessageW(
+		L"VideoProcessor.ConfigEditor.PresentationTargetAck.v2");
 
 BEGIN_MESSAGE_MAP(CVideoProcessorDlg, CDialog)
 
 	// Pre-baked callbacks
 	ON_WM_PAINT()
 	ON_WM_SIZE()
+	ON_WM_MOVE()
 	ON_WM_QUERYDRAGICON()
 	ON_WM_GETMINMAXINFO()
 	ON_WM_SETFOCUS()
@@ -1857,12 +1875,13 @@ BEGIN_MESSAGE_MAP(CVideoProcessorDlg, CDialog)
 	ON_MESSAGE(WM_MESSAGE_DIRECTSHOW_NOTIFICATION, &CVideoProcessorDlg::OnMessageDirectShowNotification)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_STATE_CHANGE, &CVideoProcessorDlg::OnMessageRendererStateChange)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_DETAIL_STRING, &CVideoProcessorDlg::OnMessageRendererDetailString)
-	ON_MESSAGE(WM_MESSAGE_RENDERER_PRESENTATION_STATUS, &CVideoProcessorDlg::OnMessageRendererPresentationStatus)
 	ON_MESSAGE(WM_MESSAGE_EXTERNAL_SHORTCUT, &CVideoProcessorDlg::OnMessageExternalShortcut)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_LIVE_FRAME, &CVideoProcessorDlg::OnMessageRendererLiveFrame)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_RESET_REQUEST, &CVideoProcessorDlg::OnMessageRendererResetRequest)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_RETIRED, &CVideoProcessorDlg::OnMessageRendererRetired)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_INTENT_READY, &CVideoProcessorDlg::OnMessageRendererIntentReady)
+	ON_MESSAGE(WM_MESSAGE_RENDERER_GRAPH_EVENT, &CVideoProcessorDlg::OnMessageRendererGraphEvent)
+	ON_MESSAGE(WM_MESSAGE_RENDERER_RESTART_REQUIRED, &CVideoProcessorDlg::OnMessageRendererRestartRequired)
 	ON_MESSAGE(WM_MODERN_OPERATOR_ACTION, &CVideoProcessorDlg::OnMessageModernOperatorAction)
 
 	// Command handlers (from accelerator)
@@ -1884,6 +1903,9 @@ BEGIN_MESSAGE_MAP(CVideoProcessorDlg, CDialog)
 	ON_MESSAGE(WM_HOTKEY, &CVideoProcessorDlg::OnConfigurationEditorHotkey)
 	ON_REGISTERED_MESSAGE(WM_CONFIGURATION_EDITOR_ASSOCIATION,
 		&CVideoProcessorDlg::OnConfigurationEditorAssociation)
+	ON_REGISTERED_MESSAGE(
+		WM_CONFIGURATION_EDITOR_PRESENTATION_TARGET_ACKNOWLEDGEMENT,
+		&CVideoProcessorDlg::OnConfigurationEditorPresentationTargetAcknowledgement)
 	ON_COMMAND_RANGE(ID_COMMAND_SHADER_RULE_FIRST, ID_COMMAND_SHADER_RULE_LAST, &CVideoProcessorDlg::OnCommandShaderRule)
 	ON_COMMAND_RANGE(ID_COMMAND_DISPLAY_RULE_FIRST, ID_COMMAND_DISPLAY_RULE_LAST, &CVideoProcessorDlg::OnCommandDisplayRule)
 	ON_COMMAND_RANGE(ID_COMMAND_UNIFIED_PROFILE_FIRST, ID_COMMAND_UNIFIED_PROFILE_LAST, &CVideoProcessorDlg::OnCommandDisplayRule)
@@ -2025,14 +2047,20 @@ CVideoProcessorDlg::CVideoProcessorDlg():
 		CreateEvent(nullptr, TRUE, FALSE, nullptr);
 	m_configurationChangedEvent = CreateEventW(nullptr, FALSE, FALSE,
 		ConfigurationLiveApply::ChangedEventName);
-	m_shaderPreparationEvent = CreateEventW(nullptr, FALSE, FALSE,
-		ConfigurationLiveApply::ShaderPreparationEventName);
 	LoadDisplayRefreshRateOverrides();
 
 	ConfigFile profileConfig;
 	if (profileConfig.Load())
 	{
 		m_configurationSnapshot = CaptureConfigurationSnapshot(profileConfig);
+		std::string shortcutPolicyError;
+		if (!ReadShortcutsForegroundOnly(profileConfig,
+			m_shortcutsForegroundOnly, shortcutPolicyError))
+		{
+			m_shortcutsForegroundOnly = false;
+			DebugLog::Log("Shortcut focus policy retained default: %s",
+				shortcutPolicyError.c_str());
+		}
 		std::string profileError;
 		if (!m_profileRuntime.Initialize(profileConfig,
 			GetUnifiedProfileSourceLookup(), profileError))
@@ -2166,9 +2194,16 @@ void CVideoProcessorDlg::StartGlobalShortcutObserver()
 {
 	StopGlobalShortcutObserver();
 	if (!ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(
-		m_interfaceMode == ApplicationInterface::Mode::Modern, m_hideUI) ||
+		m_interfaceMode == ApplicationInterface::Mode::Modern, m_hideUI,
+		m_shortcutsForegroundOnly) ||
 		!GetSafeHwnd())
+	{
+		DebugLog::Log(
+			"Background shortcut observer suppressed: modern=%d noui=%d foreground_only=%d",
+			m_interfaceMode == ApplicationInterface::Mode::Modern ? 1 : 0,
+			m_hideUI ? 1 : 0, m_shortcutsForegroundOnly ? 1 : 0);
 		return;
+	}
 
 	const bool observerStarted = GlobalShortcutObserver::Start(GetSafeHwnd(),
 		m_configuredAccelerators);
@@ -2314,7 +2349,7 @@ LRESULT CVideoProcessorDlg::OnConfigurationEditorAssociation(
 }
 
 bool CVideoProcessorDlg::PublishConfigurationEditorPresentationTarget(
-	HWND editor, bool synchronous)
+	HWND editor)
 {
 	if (!editor || !::IsWindow(editor))
 		return false;
@@ -2349,42 +2384,165 @@ bool CVideoProcessorDlg::PublishConfigurationEditorPresentationTarget(
 		return false;
 	}
 	static const UINT targetMessage = ::RegisterWindowMessageW(
-		L"VideoProcessor.ConfigEditor.PresentationTarget.v1");
-	if (!targetMessage)
+		L"VideoProcessor.ConfigEditor.PresentationTarget.v2");
+	static const UINT acknowledgementEndpointMessage =
+		::RegisterWindowMessageW(
+			L"VideoProcessor.ConfigEditor.PresentationTargetAckEndpoint.v1");
+	const HWND acknowledgementEndpoint = GetSafeHwnd();
+	if (!targetMessage || !acknowledgementEndpointMessage ||
+		!acknowledgementEndpoint || !::IsWindow(acknowledgementEndpoint))
 		return false;
-	DWORD_PTR acknowledgement = 0;
-	LRESULT delivered = 0;
-	bool accepted = false;
-	if (synchronous)
+	const ULONGLONG now = GetTickCount64();
+	if (editor == m_configurationEditorPresentationEditor &&
+		target == m_configurationEditorPresentationTarget &&
+		m_configurationEditorPresentationRequired != 0)
 	{
-		delivered = ::SendMessageTimeoutW(editor, targetMessage,
-			static_cast<WPARAM>(GetCurrentProcessId()),
-			reinterpret_cast<LPARAM>(target),
-			SMTO_ABORTIFHUNG | SMTO_BLOCK, 250, &acknowledgement);
-		accepted = delivered != 0 && acknowledgement == 1;
+		if (m_configurationEditorPresentationAcknowledged ==
+			m_configurationEditorPresentationRequired)
+		{
+			return true;
+		}
+		if (m_configurationEditorPresentationQueuedTick != 0 &&
+			now - m_configurationEditorPresentationQueuedTick < 1500)
+		{
+			return true;
+		}
 	}
-	else
+	uint32_t sequence = ++m_configurationEditorPresentationSequence;
+	if (sequence == 0)
+		sequence = ++m_configurationEditorPresentationSequence;
+	const WPARAM request =
+		(static_cast<WPARAM>(sequence) << 32) |
+		static_cast<WPARAM>(GetCurrentProcessId());
+	const BOOL endpointQueued = ::PostMessageW(editor,
+		acknowledgementEndpointMessage,
+		static_cast<WPARAM>(GetCurrentProcessId()),
+		reinterpret_cast<LPARAM>(acknowledgementEndpoint));
+	if (!endpointQueued)
 	{
-		delivered = ::PostMessageW(editor, targetMessage,
-			static_cast<WPARAM>(GetCurrentProcessId()),
-			reinterpret_cast<LPARAM>(target));
-		accepted = delivered != 0;
+		DebugLog::Log(
+			"Configuration editor presentation acknowledgement endpoint queue failed: editor=%p endpoint=%p error=%lu",
+			reinterpret_cast<void*>(editor),
+			reinterpret_cast<void*>(acknowledgementEndpoint), GetLastError());
+		return false;
 	}
-	if (synchronous &&
-		ConfigurationLiveApply::ShouldRequestConfigurationEditorOneShotReassert(
-			accepted, ::IsWindow(editor) != FALSE))
-		RequestConfigurationEditorOneShotReassert(editor, target);
+	const BOOL queued = ::PostMessageW(editor, targetMessage, request,
+		reinterpret_cast<LPARAM>(target));
+	if (!queued)
+	{
+		DebugLog::Log(
+			"Configuration editor presentation target queue failed: editor=%p target=%p target_pid=%lu sequence=%u error=%lu",
+			reinterpret_cast<void*>(editor), reinterpret_cast<void*>(target),
+			targetProcessId, sequence, GetLastError());
+		return false;
+	}
+	m_configurationEditorPresentationRequired = sequence;
+	m_configurationEditorPresentationEditor = editor;
+	m_configurationEditorPresentationTarget = target;
+	m_configurationEditorPresentationQueuedTick = now;
+	m_configurationEditorPresentationTimeoutLogged = false;
 	DebugLog::Log(
-		"Configuration editor presentation owner handoff: editor=%p target=%p target_pid=%lu monitor=%p mode=%s delivered=%lld ack=%llu accepted=%d",
+		"Configuration editor presentation target queued: editor=%p target=%p target_pid=%lu monitor=%p sequence=%u queued=1 acknowledgement=awaiting",
 		reinterpret_cast<void*>(editor), reinterpret_cast<void*>(target),
 		targetProcessId,
 		reinterpret_cast<void*>(::MonitorFromWindow(
-			target, MONITOR_DEFAULTTONEAREST)),
-		synchronous ? "sync-before-reveal" : "async-target-change",
-		static_cast<long long>(delivered),
-		static_cast<unsigned long long>(acknowledgement),
-		accepted ? 1 : 0);
-	return accepted;
+			target, MONITOR_DEFAULTTONEAREST)), sequence);
+	return true;
+}
+
+LRESULT CVideoProcessorDlg::OnConfigurationEditorPresentationTargetAcknowledgement(
+	WPARAM wParam, LPARAM lParam)
+{
+	const uint32_t sequence = static_cast<uint32_t>(wParam);
+	const HWND acknowledgedEditor = reinterpret_cast<HWND>(lParam);
+	if (sequence == 0 ||
+		sequence != m_configurationEditorPresentationRequired ||
+		acknowledgedEditor != m_configurationEditorPresentationEditor)
+	{
+		DebugLog::Log(
+			"Configuration editor presentation target acknowledgement ignored: sequence=%u required=%u editor=%p expected=%p",
+			sequence, m_configurationEditorPresentationRequired,
+			reinterpret_cast<void*>(acknowledgedEditor),
+			reinterpret_cast<void*>(m_configurationEditorPresentationEditor));
+		return 0;
+	}
+	if (!m_configurationEditorPresentationEditor ||
+		!::IsWindow(m_configurationEditorPresentationEditor) ||
+		!IsConfigurationEditorTopLevel(
+			m_configurationEditorPresentationEditor,
+			m_configurationEditorProcessId, false) ||
+		!m_configurationEditorPresentationTarget ||
+		!::IsWindow(m_configurationEditorPresentationTarget))
+	{
+		DebugLog::Log(
+			"Configuration editor presentation target acknowledgement rejected: sequence=%u editor=%p target=%p reason=stale-window",
+			sequence,
+			reinterpret_cast<void*>(m_configurationEditorPresentationEditor),
+			reinterpret_cast<void*>(m_configurationEditorPresentationTarget));
+		return 0;
+	}
+	m_configurationEditorPresentationAcknowledged = sequence;
+	m_configurationEditorPresentationQueuedTick = 0;
+	m_configurationEditorPresentationTimeoutLogged = false;
+	DebugLog::Log(
+		"Configuration editor presentation target acknowledged: editor=%p target=%p sequence=%u accepted=1",
+		reinterpret_cast<void*>(m_configurationEditorPresentationEditor),
+		reinterpret_cast<void*>(m_configurationEditorPresentationTarget), sequence);
+	RequestConfigurationEditorOneShotReassert(
+		m_configurationEditorPresentationEditor,
+		m_configurationEditorPresentationTarget);
+	return 1;
+}
+
+void CVideoProcessorDlg::RequestPresentationFocus(const char* reason,
+	unsigned int generation)
+{
+	HWND configurationEditor = VisibleAssociatedConfigurationEditor();
+	if (!configurationEditor)
+		configurationEditor = FindConfigurationEditorForCurrentInstallation();
+	const bool configurationVisible = configurationEditor &&
+		::IsWindow(configurationEditor) &&
+		::IsWindowVisible(configurationEditor);
+
+	const HWND fullscreenTarget = m_fullScreenVideoWindow &&
+		::IsWindow(m_fullScreenVideoWindow->GetHWND()) ?
+		m_fullScreenVideoWindow->GetHWND() : nullptr;
+	const HWND windowedTarget =
+		::IsWindow(m_windowedVideoWindow.GetSafeHwnd()) ?
+		m_windowedVideoWindow.GetSafeHwnd() : nullptr;
+	HWND target = reinterpret_cast<HWND>(
+		ConfigurationLiveApply::SelectConfigurationEditorPresentationTarget(
+			m_rendererFullscreenCheck.GetCheck() != FALSE,
+			reinterpret_cast<uintptr_t>(fullscreenTarget),
+			::IsWindow(m_rendererTargetHwnd) ?
+				reinterpret_cast<uintptr_t>(m_rendererTargetHwnd) : 0,
+			reinterpret_cast<uintptr_t>(windowedTarget)));
+	if (target && ::IsWindow(target))
+		target = ::GetAncestor(target, GA_ROOT);
+	if (!target || !::IsWindow(target))
+		target = GetSafeHwnd();
+	DWORD targetProcessId = 0;
+	if (target) ::GetWindowThreadProcessId(target, &targetProcessId);
+	const bool validTarget = target && ::IsWindow(target) &&
+		targetProcessId == GetCurrentProcessId();
+	if (!ConfigurationLiveApply::ShouldRequestPresentationFocus(
+		m_shortcutsForegroundOnly, configurationVisible, validTarget))
+	{
+		DebugLog::Log(
+			"Presentation focus request skipped: reason=%s generation=%u foreground_only=%d config_visible=%d valid_target=%d target=%p",
+			reason, generation, m_shortcutsForegroundOnly ? 1 : 0,
+			configurationVisible ? 1 : 0, validTarget ? 1 : 0, target);
+		return;
+	}
+
+	if (::IsIconic(target)) ::ShowWindowAsync(target, SW_RESTORE);
+	::BringWindowToTop(target);
+	const BOOL requested = ::SetForegroundWindow(target);
+	const HWND foreground = ::GetForegroundWindow();
+	DebugLog::Log(
+		"Presentation focus request: reason=%s generation=%u target=%p requested=%d foreground=%p acquired=%d",
+		reason, generation, target, requested ? 1 : 0, foreground,
+		foreground == target ? 1 : 0);
 }
 
 bool CVideoProcessorDlg::RequestConfigurationEditorOneShotReassert(
@@ -2432,7 +2590,7 @@ bool CVideoProcessorDlg::RequestConfigurationEditorReveal(HWND editor)
 
 	DWORD_PTR acknowledgement = 0;
 	bool messageDelivered = false;
-	PublishConfigurationEditorPresentationTarget(target, true);
+	PublishConfigurationEditorPresentationTarget(target);
 	if (SendConfigurationEditorRevealOnce(target,
 		ConfigurationEditorOwner(), GetCurrentProcessId(), messageDelivered,
 		acknowledgement))
@@ -2459,7 +2617,7 @@ bool CVideoProcessorDlg::RequestConfigurationEditorReveal(HWND editor)
 		return false;
 	}
 	TrackConfigurationEditor(rediscovered);
-	PublishConfigurationEditorPresentationTarget(rediscovered, true);
+	PublishConfigurationEditorPresentationTarget(rediscovered);
 	DWORD_PTR retryAcknowledgement = 0;
 	bool retryDelivered = false;
 	const bool acknowledged = SendConfigurationEditorRevealOnce(rediscovered,
@@ -2629,6 +2787,11 @@ void CVideoProcessorDlg::ApplySavedConfiguration()
 {
 	if (!StageSavedConfiguration("editor-apply", false))
 		return;
+	// The target is read when a fullscreen host is created, so publish an
+	// accepted monitor change before any renderer transition. This preserves the
+	// current presentation state while making the next fullscreen entry use the
+	// newly saved monitor.
+	PublishStagedFullscreenMonitorSelection();
 
 	switch (m_stagedConfigurationAction)
 	{
@@ -3521,6 +3684,22 @@ bool CVideoProcessorDlg::StageSavedConfiguration(
 	m_stagedConfigurationAction =
 		ConfigurationApplyPolicy::ClassifyChanges(changedValues,
 			directShowActive);
+	const bool fullscreenMonitorSelectionChanged = std::any_of(
+		changedValues.begin(), changedValues.end(),
+		ConfigurationApplyPolicy::IsFullscreenMonitorSelectionChange);
+	if (fullscreenMonitorSelectionChanged)
+	{
+		m_stagedRuntimeSettings.hasFullscreenMonitorName = true;
+		std::string fullscreenMonitorName;
+		if (candidate->TryGetString("general", "fullscreen_monitor_name",
+			fullscreenMonitorName) ||
+			candidate->TryGetString("command_line", "fullscreen_monitor_name",
+				fullscreenMonitorName))
+		{
+			m_stagedRuntimeSettings.fullscreenMonitorName =
+				fullscreenMonitorName.c_str();
+		}
+	}
 	m_stagedShortcutsChanged = std::any_of(changedValues.begin(),
 		changedValues.end(), ConfigurationApplyPolicy::IsShortcutAffectingChange);
 	stageAccelerators = stageAccelerators ||
@@ -3661,6 +3840,9 @@ bool CVideoProcessorDlg::StageRuntimeSettings(
 		return false;
 	};
 	std::string value;
+	if (!ReadShortcutsForegroundOnly(config,
+		m_stagedRuntimeSettings.shortcutsForegroundOnly, error))
+		return false;
 	if (getApplicationValue("capture_device", value))
 	{
 		m_stagedRuntimeSettings.hasCaptureDevice = true;
@@ -3933,6 +4115,19 @@ bool CVideoProcessorDlg::StageRuntimeSettings(
 	return true;
 }
 
+void CVideoProcessorDlg::PublishStagedFullscreenMonitorSelection()
+{
+	if (!m_stagedRuntimeSettings.hasFullscreenMonitorName)
+		return;
+	const CString previousSelection = m_fullscreenMonitorName;
+	FullscreenMonitorName(m_stagedRuntimeSettings.fullscreenMonitorName);
+	DebugLog::Log(
+		"Configuration fullscreen monitor selection published: previous='%S' current='%S' effect=next-fullscreen",
+		previousSelection.IsEmpty() ? L"(default)" : previousSelection.GetString(),
+		m_fullscreenMonitorName.IsEmpty() ? L"(default)" :
+			m_fullscreenMonitorName.GetString());
+}
+
 void CVideoProcessorDlg::PublishStagedRuntimeSettings()
 {
 	const auto sessionPresentation =
@@ -4161,9 +4356,13 @@ bool CVideoProcessorDlg::ReplaceStagedAccelerators()
 		std::move(m_stagedUnifiedProfileShortcutKeys);
 	m_configuredAccelerators =
 		std::move(m_stagedConfiguredAccelerators);
+	m_shortcutsForegroundOnly =
+		m_stagedRuntimeSettings.shortcutsForegroundOnly;
 	if (previous)
 		DestroyAcceleratorTable(previous);
 	StartGlobalShortcutObserver();
+	DebugLog::Log("Shortcut focus policy applied live: foreground_only=%d",
+		m_shortcutsForegroundOnly ? 1 : 0);
 	return true;
 }
 
@@ -4390,12 +4589,6 @@ CVideoProcessorDlg::~CVideoProcessorDlg()
 		CloseHandle(m_configurationChangedEvent);
 		m_configurationChangedEvent = nullptr;
 	}
-	if (m_shaderPreparationEvent)
-	{
-		CloseHandle(m_shaderPreparationEvent);
-		m_shaderPreparationEvent = nullptr;
-	}
-
 	for (auto& captureDevice : m_captureDevices)
 		(*captureDevice).Release();
 
@@ -5610,100 +5803,27 @@ LRESULT CVideoProcessorDlg::OnMessageCaptureDeviceError(WPARAM wParam, LPARAM lP
 }
 LRESULT CVideoProcessorDlg::OnMessageDirectShowNotification(WPARAM wParam, LPARAM lParam)
 {
+	const uint32_t messageGeneration = static_cast<uint32_t>(lParam);
+	const uint32_t currentGeneration =
+		m_rendererGeneration.load(std::memory_order_acquire);
 	const std::shared_ptr<IVideoRenderer> renderer =
 		std::atomic_load_explicit(
 			&m_videoRenderer, std::memory_order_acquire);
-	if (renderer)
+	if (!RendererGenerationGate::Accept(
+		messageGeneration, currentGeneration, renderer != nullptr) ||
+		!m_activeRendererIsDirectShow)
 	{
-		// Enhanced DirectShow event handling for MadVR changes
-		// We'll intercept events before passing them to the renderer to detect important changes
-
-		// First call the renderer to process DirectShow events and get any graph events
-		HRESULT hr = renderer->OnWindowsEvent(wParam, lParam);
-
-		// Now check for specific DirectShow graph events that indicate MadVR changes
-		// These events are typically sent via the DirectShow event system
-		if (SUCCEEDED(hr))
-		{
-			// Try to detect specific DirectShow events that affect MadVR
-			// Note: The exact event codes depend on DirectShow implementation
-			// We'll add logging to detect what events we're getting
-
-			DbgLog((LOG_TRACE, 2, TEXT("DirectShow notification received - wParam: 0x%08X, lParam: 0x%08X"),
-				(DWORD)wParam, (DWORD)lParam));
-
-			// Check for common DirectShow events that might indicate renderer changes
-			// EC_DISPLAY_CHANGED = 0x16, EC_WINDOW_DESTROYED = 0x11, etc.
-			long eventCode = (long)wParam;
-
-			switch (eventCode)
-			{
-			case 0x16: // EC_DISPLAY_CHANGED
-			{
-				if (!m_outputReadinessGraphReprimeActive)
-				{
-					g_displayRefreshRateSampler->ResetMeasurement();
-				}
-				else
-				{
-					DebugLog::Log(
-						"DirectShow display event belongs to the output-readiness "
-						"graph re-prime; preserving its selecting DXGI evidence");
-				}
-				const ULONGLONG now = GetTickCount64();
-				if (m_rendererState == RendererState::RENDERSTATE_RENDERING &&
-					(!m_rendererResetCoordinator ||
-						!m_rendererResetCoordinator->
-							GetDiagnostics().hasPending) &&
-					now >= m_queueResetIgnoreEventsUntil)
-				{
-					RequestRendererReset(RendererResetReason::DisplayTransition, true,
-						static_cast<UINT>(m_queueResetDelaySeconds * 1000));
-				}
-				else
-				{
-					DbgLog((LOG_TRACE, 1, TEXT("DirectShow display transition - queue re-prime already pending or suppressed")));
-				}
-				break;
-			}
-
-			case 0x0E: // EC_VIDEO_SIZE_CHANGED
-				// madVR emits this for an accepted dynamic picture-aspect update.
-				// NLS therefore changes geometry without throwing away valid DXGI
-				// timing evidence or entering the display-transition reset path.
-				ASSERT(ClassifyDirectShowGraphEvent(eventCode) ==
-					DirectShowGraphEventImpact::GeometryOnly);
-				DebugLog::Log(
-					"DirectShow video geometry changed: event=EC_VIDEO_SIZE_CHANGED "
-					"action=retain-display-timing-and-queue");
-				break;
-
-			case 0x11: // EC_WINDOW_DESTROYED  
-				DbgLog((LOG_TRACE, 1, TEXT("EC_WINDOW_DESTROYED detected - MadVR window change")));
-				break;
-
-			case 0x12: // EC_QUALITY_CHANGE
-				DbgLog((LOG_TRACE, 1, TEXT("EC_QUALITY_CHANGE detected - potential MadVR quality adjustment")));
-				// Don't reset for quality changes, but log them for diagnostics
-				break;
-
-			case 0x0D: // EC_REPAINT
-				// Very common, don't log at normal trace level
-				break;
-
-			default:
-				// Log unknown events for debugging
-				if (eventCode > 0 && eventCode < 0x50) // DirectShow event code range
-				{
-					DbgLog((LOG_TRACE, 2, TEXT("Unknown DirectShow event code: 0x%02X"), eventCode));
-				}
-				break;
-			}
-		}
-
-		if (FAILED(hr))
-			FatalError(TEXT("Failed to handle windows event in renderer"));
+		DebugLog::Log(
+			"DirectShow notification rejected: message_generation=%u "
+			"current_generation=%u renderer=%d directshow=%d",
+			messageGeneration, currentGeneration, renderer ? 1 : 0,
+			m_activeRendererIsDirectShow ? 1 : 0);
+		return 0;
 	}
+
+	const HRESULT hr = renderer->OnWindowsEvent(wParam, lParam);
+	if (FAILED(hr))
+		FatalError(TEXT("Failed to handle windows event in renderer"));
 
 	return 0;
 }
@@ -5712,6 +5832,19 @@ LRESULT CVideoProcessorDlg::OnMessageDirectShowNotification(WPARAM wParam, LPARA
 LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM lParam)
 {
 	const RendererState newRendererState = (RendererState)wParam;
+	const uint32_t messageGeneration = static_cast<uint32_t>(lParam);
+	const uint32_t currentGeneration =
+		m_rendererGeneration.load(std::memory_order_acquire);
+	if (!RendererGenerationGate::Accept(
+		messageGeneration, currentGeneration, m_videoRenderer != nullptr))
+	{
+		DebugLog::Log(
+			"Renderer state rejected: state=%d message_generation=%u "
+			"current_generation=%u renderer=%d",
+			static_cast<int>(newRendererState), messageGeneration,
+			currentGeneration, m_videoRenderer ? 1 : 0);
+		return 0;
+	}
 
 	DbgLog((LOG_TRACE, 1, TEXT("CVideoProcessorDlg::OnMessageRendererStateChange(): %s->%s"),
 		ToString(m_rendererState), ToString(newRendererState)));
@@ -5946,6 +6079,25 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 			DbgLog((LOG_TRACE, 1,
 				TEXT("LLDV confirmed during renderer startup - scheduling renderer restart")));
 		}
+		if (m_queueProfileRestartCompletionPending &&
+			!m_wantToRestartRenderer &&
+			m_rendererGeneration.load(std::memory_order_acquire) >=
+				m_queueProfileRestartStartingGeneration)
+		{
+			const auto profileSnapshot = m_profileRuntime.GetSnapshot();
+			const std::string effectiveProfile = profileSnapshot ?
+				profileSnapshot->queue.profile : std::string();
+			DebugLog::Log(
+				"Queue profile restart: profile=%s source=%s generation=%u "
+				"outcome=completed effective_profile=%s",
+				m_queueProfileRestartCompletionProfile.c_str(),
+				m_queueProfileRestartCompletionSource.c_str(),
+				m_rendererGeneration.load(std::memory_order_acquire),
+				effectiveProfile.c_str());
+			m_queueProfileRestartCompletionPending = false;
+			m_queueProfileRestartCompletionProfile.clear();
+			m_queueProfileRestartCompletionSource.clear();
+		}
 		break;
 	}
 
@@ -5963,6 +6115,15 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 		break;
 
 	case RendererState::RENDERSTATE_FAILED:
+		if (m_queueProfileRestartCompletionPending)
+		{
+			DebugLog::Log(
+				"Queue profile restart: profile=%s source=%s generation=%u "
+				"outcome=failed action=resolve-renderer-error-then-use-Restart-Renderer",
+				m_queueProfileRestartCompletionProfile.c_str(),
+				m_queueProfileRestartCompletionSource.c_str(),
+				m_rendererGeneration.load(std::memory_order_acquire));
+		}
 		PauseRendererIngress();
 		DestroyVideoRenderer();
 		if (m_rendererRetirementPending)
@@ -5978,8 +6139,19 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 			m_windowedVideoWindow.ShowLogo(true);
 		}
 		m_rendererStateText.SetWindowText(TEXT("Failed"));
-		m_windowedVideoWindow.SetWindowText(
-			TEXT("DirectShow renderer failed to build or start"));
+		if (m_queueProfileRestartCompletionPending)
+		{
+			m_windowedVideoWindow.SetWindowText(
+				TEXT("Queue profile applied, but renderer restart failed. Resolve the renderer error, then use Restart Renderer."));
+			m_queueProfileRestartCompletionPending = false;
+			m_queueProfileRestartCompletionProfile.clear();
+			m_queueProfileRestartCompletionSource.clear();
+		}
+		else
+		{
+			m_windowedVideoWindow.SetWindowText(
+				TEXT("DirectShow renderer failed to build or start"));
+		}
 		m_rendererFullscreenCheck.SetCheck(FALSE);
 		enableButtons = !m_rendererResetTransitionActive;
 		break;
@@ -6070,15 +6242,21 @@ bool CVideoProcessorDlg::TryFinalizeRendererRetirement(
 	m_rendererRetirementWaitLoggedToken = 0;
 	if (!completion.succeeded)
 	{
+		m_rendererRetirementRetryActive = false;
+		m_failedRendererRetirement = std::move(completion.renderer);
+		m_failedRendererRetirementNextRetryTick = GetTickCount64() + 1000;
 		DebugLog::Log(
-			"Renderer retirement failed: token=%llu renderer=%S source=%s; "
-			"replacement remains blocked",
+			"Renderer retirement incomplete: token=%llu renderer=%S source=%s; "
+			"external-state restoration remains pending and replacement is blocked",
 			static_cast<unsigned long long>(token),
 			static_cast<LPCTSTR>(m_retiringRendererName), completionSource);
 		m_rendererState = RendererState::RENDERSTATE_FAILED;
-		m_rendererStateText.SetWindowText(TEXT("Retirement failed"));
+		m_rendererStateText.SetWindowText(TEXT("Display restore pending"));
 		return true;
 	}
+	const bool completedRetry = m_rendererRetirementRetryActive;
+	m_rendererRetirementRetryActive = false;
+	m_failedRendererRetirementNextRetryTick = 0;
 	DebugLog::Log(
 		"Renderer transition: process=%lu generation=%u event=old-surface-retired "
 		"renderer=%S target=%p cover=%p token=%llu source=%s "
@@ -6090,7 +6268,9 @@ bool CVideoProcessorDlg::TryFinalizeRendererRetirement(
 		completion.wakePosted ? 1 : 0, completion.wakePostError);
 	m_retiringRendererName.Empty();
 	m_retiringRendererGeneration = 0;
-	if (m_rendererState == RendererState::RENDERSTATE_STOPPED)
+	if (completedRetry)
+		m_rendererState = RendererState::RENDERSTATE_UNKNOWN;
+	else if (m_rendererState == RendererState::RENDERSTATE_STOPPED)
 		m_rendererState = RendererState::RENDERSTATE_UNKNOWN;
 	else if (m_rendererState == RendererState::RENDERSTATE_FAILED &&
 		!m_wantToTerminate)
@@ -6113,256 +6293,115 @@ bool CVideoProcessorDlg::TryFinalizeRendererRetirement(
 LRESULT CVideoProcessorDlg::OnMessageRendererDetailString(WPARAM wParam, LPARAM lParam)
 {
 	CString* pDetailString = (CString*)wParam;
-
-	m_rendererDetailStringStatic.SetWindowText(*pDetailString);
+	const uint32_t messageGeneration = static_cast<uint32_t>(lParam);
+	const uint32_t currentGeneration =
+		m_rendererGeneration.load(std::memory_order_acquire);
+	if (RendererGenerationGate::Accept(
+		messageGeneration, currentGeneration, m_videoRenderer != nullptr))
+		m_rendererDetailStringStatic.SetWindowText(*pDetailString);
+	else
+		DebugLog::Log(
+			"Renderer detail rejected: message_generation=%u "
+			"current_generation=%u renderer=%d",
+			messageGeneration, currentGeneration, m_videoRenderer ? 1 : 0);
 
 	delete pDetailString;
 	return 0;
 }
 
-
-LRESULT CVideoProcessorDlg::OnMessageRendererPresentationStatus(WPARAM wParam,
-	LPARAM lParam)
+LRESULT CVideoProcessorDlg::OnMessageRendererGraphEvent(
+	WPARAM wParam, LPARAM lParam)
 {
-	std::unique_ptr<CString> status(reinterpret_cast<CString*>(wParam));
-	const bool visible = lParam != 0;
-	if (visible && status && m_rendererTargetHwnd &&
-		IsWindow(m_rendererTargetHwnd) && GetSafeHwnd())
+	const long eventCode = static_cast<long>(wParam);
+	const uint32_t messageGeneration = static_cast<uint32_t>(lParam);
+	const uint32_t currentGeneration =
+		m_rendererGeneration.load(std::memory_order_acquire);
+	if (!RendererGenerationGate::Accept(
+		messageGeneration, currentGeneration, m_videoRenderer != nullptr) ||
+		!m_activeRendererIsDirectShow)
 	{
-		m_rendererDetailStringStatic.SetWindowText(*status);
-		m_rendererTransitionWindow.ShowStatus(m_rendererTargetHwnd,
-			GetSafeHwnd(), *status);
+		DebugLog::Log(
+			"DirectShow graph event rejected: event=0x%lx "
+			"message_generation=%u current_generation=%u renderer=%d "
+			"directshow=%d",
+			eventCode, messageGeneration, currentGeneration,
+			m_videoRenderer ? 1 : 0,
+			m_activeRendererIsDirectShow ? 1 : 0);
+		return 0;
 	}
-	else
+
+	DbgLog((LOG_TRACE, 2,
+		TEXT("DirectShow graph event received: event=0x%08lX generation=%u"),
+		eventCode, messageGeneration));
+	switch (eventCode)
 	{
-		m_rendererTransitionWindow.Hide();
+	case EC_DISPLAY_CHANGED:
+		if (!m_outputReadinessGraphReprimeActive)
+			g_displayRefreshRateSampler->ResetMeasurement();
+		else
+			DebugLog::Log(
+				"DirectShow display event belongs to the output-readiness "
+				"graph re-prime; preserving its selecting DXGI evidence");
+		if (m_rendererState == RendererState::RENDERSTATE_RENDERING &&
+			(!m_rendererResetCoordinator ||
+				!m_rendererResetCoordinator->GetDiagnostics().hasPending) &&
+			GetTickCount64() >= m_queueResetIgnoreEventsUntil)
+		{
+			RequestRendererReset(
+				RendererResetReason::DisplayTransition, true,
+				static_cast<UINT>(m_queueResetDelaySeconds * 1000));
+		}
+		else
+		{
+			DbgLog((LOG_TRACE, 1,
+				TEXT("DirectShow display transition - queue re-prime already pending or suppressed")));
+		}
+		break;
+	case EC_VIDEO_SIZE_CHANGED:
+		ASSERT(ClassifyDirectShowGraphEvent(eventCode) ==
+			DirectShowGraphEventImpact::GeometryOnly);
+		DebugLog::Log(
+			"DirectShow video geometry changed: event=EC_VIDEO_SIZE_CHANGED "
+			"action=retain-display-timing-and-queue");
+		break;
+	case EC_WINDOW_DESTROYED:
+		DbgLog((LOG_TRACE, 1,
+			TEXT("EC_WINDOW_DESTROYED detected - DirectShow window change")));
+		break;
+	case EC_QUALITY_CHANGE:
+		DbgLog((LOG_TRACE, 1,
+			TEXT("EC_QUALITY_CHANGE detected - renderer quality adjustment")));
+		break;
+	case EC_REPAINT:
+		break;
+	default:
+		break;
 	}
 	return 0;
 }
 
-void CVideoProcessorDlg::PublishShaderPreparationStatus(const char* state,
-	size_t current, size_t total, const char* message) const
-{
-	std::string configPath = m_profileRuntime.ConfigPath();
-	if (configPath.empty())
-	{
-		ConfigFile config;
-		if (config.Load()) configPath = config.GetLoadedPath();
-	}
-	if (configPath.empty()) return;
 
-	const size_t separator = configPath.find_last_of("\\/");
-	if (separator == std::string::npos) return;
-	const std::string directory = configPath.substr(0, separator) +
-		"\\vprenderer";
-	if (!::CreateDirectoryA(directory.c_str(), nullptr) &&
-		::GetLastError() != ERROR_ALREADY_EXISTS) return;
-	const std::string path = directory + "\\" +
-		ConfigurationLiveApply::ShaderPreparationStatusFileNameA;
-	const std::string temporary = path + ".tmp";
+LRESULT CVideoProcessorDlg::OnMessageRendererRestartRequired(
+	WPARAM, LPARAM lParam)
+{
+	const uint32_t messageGeneration = static_cast<uint32_t>(lParam);
+	const uint32_t currentGeneration =
+		m_rendererGeneration.load(std::memory_order_acquire);
+	if (!RendererGenerationGate::Accept(
+		messageGeneration, currentGeneration, m_videoRenderer != nullptr))
 	{
-		std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-		if (!output) return;
-		output << "state=" << (state ? state : "unknown") << "\n"
-			<< "current=" << current << "\n"
-			<< "total=" << total << "\n"
-			<< "message=" << (message ? message : "") << "\n";
+		DebugLog::Log(
+			"Renderer restart request rejected: message_generation=%u "
+			"current_generation=%u renderer=%d",
+			messageGeneration, currentGeneration, m_videoRenderer ? 1 : 0);
+		return 0;
 	}
-	::MoveFileExA(temporary.c_str(), path.c_str(),
-		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+	m_postRendererStartRequiresGraph = false;
+	m_wantToRestartRenderer = true;
+	UpdateState();
+	return 0;
 }
 
-bool CVideoProcessorDlg::ApplyShaderPreparationSnapshot(
-	const std::shared_ptr<const UnifiedProfileRuntime::Snapshot>& snapshot)
-{
-	if (!snapshot || !m_videoRenderer ||
-		m_rendererState != RendererState::RENDERSTATE_RENDERING)
-		return false;
-	CString activeState;
-	bool rendererRestartRequired = false;
-	bool liveResetRequired = false;
-	if (!m_videoRenderer->ApplyApplicationState(*snapshot, activeState,
-		rendererRestartRequired, liveResetRequired))
-	{
-		FinishShaderPreparation(false,
-			"A rendering profile could not be applied live");
-		return false;
-	}
-	if (rendererRestartRequired)
-	{
-		FinishShaderPreparation(false,
-			"A rendering profile requires renderer reconstruction");
-		return false;
-	}
-	if (liveResetRequired)
-	{
-		RequestRendererReset(RendererResetReason::ProfileChange, false, 0);
-		return true;
-	}
-	return false;
-}
-
-void CVideoProcessorDlg::StartShaderPreparation()
-{
-	if (m_shaderPreparationActive) return;
-	if (!m_videoRenderer || !IsAlphaRendererSelected())
-	{
-		std::wstring directory;
-		if (!GetApplicationDirectory(directory))
-		{
-			PublishShaderPreparationStatus("failed", 0, 0,
-				"Shader preparation could not locate VideoProcessor.exe.");
-			return;
-		}
-		std::wstring executable = directory + L"VideoProcessor.exe";
-		std::wstring command = L"\"" + executable + L"\" /prepare_shaders";
-		STARTUPINFOW startup{};
-		startup.cb = sizeof(startup);
-		PROCESS_INFORMATION process{};
-		if (!::CreateProcessW(executable.c_str(), &command[0], nullptr,
-			nullptr, FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(),
-			&startup, &process))
-		{
-			PublishShaderPreparationStatus("failed", 0, 0,
-				"Non-capturing shader preparation could not start.");
-			return;
-		}
-		::CloseHandle(process.hThread);
-		::CloseHandle(process.hProcess);
-		PublishShaderPreparationStatus("waiting", 0, 0,
-			"Starting non-capturing shader preparation...");
-		return;
-	}
-	if (m_rendererState != RendererState::RENDERSTATE_RENDERING)
-	{
-		PublishShaderPreparationStatus("waiting", 0, 0,
-			"Waiting for VideoProcessor renderer...");
-		if (m_shaderPreparationEvent) SetEvent(m_shaderPreparationEvent);
-		return;
-	}
-	if (RendererResetOperationInProgress())
-	{
-		PublishShaderPreparationStatus("waiting", 0, 0,
-			"Waiting for the current renderer update...");
-		if (m_shaderPreparationEvent) SetEvent(m_shaderPreparationEvent);
-		return;
-	}
-
-	const auto original = m_profileRuntime.GetSnapshot();
-	if (!original)
-	{
-		PublishShaderPreparationStatus("failed", 0, 0,
-			"Shader preparation could not read rendering profiles.");
-		return;
-	}
-	ConfigFile config;
-	if (!config.Load())
-	{
-		PublishShaderPreparationStatus("failed", 0, 0,
-			"Shader preparation could not load VideoProcessor.cfg.");
-		return;
-	}
-	if (!m_videoRenderer->ReloadConfiguredShaderPrewarm())
-	{
-		PublishShaderPreparationStatus("failed", 0, 0,
-			"Shader configuration could not be prepared.");
-		return;
-	}
-
-	std::vector<std::string> profiles;
-	std::string profileError;
-	if (!RendererProfileConfig::CollectRenderingProfileNames(
-		config, profiles, profileError))
-	{
-		PublishShaderPreparationStatus("failed", 0, 0,
-			"Rendering profiles could not be enumerated.");
-		return;
-	}
-	if (profiles.empty())
-	{
-		FinishShaderPreparation(true, "No additional rendering profiles need preparation");
-		return;
-	}
-
-	m_shaderPreparationOriginalSnapshot = original;
-	m_shaderPreparationSnapshots.clear();
-	for (size_t index = 0; index < profiles.size(); ++index)
-	{
-		auto candidate =
-			std::make_shared<UnifiedProfileRuntime::Snapshot>(*original);
-		candidate->generation = original->generation + index + 1;
-		candidate->manualSelections["display"] = profiles[index];
-		candidate->effectiveSelections["display"] = profiles[index];
-		m_shaderPreparationSnapshots.push_back(candidate);
-	}
-	m_shaderPreparationIndex = 0;
-	m_shaderPreparationRestoring = false;
-	m_shaderPreparationActive = true;
-	DebugLog::Log("Shader preparation started: profiles=%zu renderer_generation=%u",
-		m_shaderPreparationSnapshots.size(),
-		m_rendererGeneration.load(std::memory_order_acquire));
-	AdvanceShaderPreparation();
-}
-
-void CVideoProcessorDlg::AdvanceShaderPreparation()
-{
-	if (!m_shaderPreparationActive) return;
-	while (m_shaderPreparationIndex < m_shaderPreparationSnapshots.size())
-	{
-		const size_t current = m_shaderPreparationIndex + 1;
-		char message[128] = {};
-		sprintf_s(message, "Preparing shaders %zu of %zu...", current,
-			m_shaderPreparationSnapshots.size());
-		PublishShaderPreparationStatus("preparing", current,
-			m_shaderPreparationSnapshots.size(), message);
-		DebugLog::Log("Shader preparation profile: current=%zu total=%zu display=%s",
-			current, m_shaderPreparationSnapshots.size(),
-			m_shaderPreparationSnapshots[m_shaderPreparationIndex]
-				->effectiveSelections.at("display").c_str());
-		++m_shaderPreparationIndex;
-		if (ApplyShaderPreparationSnapshot(
-			m_shaderPreparationSnapshots[m_shaderPreparationIndex - 1]))
-			return;
-		if (!m_shaderPreparationActive) return;
-	}
-
-	if (!m_shaderPreparationRestoring)
-	{
-		m_shaderPreparationRestoring = true;
-		PublishShaderPreparationStatus("preparing",
-			m_shaderPreparationSnapshots.size(),
-			m_shaderPreparationSnapshots.size(),
-			"Finalizing shader cache...");
-		if (ApplyShaderPreparationSnapshot(
-			m_shaderPreparationOriginalSnapshot))
-			return;
-		if (!m_shaderPreparationActive) return;
-	}
-	FinishShaderPreparation(true, "Shaders ready");
-}
-
-void CVideoProcessorDlg::FinishShaderPreparation(bool succeeded,
-	const char* detail)
-{
-	if (succeeded && m_videoRenderer && !m_videoRenderer->PersistShaderCache())
-	{
-		succeeded = false;
-		detail = "Shader cache could not be saved";
-	}
-	const size_t total = m_shaderPreparationSnapshots.size();
-	PublishShaderPreparationStatus(succeeded ? "ready" : "failed",
-		succeeded ? total : m_shaderPreparationIndex, total,
-		detail ? detail : (succeeded ? "Shaders ready" :
-			"Shader preparation incomplete"));
-	DebugLog::Log("Shader preparation %s: prepared=%zu total=%zu detail=%s",
-		succeeded ? "completed" : "failed", m_shaderPreparationIndex,
-		total, detail ? detail : "none");
-	m_shaderPreparationActive = false;
-	m_shaderPreparationRestoring = false;
-	m_shaderPreparationIndex = 0;
-	m_shaderPreparationSnapshots.clear();
-	m_shaderPreparationOriginalSnapshot.reset();
-}
 
 LRESULT CVideoProcessorDlg::OnMessageExternalShortcut(WPARAM wParam,
 	LPARAM lParam)
@@ -6380,18 +6419,44 @@ LRESULT CVideoProcessorDlg::OnMessageExternalShortcut(WPARAM wParam,
 
 	const WORD key = static_cast<WORD>(wParam);
 	const BYTE modifiers = static_cast<BYTE>(lParam);
+	const bool control = (modifiers & FCONTROL) != 0;
+	const bool alt = (modifiers & FALT) != 0;
+	const bool shift = (modifiers & FSHIFT) != 0;
+	const bool rightAlt = (::GetKeyState(VK_RMENU) & 0x8000) != 0;
+	const ACCEL* matchedAccelerator = nullptr;
 	for (const ACCEL& accelerator : m_configuredAccelerators)
 	{
 		if (accelerator.key != key ||
 			(accelerator.fVirt & supportedModifiers) != modifiers)
 			continue;
-
+		matchedAccelerator = &accelerator;
+		break;
+	}
+	if (!matchedAccelerator && rightAlt)
+	{
+		for (const ACCEL& accelerator : m_configuredAccelerators)
+		{
+			if (accelerator.cmd == ID_COMMAND_FULLSCREEN_TOGGLE &&
+				accelerator.key == key &&
+				ConfigurationLiveApply::FullscreenShortcutModifiersMatch(
+					(accelerator.fVirt & FCONTROL) != 0,
+					(accelerator.fVirt & FALT) != 0,
+					(accelerator.fVirt & FSHIFT) != 0,
+					control, alt, shift, rightAlt))
+			{
+				matchedAccelerator = &accelerator;
+				break;
+			}
+		}
+	}
+	if (matchedAccelerator)
+	{
 		const BOOL posted = PostMessage(WM_COMMAND,
-			MAKEWPARAM(accelerator.cmd, 1), 0);
+			MAKEWPARAM(matchedAccelerator->cmd, 1), 0);
 		DebugLog::Log(
 			"External shortcut dispatch: key=%u modifiers=0x%02x command=%u posted=%d",
 			static_cast<unsigned>(key), static_cast<unsigned>(modifiers),
-			static_cast<unsigned>(accelerator.cmd), posted ? 1 : 0);
+			static_cast<unsigned>(matchedAccelerator->cmd), posted ? 1 : 0);
 		return posted ? 1 : 0;
 	}
 
@@ -6605,6 +6670,7 @@ void CVideoProcessorDlg::OnCommandDisplayRule(UINT commandId)
 		}
 		m_lastUnifiedProfileCommand = static_cast<WORD>(commandId);
 		m_lastUnifiedProfileCommandTime = commandTime;
+		const auto previousSnapshot = m_profileRuntime.GetSnapshot();
 		UnifiedProfileRuntime::SelectionResult result;
 		std::string error;
 		if (!m_profileRuntime.SelectKey(
@@ -6627,7 +6693,17 @@ void CVideoProcessorDlg::OnCommandDisplayRule(UINT commandId)
 			activeProfiles.str().c_str());
 		if (result.changed)
 		{
-			ApplyUnifiedProfileSnapshot(result.snapshot, true);
+			const std::string previousQueueProfile = previousSnapshot ?
+				previousSnapshot->queue.profile : std::string();
+			const bool queueProfileRestart = result.snapshot &&
+				QueueProfileRestartPolicy::RequiresRestartAfterManualSelection(
+					true, previousQueueProfile, result.snapshot->queue.profile);
+			ApplyUnifiedProfileSnapshot(result.snapshot, true,
+				queueProfileRestart);
+			if (queueProfileRestart)
+				QueueUnifiedQueueProfileRendererRestart(result.snapshot,
+					"shortcut:" + std::string(
+						CStringA(unifiedKey->second).GetString()));
 			ScheduleUnifiedProfileActions(result.actions);
 		}
 		return;
@@ -6954,7 +7030,8 @@ void CVideoProcessorDlg::OnCommandCaptureRenderedOutput()
 		"Rendered-output capture command: accepted=%d renderer_state=%d detail=%ls",
 		accepted ? 1 : 0, static_cast<int>(m_rendererState),
 		static_cast<LPCWSTR>(status));
-	OnRendererDetailString(status);
+	OnRendererDetailString(
+		status, m_rendererGeneration.load(std::memory_order_acquire));
 }
 
 void CVideoProcessorDlg::ApplyStatsOverlayForActiveRenderer()
@@ -7159,7 +7236,8 @@ void CVideoProcessorDlg::OnCaptureDeviceError(const CString& error)
 }
 
 
-void CVideoProcessorDlg::OnRendererState(RendererState rendererState)
+void CVideoProcessorDlg::OnRendererState(
+	RendererState rendererState, uint32_t rendererGeneration)
 {
 	// Will be called synchronous as a response to our calls and hence does
 	// not need posting messages, we still do so to keep the pattern.
@@ -7167,11 +7245,12 @@ void CVideoProcessorDlg::OnRendererState(RendererState rendererState)
 	PostMessage(
 		WM_MESSAGE_RENDERER_STATE_CHANGE,
 		rendererState,
-		0);
+		static_cast<LPARAM>(rendererGeneration));
 }
 
 
-void CVideoProcessorDlg::OnRendererDetailString(const CString& details)
+void CVideoProcessorDlg::OnRendererDetailString(
+	const CString& details, uint32_t rendererGeneration)
 {
 	// Will be called synchronous as a response to our calls and hence does
 	// not need posting messages, we still do so to keep the pattern.
@@ -7181,28 +7260,24 @@ void CVideoProcessorDlg::OnRendererDetailString(const CString& details)
 	PostMessage(
 		WM_MESSAGE_RENDERER_DETAIL_STRING,
 		(WPARAM)pDetailString,
-		0);
+		static_cast<LPARAM>(rendererGeneration));
 }
 
 
-void CVideoProcessorDlg::OnRendererPresentationStatus(const CString& status,
-	bool visible)
+void CVideoProcessorDlg::OnRendererGraphEvent(
+	long eventCode, uint32_t rendererGeneration)
 {
-	CString* copy = new CString(status);
-	PostMessage(WM_MESSAGE_RENDERER_PRESENTATION_STATUS,
-		reinterpret_cast<WPARAM>(copy), visible ? 1 : 0);
+	PostMessage(
+		WM_MESSAGE_RENDERER_GRAPH_EVENT,
+		static_cast<WPARAM>(eventCode),
+		static_cast<LPARAM>(rendererGeneration));
 }
+
 
 
 void CVideoProcessorDlg::UpdateState()
 {
 	DbgLog((LOG_TRACE, 1, TEXT("CVideoProcessorDlg::UpdateState()")));
-	if (m_rendererConstructionActive)
-	{
-		DbgLog((LOG_TRACE, 1,
-			TEXT("CVideoProcessorDlg::UpdateState(): waiting for renderer construction")));
-		return;
-	}
 	if (m_rendererRetirementPending)
 	{
 		TryFinalizeRendererRetirement(
@@ -7212,6 +7287,33 @@ void CVideoProcessorDlg::UpdateState()
 	{
 		DbgLog((LOG_TRACE, 1,
 			TEXT("CVideoProcessorDlg::UpdateState(): waiting for renderer retirement")));
+		return;
+	}
+	if (m_failedRendererRetirement)
+	{
+		const ULONGLONG now = GetTickCount64();
+		if (now < m_failedRendererRetirementNextRetryTick)
+			return;
+
+		m_rendererRetirementPending = true;
+		m_rendererRetirementRetryActive = true;
+		m_rendererRetirementToken++;
+		m_rendererRetirementWaitLoggedToken = 0;
+		DebugLog::Log(
+			"Renderer handoff restoration retry queued: generation=%u token=%llu",
+			m_rendererGeneration.load(std::memory_order_acquire),
+			static_cast<unsigned long long>(m_rendererRetirementToken));
+		const bool queued = m_rendererRetirementService.Retire(
+			std::move(m_failedRendererRetirement), m_rendererRetirementToken,
+			GetSafeHwnd(), WM_MESSAGE_RENDERER_RETIRED);
+		if (!queued)
+			throw std::runtime_error("Renderer retirement retry service is closed");
+		return;
+	}
+	if (m_rendererConstructionActive)
+	{
+		DbgLog((LOG_TRACE, 1,
+			TEXT("CVideoProcessorDlg::UpdateState(): waiting for renderer construction")));
 		return;
 	}
 
@@ -7408,6 +7510,9 @@ void CVideoProcessorDlg::UpdateState()
 		{
 			return;
 		}
+		// Persistent libplacebo entries are consumed opportunistically. Never
+		// delay renderer construction for an exhaustive synthetic matrix; live
+		// playback compiles only the shader it actually requires.
 		if (m_captureDeviceVideoState &&
 			m_captureDeviceVideoState->valid)
 			RenderStart();
@@ -8160,6 +8265,7 @@ void CVideoProcessorDlg::RenderStart()
 				GetRendererVideoFrameQueueSizeMax();
 			m_videoRenderer = std::make_shared<LibplaceboPluginVideoRenderer>(
 				*this,
+				rendererGeneration,
 				m_rendererTargetHwnd,
 				timingClock,
 				GetRendererVideoFrameUseQueue(),
@@ -8231,7 +8337,7 @@ void CVideoProcessorDlg::RenderStart()
 		m_rendererConstructionActive = true;
 		if (IsEqualCLSID(*rendererClSID, CLSID_MPCVR))
 			m_videoRenderer = std::make_shared<DirectShowMPCVideoRenderer>(
-				*this, m_rendererTargetHwnd, GetSafeHwnd(),
+				*this, rendererGeneration, m_rendererTargetHwnd, GetSafeHwnd(),
 				WM_MESSAGE_DIRECTSHOW_NOTIFICATION, timingClock,
 				directShowStartStopTimeMethod,
 				GetRendererVideoFrameUseQueue(),
@@ -8243,7 +8349,7 @@ void CVideoProcessorDlg::RenderStart()
 			*rendererClSID, CLSID_EnhancedVideoRenderer))
 			m_videoRenderer =
 				std::make_shared<DirectShowEnhancedVideoRenderer>(
-					*this, m_rendererTargetHwnd, GetSafeHwnd(),
+					*this, rendererGeneration, m_rendererTargetHwnd, GetSafeHwnd(),
 					WM_MESSAGE_DIRECTSHOW_NOTIFICATION, timingClock,
 					directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
@@ -8252,7 +8358,7 @@ void CVideoProcessorDlg::RenderStart()
 		else if (m_activeRendererName.Find(TEXT("madVR")) >= 0)
 			m_videoRenderer =
 				std::make_shared<DirectShowGenericHDRVideoRenderer>(
-					*rendererClSID, *this, m_rendererTargetHwnd,
+					*rendererClSID, *this, rendererGeneration, m_rendererTargetHwnd,
 					GetSafeHwnd(), WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
 					timingClock, directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
@@ -8263,7 +8369,7 @@ void CVideoProcessorDlg::RenderStart()
 		else
 			m_videoRenderer =
 				std::make_shared<DirectShowGenericVideoRenderer>(
-					*rendererClSID, *this, m_rendererTargetHwnd,
+					*rendererClSID, *this, rendererGeneration, m_rendererTargetHwnd,
 					GetSafeHwnd(), WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
 					timingClock, directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
@@ -8322,6 +8428,7 @@ void CVideoProcessorDlg::RenderStart()
 			{
 				m_videoRenderer = std::make_shared<DirectShowMPCVideoRenderer>(
 					*this,
+					rendererGeneration,
 					m_rendererTargetHwnd,
 					this->GetSafeHwnd(),
 					WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
@@ -8339,6 +8446,7 @@ void CVideoProcessorDlg::RenderStart()
 			{
 				m_videoRenderer = std::make_shared<DirectShowEnhancedVideoRenderer>(
 					*this,
+					rendererGeneration,
 					m_rendererTargetHwnd,
 					this->GetSafeHwnd(),
 					WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
@@ -8352,6 +8460,7 @@ void CVideoProcessorDlg::RenderStart()
 				m_videoRenderer = std::make_shared<DirectShowGenericVideoRenderer>(
 					*rendererClSID,
 					*this,
+					rendererGeneration,
 					m_rendererTargetHwnd,
 					this->GetSafeHwnd(),
 					WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
@@ -8522,7 +8631,7 @@ void CVideoProcessorDlg::RenderRemove()
 
 	DestroyVideoRenderer();
 
-	if (!m_rendererRetirementPending)
+	if (!m_rendererRetirementPending && !m_failedRendererRetirement)
 		m_rendererState = RendererState::RENDERSTATE_UNKNOWN;
 
 	DbgLog((LOG_TRACE, 1, TEXT("CVideoProcessorDlg::RenderRemove(): End")));
@@ -8531,6 +8640,8 @@ void CVideoProcessorDlg::RenderRemove()
 
 void CVideoProcessorDlg::DestroyVideoRenderer()
 {
+	m_shaderLoadingWindow.Hide();
+	m_shaderLoadingPopupShownTick = 0;
 	if (!m_videoRenderer)
 		return;
 	if (m_fullscreenRetargetPending)
@@ -8558,29 +8669,9 @@ void CVideoProcessorDlg::DestroyVideoRenderer()
 	DebugLog::Log(
 		"Renderer teardown: detached renderer before destruction to block reentrant callbacks");
 
-	// Alpha/plugin retirement has not yet been audited as an idempotent
-	// cross-thread contract. Retire it synchronously, explicitly releasing its
-	// swapchain before a replacement renderer can claim the target HWND.
-	if (!m_activeRendererIsDirectShow)
-	{
-		rendererToDestroy->Retire();
-		m_rendererTransitionWindow.KeepOnTop();
-		const HRESULT compositionResult =
-			m_rendererTransitionWindow.SynchronizeComposition();
-		rendererToDestroy.reset();
-		DebugLog::Log(
-			"Renderer transition: process=%lu generation=%u event=old-surface-retired "
-			"renderer=%S target=%p cover=%p mode=alpha-synchronous "
-			"composition_sync=0x%08lx",
-			GetCurrentProcessId(),
-			m_rendererGeneration.load(std::memory_order_acquire),
-			static_cast<LPCTSTR>(m_activeRendererName),
-			m_rendererTargetHwnd,
-			m_rendererTransitionWindow.GetHWND(),
-			static_cast<unsigned long>(compositionResult));
-		return;
-	}
-
+	// Final swapchain/device release can enter the driver. Both DirectShow and
+	// VP Renderer retirement therefore use the lifecycle worker; replacement
+	// construction waits for durable restoration before a successor is built.
 	m_rendererRetirementPending = true;
 	m_rendererRetirementToken++;
 	m_retiringRendererName = m_activeRendererName;
@@ -8638,11 +8729,12 @@ bool CVideoProcessorDlg::ShowRendererTransitionBlack(const char* reason)
 }
 
 
-void CVideoProcessorDlg::OnRendererRestartRequired()
+void CVideoProcessorDlg::OnRendererRestartRequired(uint32_t rendererGeneration)
 {
-	m_postRendererStartRequiresGraph = false;
-	m_wantToRestartRenderer = true;
-	UpdateState();
+	PostMessage(
+		WM_MESSAGE_RENDERER_RESTART_REQUIRED,
+		0,
+		static_cast<LPARAM>(rendererGeneration));
 }
 
 
@@ -9228,6 +9320,7 @@ void CVideoProcessorDlg::TryRevealRendererTransition(uint32_t generation)
 			m_rendererResetTransitionActive = false;
 		}
 	}
+	RequestPresentationFocus("first-live-frame", generation);
 	DebugLog::Log(
 		"Renderer transition: process=%lu generation=%u event=first-live-frame-reveal "
 		"renderer=%S target=%p evidence=%s black_ms=%llu "
@@ -9240,8 +9333,6 @@ void CVideoProcessorDlg::TryRevealRendererTransition(uint32_t generation)
 		static_cast<unsigned long long>(blackDurationMs),
 		static_cast<unsigned long>(compositionSyncResult),
 		static_cast<unsigned long long>(compositionSyncMs));
-	if (coordinatedReset && m_shaderPreparationActive)
-		AdvanceShaderPreparation();
 }
 
 
@@ -10331,7 +10422,7 @@ void CVideoProcessorDlg::PublishActiveProfileStatus()
 
 void CVideoProcessorDlg::ApplyUnifiedProfileSnapshot(
 	const std::shared_ptr<const UnifiedProfileRuntime::Snapshot>& snapshot,
-	bool allowRestart)
+	bool allowRestart, bool queueProfileRestart)
 {
 	if (!snapshot)
 		return;
@@ -10481,7 +10572,7 @@ void CVideoProcessorDlg::ApplyUnifiedProfileSnapshot(
 
 	DebugLog::Log("Applied unified profile state: %s",
 		CStringA(activeState).GetString());
-	if (allowRestart && rendererRestartRequired)
+	if (allowRestart && rendererRestartRequired && !queueProfileRestart)
 	{
 		if (m_rendererFullscreenCheck.GetCheck() && m_fullScreenVideoWindow &&
 			IsWindow(m_fullScreenVideoWindow->GetHWND()))
@@ -10497,13 +10588,13 @@ void CVideoProcessorDlg::ApplyUnifiedProfileSnapshot(
 		m_wantToRestartRenderer = true;
 		UpdateState();
 	}
-	else if (allowRestart && liveResetRequired)
+	else if (allowRestart && liveResetRequired && !queueProfileRestart)
 	{
 		DebugLog::Log(
 			"Rendering profile applied live; requesting cache-preserving queue reset");
 		RequestRendererReset(RendererResetReason::ProfileChange, false, 0);
 	}
-	else if (allowRestart && queuePolicyChanged)
+	else if (allowRestart && queuePolicyChanged && !queueProfileRestart)
 	{
 		const bool requiresGraph = QueuePolicyApplyRequiresGraphReset(
 			m_activeRendererIsDirectShow);
@@ -10514,6 +10605,104 @@ void CVideoProcessorDlg::ApplyUnifiedProfileSnapshot(
 		RequestRendererReset(RendererResetReason::QueueSizeChange,
 			requiresGraph, 0);
 	}
+}
+
+
+void CVideoProcessorDlg::QueueUnifiedQueueProfileRendererRestart(
+	const std::shared_ptr<const UnifiedProfileRuntime::Snapshot>& snapshot,
+	const std::string& source)
+{
+	if (!snapshot)
+		return;
+	const QueueProfileRestartPolicy::EnqueueResult result =
+		QueueProfileRestartPolicy::Enqueue(m_queueProfileRestartRequest,
+			snapshot->generation, snapshot->queue.profile, source);
+	if (result == QueueProfileRestartPolicy::EnqueueResult::Ignored)
+		return;
+	DebugLog::Log(
+		"Queue profile restart: profile=%s source=%s generation=%llu outcome=%s "
+		"action=awaiting-selection-settle",
+		snapshot->queue.profile.c_str(), source.c_str(),
+		static_cast<unsigned long long>(snapshot->generation),
+		result == QueueProfileRestartPolicy::EnqueueResult::Coalesced ?
+			"coalesced" : "queued");
+	KillTimer(QUEUE_PROFILE_RESTART_TIMER_ID);
+	SetTimer(QUEUE_PROFILE_RESTART_TIMER_ID,
+		QUEUE_PROFILE_RESTART_DEBOUNCE_MS, nullptr);
+}
+
+
+void CVideoProcessorDlg::DispatchQueuedQueueProfileRendererRestart()
+{
+	QueueProfileRestartPolicy::PendingRequest request;
+	if (!QueueProfileRestartPolicy::Consume(m_queueProfileRestartRequest,
+		request))
+		return;
+	const auto currentSnapshot = m_profileRuntime.GetSnapshot();
+	const std::string profile = currentSnapshot &&
+		!currentSnapshot->queue.profile.empty() ?
+		currentSnapshot->queue.profile : request.profile;
+	if (!m_videoRenderer)
+	{
+		DebugLog::Log(
+			"Queue profile restart: profile=%s source=%s generation=%llu "
+			"outcome=not-required action=fresh-renderer-uses-committed-profile",
+			profile.c_str(), request.source.c_str(),
+			static_cast<unsigned long long>(request.snapshotGeneration));
+		return;
+	}
+	if (m_rendererState == RendererState::RENDERSTATE_FAILED)
+	{
+		DebugLog::Log(
+			"Queue profile restart: profile=%s source=%s generation=%llu "
+			"outcome=failed action=resolve-renderer-error-then-use-Restart-Renderer",
+			profile.c_str(), request.source.c_str(),
+			static_cast<unsigned long long>(request.snapshotGeneration));
+		m_rendererStateText.SetWindowText(TEXT("Queue profile restart unavailable"));
+		m_windowedVideoWindow.SetWindowText(
+			TEXT("Queue profile applied. Resolve the renderer error, then use Restart Renderer."));
+		return;
+	}
+
+	m_queueProfileRestartCompletionPending = true;
+	m_queueProfileRestartStartingGeneration =
+		m_rendererGeneration.load(std::memory_order_acquire);
+	m_queueProfileRestartCompletionProfile = profile;
+	m_queueProfileRestartCompletionSource = request.source;
+	if (m_rendererState != RendererState::RENDERSTATE_RENDERING ||
+		m_wantToRestartRenderer)
+	{
+		DebugLog::Log(
+			"Queue profile restart: profile=%s source=%s generation=%llu "
+			"outcome=coalesced-with-renderer-lifecycle state=%d restart_pending=%d",
+			profile.c_str(), request.source.c_str(),
+			static_cast<unsigned long long>(request.snapshotGeneration),
+			static_cast<int>(m_rendererState), m_wantToRestartRenderer ? 1 : 0);
+		return;
+	}
+
+	if (m_rendererFullscreenCheck.GetCheck() && m_fullScreenVideoWindow &&
+		IsWindow(m_fullScreenVideoWindow->GetHWND()))
+	{
+		m_preserveFullscreenHostForProfileRestart = true;
+		DebugLog::Log(
+			"Queue profile restart: preserving fullscreen host hwnd=%p",
+			m_fullScreenVideoWindow->GetHWND());
+	}
+	m_postRendererStartRequiresGraph = false;
+	m_wantToRestartRenderer = true;
+	const RendererRestartDispatch dispatch = ClassifyRendererRestartDispatch(
+		m_rendererConstructionActive, m_rendererRetirementPending);
+	DebugLog::Log(
+		"Queue profile restart: profile=%s source=%s generation=%llu backend=%s "
+		"outcome=%s action=controlled-renderer-restart",
+		profile.c_str(), request.source.c_str(),
+		static_cast<unsigned long long>(request.snapshotGeneration),
+		m_activeRendererIsDirectShow ? "DirectShow/madVR" : "VP Renderer",
+		dispatch == RendererRestartDispatch::DispatchNow ?
+			"restart-requested" : "coalesced-with-lifecycle-boundary");
+	if (dispatch == RendererRestartDispatch::DispatchNow)
+		UpdateState();
 }
 
 
@@ -11670,6 +11859,7 @@ void CVideoProcessorDlg::OnSize(UINT nType, int cx, int cy)
 		!RendererResetOperationInProgress())
 		m_videoRenderer->OnSize();
 	m_rendererTransitionWindow.KeepOnTop();
+	m_shaderLoadingWindow.UpdatePosition();
 
 	// Some windowed DirectShow renderers finish processing WM_SIZE after this
 	// handler returns.  Restore the fixed UI now and once more after that work
@@ -11707,6 +11897,13 @@ void CVideoProcessorDlg::OnSize(UINT nType, int cx, int cy)
 
 	lastSize = currentSize;
 	CDialog::OnSize(nType, cx, cy);
+}
+
+
+void CVideoProcessorDlg::OnMove(int x, int y)
+{
+	CDialog::OnMove(x, y);
+	m_shaderLoadingWindow.UpdatePosition();
 }
 
 
@@ -11898,6 +12095,25 @@ void CVideoProcessorDlg::OnTimer(UINT_PTR nIDEvent)
 {
 	const ULONGLONG uiNow = GetTickCount64();
 	m_lastUiMessageTick.store(uiNow, std::memory_order_release);
+	if (m_configurationEditorPresentationRequired != 0 &&
+		m_configurationEditorPresentationAcknowledged !=
+			m_configurationEditorPresentationRequired &&
+		m_configurationEditorPresentationQueuedTick != 0 &&
+		uiNow - m_configurationEditorPresentationQueuedTick >= 1500 &&
+		!m_configurationEditorPresentationTimeoutLogged)
+	{
+		// A dead or blocked Qt process must never make the MFC UI wait. Keep the
+		// fullscreen close/shortcut routes independent of this advisory target
+		// handoff; a later lifecycle event may safely retry the newest sequence.
+		m_configurationEditorPresentationTimeoutLogged = true;
+		DebugLog::Log(
+			"Configuration editor presentation target acknowledgement timed out: editor=%p target=%p sequence=%u elapsed_ms=%llu state=nonblocking-safe-route-retained",
+			reinterpret_cast<void*>(m_configurationEditorPresentationEditor),
+			reinterpret_cast<void*>(m_configurationEditorPresentationTarget),
+			m_configurationEditorPresentationRequired,
+			static_cast<unsigned long long>(
+				uiNow - m_configurationEditorPresentationQueuedTick));
+	}
 	if (m_rendererRetirementPending &&
 		TryFinalizeRendererRetirement(
 			m_rendererRetirementToken, "ui-timer-reconciliation"))
@@ -11952,6 +12168,13 @@ void CVideoProcessorDlg::OnTimer(UINT_PTR nIDEvent)
 	{
 		KillTimer(RENDERER_RESET_MAILBOX_TIMER_ID);
 		PumpRendererResetMailbox();
+		return;
+	}
+
+	if (nIDEvent == QUEUE_PROFILE_RESTART_TIMER_ID)
+	{
+		KillTimer(QUEUE_PROFILE_RESTART_TIMER_ID);
+		DispatchQueuedQueueProfileRendererRestart();
 		return;
 	}
 
@@ -12056,6 +12279,34 @@ void CVideoProcessorDlg::OnTimer(UINT_PTR nIDEvent)
 
 	if (nIDEvent == SHADER_RULE_REFRESH_TIMER_ID)
 	{
+		// Renderer preparation remains asynchronous and observable in logs, but
+		// the operator-facing pipeline preparation popup is intentionally off.
+		constexpr bool showRenderStallOverlay = false;
+		CString renderStallStatus;
+		const bool rendererCanReportStall =
+			m_rendererState == RendererState::RENDERSTATE_STARTING ||
+			m_rendererState == RendererState::RENDERSTATE_READY ||
+			m_rendererState == RendererState::RENDERSTATE_RENDERING;
+		const bool renderStalled =
+			showRenderStallOverlay && rendererCanReportStall &&
+			m_videoRenderer && !m_wantToRestartRenderer &&
+			m_videoRenderer->GetRenderStallStatus(renderStallStatus);
+		if (renderStalled && m_rendererTargetHwnd && GetSafeHwnd())
+		{
+			const bool wasVisible = m_shaderLoadingWindow.IsVisible();
+			const bool shown = m_shaderLoadingWindow.Show(
+				m_rendererTargetHwnd, GetSafeHwnd(), renderStallStatus);
+			if (shown && !wasVisible && m_shaderLoadingWindow.IsVisible())
+				m_shaderLoadingPopupShownTick = GetTickCount64();
+		}
+		else if (m_shaderLoadingWindow.IsVisible() &&
+			(!rendererCanReportStall ||
+			 GetTickCount64() - m_shaderLoadingPopupShownTick >= 300))
+		{
+			m_shaderLoadingWindow.Hide();
+			m_shaderLoadingPopupShownTick = 0;
+		}
+
 		if (m_rendererState == RendererState::RENDERSTATE_RENDERING &&
 			m_videoRenderer && !m_wantToRestartRenderer)
 		{
@@ -12216,9 +12467,6 @@ void CVideoProcessorDlg::OnTimer(UINT_PTR nIDEvent)
 		if (m_configurationChangedEvent &&
 			WaitForSingleObject(m_configurationChangedEvent, 0) == WAIT_OBJECT_0)
 			ApplySavedConfiguration();
-		if (m_shaderPreparationEvent &&
-			WaitForSingleObject(m_shaderPreparationEvent, 0) == WAIT_OBJECT_0)
-			StartShaderPreparation();
 		return;
 	}
 
@@ -12280,6 +12528,8 @@ void CVideoProcessorDlg::OnTimer(UINT_PTR nIDEvent)
 	// Handle regular 1-second timer for UI updates
 	if (nIDEvent == TIMER_ID_1SECOND)
 	{
+		if (m_failedRendererRetirement)
+			UpdateState();
 		UpdateActiveOutputSweep(uiNow);
 
 		// A source can publish its BT.2020/SDR state only once at startup.
@@ -13272,6 +13522,10 @@ void CVideoProcessorDlg::UpdateStatsOverlay()
 
 	StatsData stats;
 	stats.outputSweep = m_activeOutputSweepStatus;
+	const IVideoRenderer* const statsRenderer = m_videoRenderer.get();
+	const bool sameStatsTelemetryGeneration = statsRenderer != nullptr &&
+		statsRenderer == m_lastStatsTelemetryRenderer &&
+		m_transitionGeneration == m_lastStatsTelemetryGeneration;
 
 	// Video format info
 	if (m_captureDeviceVideoState && m_captureDeviceVideoState->valid)
@@ -13398,8 +13652,16 @@ void CVideoProcessorDlg::UpdateStatsOverlay()
 				stats.presentationTimingStatus);
 		}
 		stats.queueDroppedFrames = m_videoRenderer->DroppedFrameCount();
-		m_videoRenderer->GetOutputModeInfo(stats.outputMode);
-		m_videoRenderer->GetDisplayLutInfo(stats.displayLut);
+		if (!m_videoRenderer->GetOutputModeInfo(stats.outputMode) &&
+			sameStatsTelemetryGeneration)
+		{
+			stats.outputMode = m_lastStatsData->outputMode;
+		}
+		if (!m_videoRenderer->GetDisplayLutInfo(stats.displayLut) &&
+			sameStatsTelemetryGeneration)
+		{
+			stats.displayLut = m_lastStatsData->displayLut;
+		}
 		stats.sceneDetectCorrectionDrops = m_videoRenderer->SceneAwareCorrectionDropCount();
 		stats.sceneDetectCorrectionRepeats = m_videoRenderer->SceneAwareCorrectionRepeatCount();
 		stats.sceneDetectDetected = m_videoRenderer->SceneAwareDetectedCount();
@@ -13453,6 +13715,8 @@ void CVideoProcessorDlg::UpdateStatsOverlay()
 		CString ingress;
 		if (m_videoRenderer->GetVideoIngressInfo(ingress))
 			stats.videoConversion = ingress;
+		else if (sameStatsTelemetryGeneration)
+			stats.videoConversion = m_lastStatsData->videoConversion;
 	}
 	
 	// Conversion performance (NEW - V210→P010 etc.)
@@ -13552,6 +13816,8 @@ void CVideoProcessorDlg::UpdateStatsOverlay()
 
 	// Save current stats for next update
 	*m_lastStatsData = stats;
+	m_lastStatsTelemetryRenderer = statsRenderer;
+	m_lastStatsTelemetryGeneration = m_transitionGeneration;
 }
 
 

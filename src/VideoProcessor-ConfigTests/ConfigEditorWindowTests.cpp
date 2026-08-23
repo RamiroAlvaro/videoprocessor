@@ -19,6 +19,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QEventLoop>
 #include <QFrame>
 #include <QImage>
 #include <QHeaderView>
@@ -50,6 +51,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -66,6 +68,8 @@ WNDPROC testOwnerOriginalProcedure = nullptr;
 HWND testAdvertisedEditor = nullptr;
 bool testActivateOnAssociation = false;
 bool testAssociationActivationAcknowledged = false;
+uint32_t testPresentationTargetAcknowledgementSequence = 0;
+HWND testPresentationTargetAcknowledgementEditor = nullptr;
 
 void answerInputDialog(const QString& text);
 
@@ -259,6 +263,17 @@ LRESULT CALLBACK testOwnerProcedure(HWND window, UINT message,
 {
     static const UINT associationMessage = RegisterWindowMessageW(
         L"VideoProcessor.ConfigEditor.Association.v1");
+	static const UINT presentationTargetAcknowledgementMessage =
+		RegisterWindowMessageW(
+			L"VideoProcessor.ConfigEditor.PresentationTargetAck.v2");
+	if (message == presentationTargetAcknowledgementMessage)
+	{
+		testPresentationTargetAcknowledgementSequence =
+			static_cast<uint32_t>(wParam);
+		testPresentationTargetAcknowledgementEditor =
+			reinterpret_cast<HWND>(lParam);
+		return 1;
+	}
     if (message == associationMessage)
     {
         const HWND editor = reinterpret_cast<HWND>(lParam);
@@ -396,8 +411,8 @@ void testEveryPageRoundTrips()
 
     QStackedWidget* pages = requireControl<QStackedWidget>(window,
         QStringLiteral("settingsPages"));
-    require(pages->count() == 15,
-        "Renderer Output, Input, and shader child pages were not added as dedicated settings pages");
+    require(pages->count() == 16,
+        "Renderer Output, Input, shader, and shortcut child pages were not added as dedicated settings pages");
     for (QPushButton* button : window.findChildren<QPushButton*>())
         require(!button->property("navChild").toBool(),
             "Grouped settings still expose child entries in the left navigation");
@@ -426,9 +441,10 @@ void testEveryPageRoundTrips()
         require(actual == expected, "A grouped settings page has the wrong top tabs");
     };
     QPushButton* shadersNavigation = parentButton(QStringLiteral("Shaders"));
+    QPushButton* shortcutsNavigation = parentButton(QStringLiteral("Shortcuts"));
     QPushButton* vpRenderer = parentButton(QStringLiteral("VP Renderer"));
     QPushButton* directShow = parentButton(QStringLiteral("DirectShow"));
-    require(shadersNavigation && vpRenderer && directShow,
+    require(shadersNavigation && shortcutsNavigation && vpRenderer && directShow,
         "A grouped settings parent is missing from the left navigation");
     shadersNavigation->click();
     requireTabs({ QStringLiteral("Setup"), QStringLiteral("Standard"),
@@ -439,6 +455,8 @@ void testEveryPageRoundTrips()
         QStringLiteral("Input Processing") });
     directShow->click();
     requireTabs({ QStringLiteral("General"), QStringLiteral("Input Processing") });
+    shortcutsNavigation->click();
+    requireTabs({ QStringLiteral("Setup"), QStringLiteral("Shortcuts") });
     QWidget* navigation = requireControl<QWidget>(window, QStringLiteral("sidebar"));
     require(navigation->minimumWidth() >= 172,
         "The settings navigation is too narrow for renderer child labels");
@@ -570,6 +588,11 @@ void testEveryPageRoundTrips()
     require(noUiShortcut->text() == QStringLiteral("Ctrl+Shift+U"),
         "Video-only UI toggle did not default to Ctrl+Shift+U");
     noUiShortcut->setText(QStringLiteral("Alt+u"));
+    QCheckBox* foregroundOnly = requireControl<QCheckBox>(window,
+        QStringLiteral("config.shortcuts.foreground_only"));
+    require(!foregroundOnly->isChecked(),
+        "Foreground-only shortcut processing did not default to disabled");
+    foregroundOnly->setChecked(true);
 
     window.selectPage(10);
     require(requireControl<QCheckBox>(window, QStringLiteral("config.logging.enabled"))->isChecked(),
@@ -670,6 +693,9 @@ void testEveryPageRoundTrips()
         shaderSections->tabText(2) == QStringLiteral("NLS") &&
         shaderSections->currentIndex() == 0,
         "Shaders page does not separate Setup, Standard, and NLS in the requested order");
+    require(window.findChild<QPushButton*>(
+        QStringLiteral("config.shader.prepare")) == nullptr,
+        "Shaders Setup still exposes exhaustive preparation");
     const QString cacheDirectoryPath = directory.filePath(QStringLiteral("vprenderer"));
     require(QDir().mkpath(cacheDirectoryPath),
         "Cannot create the shader-cache test directory");
@@ -755,6 +781,7 @@ void testEveryPageRoundTrips()
         "container_colorspace: REC709", "max_cll: 1200", "max_fall: 450",
         "fullscreen_toggle: Ctrl+F", "config_editor: Ctrl+E",
         "capture_rendered_output: Ctrl+Alt+C", "toggle_noui: Alt+U",
+        "foreground_only: true",
         "renderer: *", "run: C:\\Tools\\verified-action.cmd 42",
         "enabled: false", "debug: false", "debug_log_retention: 25",
         "label: Verified Stretch", "order: 10", "strength: 0.85", "threshold: 28",
@@ -793,6 +820,9 @@ void testEveryPageRoundTrips()
     require(requireControl<QComboBox>(reloaded,
         QStringLiteral("config.directshow.video_conversion"))->currentData().toString() ==
         QStringLiteral("NONE"), "DirectShow input override did not reload");
+    require(requireControl<QCheckBox>(reloaded,
+        QStringLiteral("config.shortcuts.foreground_only"))->isChecked(),
+        "Foreground-only shortcut processing did not reload");
 }
 
 void testRendererSectionTabsRemainSynchronizedDuringRapidClicks()
@@ -909,13 +939,24 @@ void testRendererSectionTabsRemainSynchronizedDuringRapidClicks()
     runSequence({
         { 2, 9, "NLS", "config.shader.nls.modes" },
         { 1, 8, "Standard", "config.shader.standard.items" },
-        { 0, 14, "Shaders", "config.shader.prepare" },
+        { 0, 14, "Shaders", "config.shader.cache.clear" },
         { 2, 9, "NLS", "config.shader.nls.modes" },
         { 1, 8, "Standard", "config.shader.standard.items" }
     });
     require(navigationButton(QStringLiteral("Shaders")) &&
         navigationButton(QStringLiteral("Shaders"))->isChecked(),
         "Shader child page lost its parent navigation selection");
+
+    window.selectPage(15);
+    requireTabs({ QStringLiteral("Setup"), QStringLiteral("Shortcuts") });
+    runSequence({
+        { 1, 6, "Shortcuts", "config.shortcuts.fullscreen_toggle" },
+        { 0, 15, "Shortcuts", "config.shortcuts.foreground_only" },
+        { 1, 6, "Shortcuts", "config.shortcuts.fullscreen_toggle" }
+    });
+    require(navigationButton(QStringLiteral("Shortcuts")) &&
+        navigationButton(QStringLiteral("Shortcuts"))->isChecked(),
+        "Shortcuts child page lost its parent navigation selection");
     require(!sectionTabs->drawBase(),
         "Persistent grouped tabs restored the native white tab-bar base");
 }
@@ -2112,7 +2153,7 @@ void testChoiceLabelsAndVpRendererName()
             QStringLiteral("Auto: sRGB") &&
         requireControl<QLabel>(window,
         QStringLiteral("config.vprenderer.sdr_adjust_gamma.auto_status"))->text() ==
-            QStringLiteral("Auto: Source unavailable") &&
+            QStringLiteral("Auto: Conditional SDR-to-sRGB policy") &&
         requireControl<QLabel>(window,
         QStringLiteral("config.vprenderer.sdr_input_transfer.auto_status"))->text() ==
             QStringLiteral("Auto: Source unavailable") &&
@@ -2654,6 +2695,10 @@ void testApplyOkCancelContract()
             QStringLiteral("configurationStatus"))->text().contains(
                 QStringLiteral("Takes effect when VideoProcessor next starts")),
             "VP-absent Apply did not report the next-start behavior");
+        require(!requireControl<QLabel>(window,
+            QStringLiteral("configurationStatus"))->text().contains(
+                QStringLiteral("Backup:")),
+            "Configuration save status still reports a backup path");
 
         // A clean OK closes without rewriting the file or creating another
         // backup/runtime notification.
@@ -2731,17 +2776,8 @@ void testApplyOkCancelContract()
             "Config did not replace the externally edited file with its validated document");
         const QStringList backupsAfter = QDir(directory.path()).entryList(
             { QStringLiteral("VideoProcessor.cfg.backup-*") }, QDir::Files);
-        require(backupsAfter.size() == backupsBefore.size() + 1,
-            "Overwriting an external edit did not retain a timestamped backup");
-        bool externalVersionBackedUp = false;
-        for (const QString& backup : backupsAfter)
-            if (readBytes(QDir(directory.path()).filePath(backup)).contains("# external edit"))
-            {
-                externalVersionBackedUp = true;
-                break;
-            }
-        require(externalVersionBackedUp,
-            "The externally edited configuration was not preserved in the backup");
+        require(backupsAfter == backupsBefore,
+            "Overwriting an external edit created a timestamped backup");
     }
 
     {
@@ -3414,6 +3450,36 @@ void testNativeOwnerPreservesQtInputAndPopupAssociation()
         SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &targetAcknowledged) &&
         targetAcknowledged == 1,
         "Replacement presentation target was not accepted");
+	const UINT targetMessageV2 = RegisterWindowMessageW(
+		L"VideoProcessor.ConfigEditor.PresentationTarget.v2");
+	const UINT acknowledgementEndpointMessage = RegisterWindowMessageW(
+		L"VideoProcessor.ConfigEditor.PresentationTargetAckEndpoint.v1");
+	constexpr uint32_t targetSequence = 0x141;
+	testPresentationTargetAcknowledgementSequence = 0;
+	testPresentationTargetAcknowledgementEditor = nullptr;
+	require(PostMessageW(editor, acknowledgementEndpointMessage,
+		static_cast<WPARAM>(GetCurrentProcessId()),
+		reinterpret_cast<LPARAM>(owner)),
+		"Could not queue asynchronous presentation-target acknowledgement endpoint");
+	require(PostMessageW(editor, targetMessageV2,
+		(static_cast<WPARAM>(targetSequence) << 32) |
+			static_cast<WPARAM>(GetCurrentProcessId()),
+		reinterpret_cast<LPARAM>(replacementHost)),
+		"Could not queue asynchronous presentation-target v2 update");
+	QEventLoop acknowledgementLoop;
+	QTimer acknowledgementPoll;
+	QObject::connect(&acknowledgementPoll, &QTimer::timeout,
+		&acknowledgementLoop, [&acknowledgementLoop, targetSequence]
+		{
+			if (testPresentationTargetAcknowledgementSequence == targetSequence)
+				acknowledgementLoop.quit();
+		});
+	QTimer::singleShot(1000, &acknowledgementLoop, &QEventLoop::quit);
+	acknowledgementPoll.start(10);
+	acknowledgementLoop.exec();
+	require(testPresentationTargetAcknowledgementSequence == targetSequence &&
+		testPresentationTargetAcknowledgementEditor == editor,
+		"Presentation-target v2 update did not asynchronously acknowledge the current Config HWND");
     QCoreApplication::processEvents();
     require(GetWindow(editor, GW_OWNER) == nullptr &&
         (GetWindowLongPtrW(editor, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0,
@@ -3468,6 +3534,8 @@ void testNativeOwnerPreservesQtInputAndPopupAssociation()
         reinterpret_cast<LONG_PTR>(testOwnerOriginalProcedure));
     testOwnerOriginalProcedure = nullptr;
     testAdvertisedEditor = nullptr;
+	testPresentationTargetAcknowledgementSequence = 0;
+	testPresentationTargetAcknowledgementEditor = nullptr;
     DestroyWindow(owner);
 }
 

@@ -11,7 +11,6 @@
 
 #include <ConfigEditorCore.h>
 #include <RendererProfileConfig.h>
-#include <ShaderPreparationPolicy.h>
 
 #include <QAbstractItemView>
 #include <QAbstractItemModel>
@@ -26,6 +25,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QDialog>
+#include <QDebug>
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
@@ -51,8 +51,6 @@
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPointer>
-#include <QProcess>
-#include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRect>
@@ -74,6 +72,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWindow>
+#include <QWindowStateChangeEvent>
 #include <QWinEventNotifier>
 
 #include <algorithm>
@@ -90,7 +89,8 @@ constexpr int kCardPadding = 12;
 constexpr int kResponsiveContentWidth = 720;
 constexpr int kRendererNameRole = Qt::UserRole + 1;
 
-using DocumentSnapshot = ShaderPreparationPolicy::Snapshot;
+using DocumentSection = std::map<std::string, std::string>;
+using DocumentSnapshot = std::map<std::string, DocumentSection>;
 
 DocumentSnapshot captureDocumentSnapshot(
     const ConfigEditorCore::ConfigDocument& document)
@@ -905,11 +905,11 @@ ConfigEditorWindow::ConfigEditorWindow(QString configPath, quintptr ownerHandle,
         connect(activeProfileTimer_, &QTimer::timeout, this,
             &ConfigEditorWindow::refreshActiveProfileIndicators);
         refreshActiveProfileIndicators();
-        shaderStatusTimer_ = new QTimer(this);
-        shaderStatusTimer_->setInterval(250);
-        connect(shaderStatusTimer_, &QTimer::timeout, this,
-            &ConfigEditorWindow::refreshShaderPreparationStatus);
-        shaderStatusTimer_->start();
+        shaderCacheStatusTimer_ = new QTimer(this);
+        shaderCacheStatusTimer_->setInterval(2000);
+        connect(shaderCacheStatusTimer_, &QTimer::timeout, this,
+            &ConfigEditorWindow::refreshShaderCacheStatus);
+        shaderCacheStatusTimer_->start();
     }
     if (!testMode_) setupTray();
 	const std::wstring revealEventName =
@@ -1435,8 +1435,10 @@ void ConfigEditorWindow::refreshRendererAutoStatus()
         else if (binding.key == QStringLiteral("output_gamma"))
             text = QStringLiteral("sRGB");
         else if (binding.key == QStringLiteral("sdr_adjust_gamma"))
-            text = liveSourceTransfer_.isEmpty() ?
-                QStringLiteral("Source unavailable") : liveSourceTransfer_;
+            // This selector controls the conversion policy, rather than
+            // declaring the input transfer. Do not echo the live input EOTF
+            // here: that belongs only to sdr_input_transfer below.
+            text = QStringLiteral("Conditional SDR-to-sRGB policy");
         else if (binding.key == QStringLiteral("sdr_input_transfer"))
             text = liveSourceTransfer_.isEmpty() ?
                 QStringLiteral("Source unavailable") : liveSourceTransfer_;
@@ -2020,6 +2022,19 @@ void ConfigEditorWindow::applyScopedTopmost()
 {
     if (!pendingTopmostReassert_ || !scopedTopmostEligible_ || !isVisible())
         return;
+	if (hasActiveOwnedPopup())
+	{
+		if (!topmostReassertDeferredForPopup_)
+		{
+			topmostReassertDeferredForPopup_ = true;
+			qInfo("Configuration editor z-order repair deferred: active Qt popup");
+		}
+		// A native topmost request can reorder the popup out from under its menu
+		// or combo list. Keep the repair pending and retry from the Qt event loop
+		// after the popup has had a chance to close.
+		QTimer::singleShot(50, this, [this] { applyScopedTopmost(); });
+		return;
+	}
     // Config is an operator modal surface.  While it is visible, retain its
     // topmost placement even after another application receives foreground.
     // This deliberately matches madVR's configuration behavior and keeps the
@@ -2029,6 +2044,11 @@ void ConfigEditorWindow::applyScopedTopmost()
     scopedTopmost_ = SetWindowPos(editor, HWND_TOPMOST, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW) != FALSE;
     pendingTopmostReassert_ = false;
+	if (topmostReassertDeferredForPopup_)
+	{
+		topmostReassertDeferredForPopup_ = false;
+		qInfo("Configuration editor z-order repair applied after Qt popup closed");
+	}
 }
 
 void ConfigEditorWindow::removeScopedTopmost()
@@ -2198,7 +2218,10 @@ bool ConfigEditorWindow::saveChanges()
         {
             for (const auto& setting : document_->SectionSettings(section))
             {
-                const bool isShortcut = root == QStringLiteral("shortcuts") ||
+                const bool isShortcut =
+                    (root == QStringLiteral("shortcuts") &&
+                        ConfigFile::NormalizeName(setting.first) !=
+                            "foreground_only") ||
                     ConfigFile::NormalizeName(setting.first) == "shortcut";
                 if (!isShortcut || ConfigFile::Trim(setting.second).empty()) continue;
                 std::string canonical;
@@ -2241,9 +2264,8 @@ bool ConfigEditorWindow::saveChanges()
         if (applyButton_) applyButton_->setEnabled(false);
         return false;
     }
-    // Config is the interactive authority for this file. Preserve any outside
-    // version in the timestamped backup, then save the user's validated editor
-    // state instead of refusing a stale-file conflict.
+    // Config is the interactive authority for this file. Save the user's
+    // validated editor state instead of refusing a stale-file conflict.
     if (!ConfigEditorCore::SaveSafely(*document_, result, error, true))
     {
         setStatus(QString::fromStdWString(error), true);
@@ -2272,11 +2294,10 @@ bool ConfigEditorWindow::saveChanges()
                 enabled->setChecked(false);
             }
         }
-        setStatus(QStringLiteral("Changes saved%1. Incomplete action%2 %3 saved as disabled draft%2. Backup: %4")
+        setStatus(QStringLiteral("Changes saved%1. Incomplete action%2 %3 saved as disabled draft%2.")
             .arg(notified ? QStringLiteral(" and sent to VideoProcessor") : QStringLiteral("; VideoProcessor could not be notified"))
             .arg(draftedActions.size() == 1 ? QString() : QStringLiteral("s"),
-                draftedActions.join(QStringLiteral(", ")),
-                QString::fromStdWString(result.backupPath)));
+                draftedActions.join(QStringLiteral(", "))));
     }
 	else if (creatingConfiguration)
     {
@@ -2293,10 +2314,8 @@ bool ConfigEditorWindow::saveChanges()
         const QString effect = QString::fromLatin1(
             ConfigurationApplyPolicy::ActionLabel(action));
         setStatus(notified ?
-            QStringLiteral("Changes saved safely. %1 was requested. Backup: %2")
-                .arg(effect, QString::fromStdWString(result.backupPath)) :
-            QStringLiteral("Changes saved safely. Takes effect when VideoProcessor next starts. Backup: %1")
-                .arg(QString::fromStdWString(result.backupPath)), false);
+            QStringLiteral("Changes saved safely. %1 was requested.").arg(effect) :
+            QStringLiteral("Changes saved safely. Takes effect when VideoProcessor next starts."), false);
     }
     return true;
 }
@@ -2315,8 +2334,6 @@ QWidget* ConfigEditorWindow::createShell()
     saveButton_ = nullptr;
     configurationHost_ = nullptr;
     shaderCacheStatus_ = nullptr;
-    shaderPreparationStatus_ = nullptr;
-    shaderFooterBusy_ = nullptr;
     activeProfileLists_.clear();
     rendererAutoStatusBindings_.clear();
     auto* root = new QWidget;
@@ -2392,6 +2409,7 @@ QWidget* ConfigEditorWindow::createShell()
         QStringLiteral("directshow")));
     pages_->addWidget(createOutputPage());
     pages_->addWidget(createShadersSetupPage());
+    pages_->addWidget(createShortcutsSetupPage());
 
     auto* navGroup = new QButtonGroup(root);
     navGroup->setExclusive(true);
@@ -2408,7 +2426,7 @@ QWidget* ConfigEditorWindow::createShell()
     addLeaf(QStringLiteral("LLDV"), 5);
     QPushButton* shadersNavigation = addLeaf(QStringLiteral("Shaders"), 14);
     addLeaf(QStringLiteral("Actions"), 7);
-    addLeaf(QStringLiteral("Shortcuts"), 6);
+    QPushButton* shortcutsNavigation = addLeaf(QStringLiteral("Shortcuts"), 15);
     addLeaf(QStringLiteral("Logs"), 10);
     navLayout->addSpacing(8);
     QPushButton* vpNavigation = addLeaf(QStringLiteral("VP Renderer"), 2);
@@ -2454,7 +2472,7 @@ QWidget* ConfigEditorWindow::createShell()
         sectionTabs->setVisible(!entries.empty());
     };
     const auto updateSectionTabs = [showSectionTabs, shadersNavigation,
-        vpNavigation, directShowNavigation](int page)
+        shortcutsNavigation, vpNavigation, directShowNavigation](int page)
     {
         if (page == 8 || page == 9 || page == 14)
         {
@@ -2476,6 +2494,12 @@ QWidget* ConfigEditorWindow::createShell()
             directShowNavigation->setChecked(true);
             showSectionTabs({ { QStringLiteral("General"), 3 },
                 { QStringLiteral("Input Processing"), 12 } }, page);
+        }
+        else if (page == 6 || page == 15)
+        {
+            shortcutsNavigation->setChecked(true);
+            showSectionTabs({ { QStringLiteral("Setup"), 15 },
+                { QStringLiteral("Shortcuts"), 6 } }, page);
         }
         else
             showSectionTabs({}, page);
@@ -2508,13 +2532,6 @@ QWidget* ConfigEditorWindow::createShell()
     status_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     status_->setWordWrap(true);
     footerLayout->addWidget(status_, 1);
-    shaderFooterBusy_ = new QProgressBar;
-    shaderFooterBusy_->setObjectName(QStringLiteral("shaderPreparationBusy"));
-    shaderFooterBusy_->setRange(0, 0);
-    shaderFooterBusy_->setTextVisible(false);
-    shaderFooterBusy_->setFixedSize(54, 8);
-    shaderFooterBusy_->hide();
-    footerLayout->addWidget(shaderFooterBusy_);
     effectSummary_ = new QLabel;
     effectSummary_->setObjectName(QStringLiteral("configurationEffectSummary"));
     effectSummary_->setAccessibleName(QStringLiteral("Pending configuration effect"));
@@ -4584,94 +4601,7 @@ QWidget* ConfigEditorWindow::createRendererPage()
         QStringLiteral("Configure ordered rendering profiles. The first profile in the list is the default."), QStringLiteral("vprenderer"));
 }
 
-void ConfigEditorWindow::setShaderPreparationBusy(bool busy,
-    const QString& message)
-{
-    shaderPreparationBusy_ = busy;
-    if (shaderFooterBusy_) shaderFooterBusy_->setVisible(busy);
-    if (auto* prepare = findChild<QPushButton*>(
-        QStringLiteral("config.shader.prepare")))
-        prepare->setEnabled(!busy);
-    if (saveButton_) saveButton_->setEnabled(configurationLoaded_ && validationValid_);
-    if (applyButton_)
-        applyButton_->setEnabled(configurationLoaded_ && dirty_ &&
-            validationValid_);
-    if (!message.isEmpty()) setStatus(message, false);
-}
-
-void ConfigEditorWindow::requestShaderPreparation()
-{
-    if (testMode_) return;
-    const QDir rendererDirectory(QFileInfo(configPath_).absoluteDir().filePath(
-        QStringLiteral("vprenderer")));
-    if (!QDir().mkpath(rendererDirectory.absolutePath()))
-    {
-        setStatus(QStringLiteral("Could not access the VP Renderer shader folder."), true);
-        return;
-    }
-    const QString statusPath = rendererDirectory.filePath(
-        QString::fromWCharArray(
-            ConfigurationLiveApply::ShaderPreparationStatusFileName));
-    const QString temporaryPath = statusPath + QStringLiteral(".tmp");
-    QFile status(temporaryPath);
-    if (!status.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
-        status.write("state=waiting\ncurrent=0\ntotal=0\nmessage=Waiting for VideoProcessor...\n") < 0)
-    {
-        setStatus(QStringLiteral("Could not create the shader preparation request."), true);
-        return;
-    }
-    status.close();
-    QFile::remove(statusPath);
-    if (!QFile::rename(temporaryPath, statusPath))
-    {
-        setStatus(QStringLiteral("Could not publish the shader preparation request."), true);
-        return;
-    }
-
-    // Never ask an active presentation process to compile cache variants. The
-    // old event path ran this work from VP's MFC UI thread, which made both VP
-    // and Config appear frozen. Explicit preparation uses an isolated process.
-    HANDLE listener = OpenEventW(SYNCHRONIZE, FALSE,
-        ConfigurationLiveApply::ShaderPreparationEventName);
-    const bool vpIsRunning = listener != nullptr;
-    if (listener) CloseHandle(listener);
-    if (vpIsRunning)
-    {
-        QFile::remove(statusPath);
-        setShaderPreparationBusy(false);
-        setStatus(QStringLiteral(
-            "Shader preparation is available after VideoProcessor stops. Live changes do not prepare shaders."), false);
-        return;
-    }
-
-    QDir installation = QFileInfo(configPath_).absoluteDir();
-    QString executable = installation.filePath(
-        QStringLiteral("VideoProcessor.exe"));
-    if (!QFileInfo::exists(executable))
-    {
-        QDir besideConfig(QCoreApplication::applicationDirPath());
-        besideConfig.cdUp();
-        executable = besideConfig.filePath(QStringLiteral("VideoProcessor.exe"));
-    }
-    qint64 processId = 0;
-    if (!QFileInfo::exists(executable) || !QProcess::startDetached(executable,
-        { QStringLiteral("/prepare_shaders") }, installation.absolutePath(),
-        &processId))
-    {
-		QFile::remove(statusPath);
-		setShaderPreparationBusy(false);
-        setStatus(QStringLiteral(
-            "Shader preparation could not start VideoProcessor."), true);
-        return;
-    }
-	shaderPreparationProcessId_ = processId;
-	setStatus(QStringLiteral(
-		"Started VideoProcessor to prepare shaders. Config remains available."), false);
-    setShaderPreparationBusy(true, QStringLiteral("Preparing shaders..."));
-    refreshShaderPreparationStatus();
-}
-
-void ConfigEditorWindow::refreshShaderPreparationStatus()
+void ConfigEditorWindow::refreshShaderCacheStatus()
 {
     const QDir rendererDirectory(QFileInfo(configPath_).absoluteDir().filePath(
         QStringLiteral("vprenderer")));
@@ -4685,68 +4615,6 @@ void ConfigEditorWindow::refreshShaderPreparationStatus()
                 .arg(cache.lastModified().toString(QStringLiteral("MMM d, h:mm AP"))) :
             QStringLiteral("Persistent cache: Not created yet"));
     }
-
-    QFile status(rendererDirectory.filePath(QString::fromWCharArray(
-        ConfigurationLiveApply::ShaderPreparationStatusFileName)));
-    if (!status.open(QIODevice::ReadOnly))
-    {
-        if (shaderPreparationStatus_)
-            shaderPreparationStatus_->setText(QStringLiteral("Shaders not prepared yet"));
-        return;
-    }
-    QString state;
-    QString message;
-    while (!status.atEnd())
-    {
-        const QString line = QString::fromUtf8(status.readLine()).trimmed();
-        const int separator = line.indexOf(u'=');
-        if (separator < 0) continue;
-        const QString key = line.left(separator);
-        const QString value = line.mid(separator + 1);
-        if (key == QStringLiteral("state")) state = value;
-        else if (key == QStringLiteral("message")) message = value;
-    }
-	if (state == QStringLiteral("waiting") && shaderPreparationProcessId_ == 0)
-	{
-		HANDLE listener = OpenEventW(SYNCHRONIZE, FALSE,
-			ConfigurationLiveApply::ShaderPreparationEventName);
-		const bool isListening = listener != nullptr;
-		if (listener) CloseHandle(listener);
-		if (!isListening)
-		{
-			state = QStringLiteral("idle");
-			message = QStringLiteral(
-				"Shader preparation is not running. Start it when VideoProcessor is available.");
-		}
-	}
-	if (state == QStringLiteral("waiting") && shaderPreparationProcessId_ > 0)
-	{
-		HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-			FALSE, static_cast<DWORD>(shaderPreparationProcessId_));
-		DWORD exitCode = STILL_ACTIVE;
-		const bool stopped = !process ||
-			(!GetExitCodeProcess(process, &exitCode) || exitCode != STILL_ACTIVE);
-		if (process) CloseHandle(process);
-		if (stopped)
-		{
-			state = QStringLiteral("failed");
-			message = QStringLiteral(
-				"VideoProcessor closed before shader preparation began.");
-			shaderPreparationProcessId_ = 0;
-		}
-	}
-	if (state != QStringLiteral("waiting") && state != QStringLiteral("preparing"))
-		shaderPreparationProcessId_ = 0;
-	const bool finalBusy = state == QStringLiteral("waiting") ||
-		state == QStringLiteral("preparing");
-    if (shaderPreparationStatus_)
-        shaderPreparationStatus_->setText(message.isEmpty() ?
-            (finalBusy ? QStringLiteral("Preparing shaders...") :
-                QStringLiteral("Shaders ready")) : message);
-    if (finalBusy != shaderPreparationBusy_)
-        setShaderPreparationBusy(finalBusy, message);
-    else if (finalBusy && !message.isEmpty())
-        setStatus(message, false);
 }
 
 QWidget* ConfigEditorWindow::createOutputPage()
@@ -5335,16 +5203,11 @@ QWidget* ConfigEditorWindow::createShadersSetupPage()
     auto* statusLayout = new QVBoxLayout(statusContent);
     statusLayout->setContentsMargins(0, 0, 0, 0);
     statusLayout->setSpacing(8);
-    shaderPreparationStatus_ = new QLabel(QStringLiteral("Shaders ready"));
-    shaderPreparationStatus_->setObjectName(
-        QStringLiteral("config.shader.preparation.status"));
-    shaderPreparationStatus_->setProperty("cardTitle", true);
     shaderCacheStatus_ = helpLabel(QStringLiteral("Checking shader cache..."));
     shaderCacheStatus_->setObjectName(QStringLiteral("config.shader.cache.status"));
-    statusLayout->addWidget(shaderPreparationStatus_);
     statusLayout->addWidget(shaderCacheStatus_);
-    layout->addWidget(createCard(QStringLiteral("Shader status"),
-        QStringLiteral("VP prepares missing GPU shader variants before you switch rendering profiles."),
+    layout->addWidget(createCard(QStringLiteral("Shader cache"),
+        QStringLiteral("VP Renderer compiles shaders when they are required and stores them here."),
         statusContent));
 
     auto* controls = new QWidget;
@@ -5352,28 +5215,21 @@ QWidget* ConfigEditorWindow::createShadersSetupPage()
     controlsLayout->setContentsMargins(0, 0, 0, 0);
     controlsLayout->setSpacing(8);
     auto* buttons = new QHBoxLayout;
-    auto* prepare = new QPushButton(QStringLiteral("Prepare shaders"));
-    prepare->setObjectName(QStringLiteral("config.shader.prepare"));
-    prepare->setAccessibleDescription(QStringLiteral(
-        "Prepare shader variants for every VP Renderer rendering profile."));
     auto* clearCache = new QPushButton(QStringLiteral("Clear shader cache"));
     clearCache->setObjectName(QStringLiteral("config.shader.cache.clear"));
     clearCache->setProperty("danger", true);
     clearCache->setAccessibleDescription(QStringLiteral(
         "Clear the persistent VP Renderer shader cache at the next renderer start."));
-    buttons->addWidget(prepare);
     buttons->addWidget(clearCache);
     buttons->addStretch();
     controlsLayout->addLayout(buttons);
     controlsLayout->addWidget(helpLabel(QStringLiteral(
-        "Preparation runs in an isolated non-capturing process after VP stops, so it never interrupts playback.")));
-    layout->addWidget(createCard(QStringLiteral("Shader setup"),
-        QStringLiteral("Prepare or clear the persistent VP Renderer shader cache."),
+        "The cache is rebuilt automatically as VP Renderer uses shaders.")));
+    layout->addWidget(createCard(QStringLiteral("Cache maintenance"),
+        QStringLiteral("Remove the persistent VP Renderer shader cache."),
         controls));
     layout->addStretch();
 
-    connect(prepare, &QPushButton::clicked, this,
-        &ConfigEditorWindow::requestShaderPreparation);
     connect(clearCache, &QPushButton::clicked, this, [this]
     {
         const QDir configurationDirectory = QFileInfo(configPath_).absoluteDir();
@@ -5402,11 +5258,11 @@ QWidget* ConfigEditorWindow::createShadersSetupPage()
         QFile::remove(temporaryPath);
         setStatus(QStringLiteral(
             "Shader cache will be cleared at the next VP Renderer start."));
-        refreshShaderPreparationStatus();
+        refreshShaderCacheStatus();
     });
-    refreshShaderPreparationStatus();
+    refreshShaderCacheStatus();
     return createPage(QStringLiteral("Shaders"),
-        QStringLiteral("Prepare and inspect VP Renderer shader storage."), content);
+        QStringLiteral("Inspect or clear VP Renderer shader storage."), content);
 }
 
 QWidget* ConfigEditorWindow::createStandardShadersPage()
@@ -6300,7 +6156,79 @@ QWidget* ConfigEditorWindow::createShortcutsPage()
             true));
     }
     return createPage(QStringLiteral("Shortcuts"),
-        QStringLiteral("Configure global keyboard shortcuts. Defaults are shown; clear a field and save to disable it. A running VP applies saved shortcuts immediately."),
+        QStringLiteral("Configure keyboard shortcuts. Defaults are shown; clear a field and save to disable it. A running VP applies saved shortcuts immediately."),
+        content);
+}
+
+bool ConfigEditorWindow::savedForegroundOnlyEnabled() const
+{
+    for (const auto& section : savedSnapshot_)
+    {
+        if (ConfigurationApplyPolicy::NormalizeSection(section.first) !=
+            "shortcuts")
+            continue;
+        for (const auto& setting : section.second)
+            if (ConfigurationApplyPolicy::NormalizeSection(setting.first) ==
+                "foreground_only")
+                return configuredBooleanValue(
+                    QString::fromLocal8Bit(setting.second.c_str()), false);
+    }
+    return false;
+}
+
+void ConfigEditorWindow::returnFocusToPresentationTarget(const char* reason)
+{
+    const HWND target = reinterpret_cast<HWND>(presentationTargetHandle_);
+    DWORD actualProcessId = 0;
+    const bool validTarget = target && IsWindow(target) &&
+        presentationTargetProcessId_ != 0 &&
+        presentationTargetProcessId_ == ownerProcessId_ &&
+        GetWindowThreadProcessId(target, &actualProcessId) != 0 &&
+        actualProcessId == presentationTargetProcessId_;
+    if (!ConfigurationLiveApply::ShouldReturnPresentationFocus(
+        savedForegroundOnlyEnabled(), true, validTarget))
+        return;
+
+    if (IsIconic(target)) ShowWindowAsync(target, SW_RESTORE);
+    AllowSetForegroundWindow(ownerProcessId_);
+    BringWindowToTop(target);
+    const BOOL requested = SetForegroundWindow(target);
+    const HWND foreground = GetForegroundWindow();
+    const QString diagnostic = QStringLiteral(
+        "VideoProcessor Config focus handoff: reason=%1 target=0x%2 requested=%3 foreground=0x%4\n")
+        .arg(QString::fromLatin1(reason))
+        .arg(reinterpret_cast<quintptr>(target), 0, 16)
+        .arg(requested ? QStringLiteral("true") : QStringLiteral("false"))
+        .arg(reinterpret_cast<quintptr>(foreground), 0, 16);
+    OutputDebugStringW(reinterpret_cast<LPCWSTR>(diagnostic.utf16()));
+}
+
+QWidget* ConfigEditorWindow::createShortcutsSetupPage()
+{
+    auto* content = new QWidget;
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(16);
+
+    auto* handling = new QWidget;
+    auto* handlingLayout = new QVBoxLayout(handling);
+    handlingLayout->setContentsMargins(0, 0, 0, 0);
+    handlingLayout->setSpacing(8);
+    handlingLayout->addWidget(bindCheckField(
+        QStringLiteral("Only process shortcuts while VideoProcessor is in the foreground"),
+        QStringLiteral("shortcuts"), QStringLiteral("foreground_only"), false));
+    auto* help = new QLabel(QStringLiteral(
+        "When enabled, background applications keep their keystrokes. VideoProcessor asks Windows to return focus after startup, a renderer change, or closing or minimizing Config."));
+    help->setWordWrap(true);
+    help->setObjectName(QStringLiteral("fieldHelp"));
+    handlingLayout->addWidget(help);
+    layout->addWidget(createCard(QStringLiteral("Keyboard handling"),
+        QStringLiteral("Choose whether shortcuts remain global or require VideoProcessor focus."),
+        handling));
+    layout->addStretch();
+
+    return createPage(QStringLiteral("Shortcuts"),
+        QStringLiteral("Control when VideoProcessor processes configured keyboard shortcuts."),
         content);
 }
 
@@ -6373,6 +6301,11 @@ void ConfigEditorWindow::closeEvent(QCloseEvent* event)
 {
     if (!exitRequested_ && tray_ && tray_->isVisible())
     {
+        const HWND editor = reinterpret_cast<HWND>(effectiveWinId());
+        returnFocusAfterHide_ = savedForegroundOnlyEnabled() && editor &&
+            GetForegroundWindow() == editor;
+        if (returnFocusAfterHide_ && ownerProcessId_ != 0)
+            AllowSetForegroundWindow(ownerProcessId_);
         hide();
         event->ignore();
         return;
@@ -6389,6 +6322,11 @@ void ConfigEditorWindow::hideEvent(QHideEvent* event)
     removeScopedTopmost();
     clearNativeOwner();
     QMainWindow::hideEvent(event);
+    if (returnFocusAfterHide_)
+    {
+        returnFocusAfterHide_ = false;
+        returnFocusToPresentationTarget("config-close");
+    }
 }
 
 void ConfigEditorWindow::showEvent(QShowEvent* event)
@@ -6423,14 +6361,47 @@ bool ConfigEditorWindow::nativeEvent(const QByteArray& eventType,
         L"VideoProcessor.ConfigEditor.Activate.v1");
     static const UINT presentationTargetMessage = RegisterWindowMessageW(
         L"VideoProcessor.ConfigEditor.PresentationTarget.v1");
+	static const UINT presentationTargetMessageV2 = RegisterWindowMessageW(
+		L"VideoProcessor.ConfigEditor.PresentationTarget.v2");
+	static const UINT presentationTargetAcknowledgementEndpointMessage =
+		RegisterWindowMessageW(
+			L"VideoProcessor.ConfigEditor.PresentationTargetAckEndpoint.v1");
+	static const UINT presentationTargetAcknowledgementMessageV2 =
+		RegisterWindowMessageW(
+			L"VideoProcessor.ConfigEditor.PresentationTargetAck.v2");
     static const UINT reassertMessage = RegisterWindowMessageW(
         L"VideoProcessor.ConfigEditor.Reassert.v1");
     if (!message)
         return QMainWindow::nativeEvent(eventType, nativeMessage, result);
+	if (presentationTargetAcknowledgementEndpointMessage &&
+		message->message == presentationTargetAcknowledgementEndpointMessage)
+	{
+		const DWORD requestedProcessId = static_cast<DWORD>(message->wParam);
+		const HWND requestedEndpoint = reinterpret_cast<HWND>(message->lParam);
+		DWORD actualProcessId = 0;
+		if (requestedEndpoint && IsWindow(requestedEndpoint))
+			GetWindowThreadProcessId(requestedEndpoint, &actualProcessId);
+		const bool accepted = requestedProcessId != 0 &&
+			requestedProcessId == ownerProcessId_ &&
+			actualProcessId == requestedProcessId;
+		if (accepted)
+		{
+			presentationTargetAcknowledgementHandle_ =
+				reinterpret_cast<quintptr>(requestedEndpoint);
+			presentationTargetAcknowledgementProcessId_ = requestedProcessId;
+		}
+		if (result) *result = accepted ? 1 : 0;
+		return true;
+	}
 
-    if (message->message == presentationTargetMessage)
+    if (message->message == presentationTargetMessage ||
+		message->message == presentationTargetMessageV2)
     {
         const DWORD requestedProcessId = static_cast<DWORD>(message->wParam);
+		const quint32 requestedSequence =
+			message->message == presentationTargetMessageV2 ?
+				static_cast<quint32>(static_cast<quint64>(message->wParam) >> 32) :
+				0;
         const HWND requestedTarget = reinterpret_cast<HWND>(message->lParam);
         DWORD actualProcessId = 0;
         if (requestedTarget && IsWindow(requestedTarget))
@@ -6442,9 +6413,29 @@ bool ConfigEditorWindow::nativeEvent(const QByteArray& eventType,
         {
             presentationTargetHandle_ = reinterpret_cast<quintptr>(requestedTarget);
             presentationTargetProcessId_ = requestedProcessId;
-			// The presentation target is placement metadata only. Re-parenting or
-			// reasserting z-order here disrupts a combo popup that the operator may
-			// be using while VP rebuilds its renderer.
+			if (isVisible() && scopedTopmostEligible_)
+			{
+				pendingTopmostReassert_ = true;
+				QTimer::singleShot(0, this, [this] { applyScopedTopmost(); });
+			}
+			// The target is placement metadata only: Config remains an independent
+			// native top-level window and never acquires the fullscreen HWND as an
+			// owner. v2 acknowledges receiver acceptance asynchronously; VP treats
+			// a queued PostMessage as pending, never as accepted.
+			const HWND editor = reinterpret_cast<HWND>(effectiveWinId());
+			if (requestedSequence != 0 && presentationTargetAcknowledgementMessageV2 &&
+				presentationTargetAcknowledgementHandle_ && editor &&
+				IsWindow(editor) &&
+				presentationTargetAcknowledgementProcessId_ == requestedProcessId &&
+				IsWindow(reinterpret_cast<HWND>(
+					presentationTargetAcknowledgementHandle_)))
+			{
+				PostMessageW(reinterpret_cast<HWND>(
+					presentationTargetAcknowledgementHandle_),
+					presentationTargetAcknowledgementMessageV2,
+					static_cast<WPARAM>(requestedSequence),
+					reinterpret_cast<LPARAM>(editor));
+			}
         }
         if (result) *result = accepted ? 1 : 0;
         return true;
@@ -6511,7 +6502,20 @@ bool ConfigEditorWindow::nativeEvent(const QByteArray& eventType,
 
 bool ConfigEditorWindow::event(QEvent* event)
 {
+    bool returnAfterMinimize = false;
+    if (event->type() == QEvent::WindowStateChange)
+    {
+        const auto* stateChange = static_cast<QWindowStateChangeEvent*>(event);
+        const HWND editor = reinterpret_cast<HWND>(effectiveWinId());
+        returnAfterMinimize = !(stateChange->oldState() & Qt::WindowMinimized) &&
+            editor && GetForegroundWindow() == editor &&
+            savedForegroundOnlyEnabled();
+        if (returnAfterMinimize && ownerProcessId_ != 0)
+            AllowSetForegroundWindow(ownerProcessId_);
+    }
     const bool handled = QMainWindow::event(event);
+    if (returnAfterMinimize && isMinimized())
+        returnFocusToPresentationTarget("config-minimize");
     if (event->type() == QEvent::WinIdChange)
     {
         if (scopedTopmost_)

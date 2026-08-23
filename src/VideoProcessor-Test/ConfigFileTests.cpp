@@ -11,6 +11,7 @@
 #include <EventActionLauncher.h>
 #include <MainConfigSchema.h>
 #include <QueueConfiguration.h>
+#include <QueueProfileRestartPolicy.h>
 #include <blackmagic_decklink/BlackMagicDeckLinkTranslate.h>
 #include <guid.h>
 #include <microsoft_directshow/DirectShowTranslations.h>
@@ -19,7 +20,6 @@
 #include <RendererConfigView.h>
 #include <RendererProfileConfig.h>
 #include <ShaderConfigValidation.h>
-#include <ShaderPreparationPolicy.h>
 #include <UnifiedProfileRuntime.h>
 #include <VideoConversionOverride.h>
 #include "CppUnitTest.h"
@@ -249,11 +249,23 @@ namespace VideoProcessorTest
 		TEST_METHOD(ModernBackgroundAndConfigurationModalPoliciesAreFailSafe)
 		{
 			Assert::IsTrue(
-				ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(true, false));
+				ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(true, false, false));
 			Assert::IsFalse(
-				ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(false, false));
+				ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(false, false, false));
 			Assert::IsFalse(
-				ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(true, true));
+				ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(true, true, false));
+			Assert::IsFalse(
+				ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(true, false, true));
+			Assert::IsTrue(ConfigurationLiveApply::ShouldRequestPresentationFocus(
+				true, false, true));
+			Assert::IsFalse(ConfigurationLiveApply::ShouldRequestPresentationFocus(
+				false, false, true));
+			Assert::IsFalse(ConfigurationLiveApply::ShouldRequestPresentationFocus(
+				true, true, true));
+			Assert::IsTrue(ConfigurationLiveApply::ShouldReturnPresentationFocus(
+				true, true, true));
+			Assert::IsFalse(ConfigurationLiveApply::ShouldReturnPresentationFocus(
+				false, true, true));
 			Assert::IsTrue(
 				ConfigurationLiveApply::ShouldSuppressFullscreenTopmost(false, true, false));
 			Assert::IsTrue(
@@ -1686,6 +1698,114 @@ namespace VideoProcessorTest
 			DeleteFileA(path.c_str());
 		}
 
+		TEST_METHOD(UnifiedQueueProfileRestartPolicyUsesCommittedLatestQueueSelection)
+		{
+			char temporaryDirectory[MAX_PATH] = {};
+			Assert::IsTrue(GetTempPathA(
+				ARRAYSIZE(temporaryDirectory), temporaryDirectory) > 0);
+			const std::string path = std::string(temporaryDirectory) +
+				"VideoProcessor-queue-profile-restart.cfg";
+			{
+				std::ofstream file(path, std::ios::out | std::ios::trunc);
+				file << "[queue]\n"
+					"when: $key==\"F1\"\n"
+					"queue_size: 32\n"
+					"[queue.low_latency]\n"
+					"when: $key==\"F2\"\n"
+					"queue_size: 4\n"
+					"[vprenderer.viewport]\n"
+					"screen_aspect: 16:9\n"
+					"[vprenderer.viewport.scope]\n"
+					"when: $key==\"F3\"\n"
+					"screen_aspect: 2.35:1\n";
+			}
+
+			ConfigFile config;
+			Assert::IsTrue(config.Load(path));
+			std::string error;
+			UnifiedProfileRuntime::Runtime runtime;
+			Assert::IsTrue(runtime.Initialize(config,
+				[](const std::string&, std::string&) { return false; }, error),
+				std::wstring(error.begin(), error.end()).c_str());
+
+			const auto initial = runtime.GetSnapshot();
+			UnifiedProfileRuntime::SelectionResult queueSelection;
+			Assert::IsTrue(runtime.SelectKey("F2",
+				[](const std::string&, std::string&) { return false; },
+				queueSelection, error));
+			Assert::IsTrue(queueSelection.changed);
+			Assert::IsTrue(runtime.GetSnapshot() == queueSelection.snapshot);
+			Assert::IsTrue(QueueProfileRestartPolicy::
+				RequiresRestartAfterManualSelection(queueSelection.changed,
+					initial->queue.profile, queueSelection.snapshot->queue.profile));
+
+			QueueProfileRestartPolicy::PendingRequest pending;
+			Assert::IsTrue(QueueProfileRestartPolicy::EnqueueResult::Queued ==
+				QueueProfileRestartPolicy::Enqueue(pending,
+					queueSelection.snapshot->generation,
+					queueSelection.snapshot->queue.profile, "shortcut:F2"));
+
+			const auto beforeReselect = runtime.GetSnapshot();
+			UnifiedProfileRuntime::SelectionResult reselect;
+			Assert::IsTrue(runtime.SelectKey("F2",
+				[](const std::string&, std::string&) { return false; }, reselect,
+				error));
+			Assert::IsFalse(reselect.changed);
+			Assert::IsFalse(QueueProfileRestartPolicy::
+				RequiresRestartAfterManualSelection(reselect.changed,
+					beforeReselect->queue.profile, reselect.snapshot->queue.profile));
+
+			const auto beforeViewportSelection = runtime.GetSnapshot();
+			UnifiedProfileRuntime::SelectionResult viewportSelection;
+			Assert::IsTrue(runtime.SelectKey("F3",
+				[](const std::string&, std::string&) { return false; },
+				viewportSelection, error));
+			Assert::IsTrue(viewportSelection.changed);
+			Assert::IsFalse(QueueProfileRestartPolicy::
+				RequiresRestartAfterManualSelection(viewportSelection.changed,
+					beforeViewportSelection->queue.profile,
+					viewportSelection.snapshot->queue.profile));
+			Assert::IsFalse(QueueProfileRestartPolicy::
+				RequiresRestartAfterManualSelection(false, "low_latency", "base"));
+
+			const auto beforeFirstRapidSelection = runtime.GetSnapshot();
+			UnifiedProfileRuntime::SelectionResult firstRapidSelection;
+			Assert::IsTrue(runtime.SelectKey("F1",
+				[](const std::string&, std::string&) { return false; },
+				firstRapidSelection, error));
+			Assert::IsTrue(QueueProfileRestartPolicy::
+				RequiresRestartAfterManualSelection(firstRapidSelection.changed,
+					beforeFirstRapidSelection->queue.profile,
+					firstRapidSelection.snapshot->queue.profile));
+			Assert::IsTrue(QueueProfileRestartPolicy::EnqueueResult::Coalesced ==
+				QueueProfileRestartPolicy::Enqueue(pending,
+					firstRapidSelection.snapshot->generation,
+					firstRapidSelection.snapshot->queue.profile, "shortcut:F1"));
+
+			const auto beforeFinalRapidSelection = runtime.GetSnapshot();
+			UnifiedProfileRuntime::SelectionResult finalRapidSelection;
+			Assert::IsTrue(runtime.SelectKey("F2",
+				[](const std::string&, std::string&) { return false; },
+				finalRapidSelection, error));
+			Assert::IsTrue(QueueProfileRestartPolicy::
+				RequiresRestartAfterManualSelection(finalRapidSelection.changed,
+					beforeFinalRapidSelection->queue.profile,
+					finalRapidSelection.snapshot->queue.profile));
+			Assert::IsTrue(QueueProfileRestartPolicy::EnqueueResult::Coalesced ==
+				QueueProfileRestartPolicy::Enqueue(pending,
+					finalRapidSelection.snapshot->generation,
+					finalRapidSelection.snapshot->queue.profile, "shortcut:F2"));
+
+			QueueProfileRestartPolicy::PendingRequest finalRequest;
+			Assert::IsTrue(QueueProfileRestartPolicy::Consume(pending,
+				finalRequest));
+			Assert::AreEqual(finalRapidSelection.snapshot->queue.profile.c_str(),
+				finalRequest.profile.c_str());
+			Assert::IsFalse(QueueProfileRestartPolicy::Consume(pending,
+				finalRequest));
+			DeleteFileA(path.c_str());
+		}
+
 		TEST_METHOD(UnifiedProfileRuntimeReloadsEditedViewportAndKeepsSelection)
 		{
 			char temporaryDirectory[MAX_PATH] = {};
@@ -2305,13 +2425,13 @@ namespace VideoProcessorTest
 			DeleteFileA(path.c_str());
 		}
 
-		TEST_METHOD(ShaderPreparationUsesExactParsedRenderingProfileNames)
+		TEST_METHOD(RenderingProfilesUseExactParsedNames)
 		{
 			char temporaryDirectory[MAX_PATH] = {};
 			Assert::IsTrue(GetTempPathA(
 				ARRAYSIZE(temporaryDirectory), temporaryDirectory) > 0);
 			const std::string path = std::string(temporaryDirectory) +
-				"VideoProcessor-shader-preparation-profiles.cfg";
+				"VideoProcessor-rendering-profile-names.cfg";
 			{
 				std::ofstream file(path, std::ios::out | std::ios::trunc);
 				file << "[general]\nrenderer: VideoProcessor Renderer (Alpha)\n"
@@ -2331,7 +2451,7 @@ namespace VideoProcessorTest
 				std::wstring(error.begin(), error.end()).c_str());
 			Assert::AreEqual(static_cast<size_t>(2), profiles.size());
 			// ConfigFile defines profile identifiers as normalized, case-insensitive
-			// names. The worker must use the model's identifiers verbatim instead
+			// names. Consumers must use the model's identifiers verbatim instead
 			// of deriving a second list from section text.
 			Assert::AreEqual("rec709_scope_med", profiles[0].c_str());
 			Assert::AreEqual("bt2020_scope_high", profiles[1].c_str());
@@ -2342,74 +2462,6 @@ namespace VideoProcessorTest
 			Assert::IsTrue(model.profiles.find("display." + profiles[1]) !=
 				model.profiles.end());
 			DeleteFileA(path.c_str());
-		}
-
-		TEST_METHOD(ShaderPreparationSkipsDeletionAndProfileMetadata)
-		{
-			using ShaderPreparationPolicy::Snapshot;
-			const Snapshot original = {
-				{ "vprenderer.Rec709", {
-					{ "quality", "high" }, { "shortcut", "F5" } } },
-				{ "vprenderer.ToDelete", { { "quality", "balanced" } } },
-				{ "vprenderer.viewport.scope", {
-					{ "screen_aspect", "2.35:1" } } },
-				{ "vprenderer.output.Default", {
-					{ "presentation_preference", "auto" } } },
-				{ "shader.Example", { { "file", "example.glsl" } } }
-			};
-
-			Snapshot deleted = original;
-			deleted.erase("vprenderer.ToDelete");
-			deleted.erase("shader.Example");
-			Assert::IsFalse(ShaderPreparationPolicy::ShouldPrepare(
-				original, deleted));
-
-			Snapshot metadata = original;
-			metadata["vprenderer.Rec709"]["shortcut"] = "F6";
-			metadata["vprenderer.Rec709"]["when"] = "$eotf == SDR";
-			Assert::IsFalse(ShaderPreparationPolicy::ShouldPrepare(
-				original, metadata));
-
-			Snapshot renamed = original;
-			renamed["vprenderer.Renamed"] = renamed["vprenderer.Rec709"];
-			renamed.erase("vprenderer.Rec709");
-			Assert::IsFalse(ShaderPreparationPolicy::ShouldPrepare(
-				original, renamed));
-
-			Snapshot emptyProfile = original;
-			emptyProfile["vprenderer.New"] = {};
-			Assert::IsFalse(ShaderPreparationPolicy::ShouldPrepare(
-				original, emptyProfile));
-		}
-
-		TEST_METHOD(ShaderPreparationRunsForNewGpuProcessingState)
-		{
-			using ShaderPreparationPolicy::Snapshot;
-			const Snapshot original = {
-				{ "vprenderer.Rec709", { { "quality", "high" } } },
-				{ "vprenderer.viewport.scope", {
-					{ "screen_aspect", "2.35:1" } } }
-			};
-
-			Snapshot changed = original;
-			changed["vprenderer.Rec709"]["sdr_target_nits"] = "120";
-			Assert::IsTrue(ShaderPreparationPolicy::ShouldPrepare(
-				original, changed));
-
-			Snapshot added = original;
-			added["vprenderer.BT2020"] = { { "quality", "balanced" } };
-			Assert::IsTrue(ShaderPreparationPolicy::ShouldPrepare(
-				original, added));
-
-			Snapshot shader = original;
-			shader["shader.NLS"] = { { "file", "nls.glsl" } };
-			Assert::IsTrue(ShaderPreparationPolicy::ShouldPrepare(
-				original, shader));
-
-			Snapshot unrelated = original;
-			unrelated["vprenderer.viewport.scope"]["screen_aspect"] = "2.40:1";
-			Assert::IsFalse(ShaderPreparationPolicy::ShouldPrepare(
-				original, unrelated));
 		}
 
 		TEST_METHOD(Vp0097ShortcutKeyCombinesWithOptionalProfileRule)
@@ -2970,38 +3022,6 @@ namespace VideoProcessorTest
 			DeleteFileA(path.c_str());
 		}
 
-		TEST_METHOD(TargetNlsPrewarmEnumeratesAlphaGlslVariants)
-		{
-			char temporaryDirectory[MAX_PATH] = {};
-			Assert::IsTrue(GetTempPathA(
-				ARRAYSIZE(temporaryDirectory), temporaryDirectory) > 0);
-			const std::string path = std::string(temporaryDirectory) +
-				"VideoProcessor-target-nls-prewarm.cfg";
-			{
-				std::ofstream file(path, std::ios::out | std::ios::trunc);
-				file << "[shader.nls]\nshortcut: n\n"
-					"[shader.nls.first]\nshader_type: nls\n"
-					"glsl_file: First.glsl\nhlsl_file: First.hlsl\n"
-					"[shader.nls.second]\nshader_type: nls\n"
-					"glsl_file: Second.glsl\n"
-					"[shader.standard.other]\nshader_type: custom\n"
-					"glsl_file: Other.glsl\n";
-			}
-
-			ConfigFile config;
-			Assert::IsTrue(config.Load(path));
-			std::vector<ConfiguredShaderRule> rules;
-			std::string reason;
-			Assert::IsTrue(
-				MadVRShaderLoader::ResolveConfiguredNlsPrewarmRules(
-					config, rules, reason),
-				std::wstring(reason.begin(), reason.end()).c_str());
-			Assert::AreEqual(static_cast<size_t>(2), rules.size());
-			Assert::AreEqual("First.glsl", rules[0].filename.c_str());
-			Assert::AreEqual("Second.glsl", rules[1].filename.c_str());
-			DeleteFileA(path.c_str());
-		}
-
 		TEST_METHOD(Vp0089AndVp0131InvalidAdvancedNlsSettingsAreRejected)
 		{
 			char temporaryDirectory[MAX_PATH] = {};
@@ -3426,6 +3446,33 @@ namespace VideoProcessorTest
 			Assert::IsFalse(MainConfigSchema::Validate(config, error));
 			Assert::IsTrue(
 				error.find("lead_frames") != std::string::npos);
+			DeleteFileA(path.c_str());
+		}
+
+		TEST_METHOD(MainConfigSchemaValidatesForegroundOnlyShortcutPolicy)
+		{
+			char temporaryDirectory[MAX_PATH] = {};
+			Assert::IsTrue(GetTempPathA(
+				ARRAYSIZE(temporaryDirectory), temporaryDirectory) > 0);
+			const std::string path = std::string(temporaryDirectory) +
+				"VideoProcessor-shortcut-focus-schema.cfg";
+			ConfigFile config;
+			std::string error;
+
+			{
+				std::ofstream file(path, std::ios::out | std::ios::trunc);
+				file << "[shortcuts]\nforeground_only: true\n";
+			}
+			Assert::IsTrue(config.Load(path));
+			Assert::IsTrue(MainConfigSchema::Validate(config, error));
+
+			{
+				std::ofstream file(path, std::ios::out | std::ios::trunc);
+				file << "[shortcuts]\nforeground_only: sometimes\n";
+			}
+			Assert::IsTrue(config.Load(path));
+			Assert::IsFalse(MainConfigSchema::Validate(config, error));
+			Assert::IsTrue(error.find("foreground_only") != std::string::npos);
 			DeleteFileA(path.c_str());
 		}
 
