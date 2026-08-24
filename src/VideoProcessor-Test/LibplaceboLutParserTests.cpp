@@ -173,6 +173,39 @@ namespace
 		}
 	}
 
+	const pl_hook* ParseBundledAdaptiveSharpen(pl_gpu gpu,
+		double strength = 0.5)
+	{
+		std::string source = LoadBundledShader("Adaptive sharpen.glsl");
+		Assert::IsFalse(source.empty(),
+			L"Bundled Adaptive Sharpen shader was not found");
+		ReplaceShaderToken(source, "strength", std::to_string(strength));
+		Assert::IsTrue(source.find("{{") == std::string::npos,
+			L"Bundled Adaptive Sharpen still contains an unsubstituted token");
+		const pl_hook* hook = pl_mpv_user_shader_parse(
+			gpu, source.data(), source.size());
+		Assert::IsNotNull(hook,
+			L"libplacebo rejected bundled Adaptive Sharpen GLSL");
+		return hook;
+	}
+
+	const pl_hook* ParseDeterministicStandardOutputShader(pl_gpu gpu)
+	{
+		static const char source[] =
+			"//!HOOK OUTPUT\n"
+			"//!BIND HOOKED\n"
+			"//!DESC VP standard hook composition test\n"
+			"vec4 hook() {\n"
+			"    vec4 color = HOOKED_texOff(0);\n"
+			"    return vec4(color.r * 0.5, color.g, color.b, color.a);\n"
+			"}\n";
+		const pl_hook* hook = pl_mpv_user_shader_parse(
+			gpu, source, sizeof(source) - 1);
+		Assert::IsNotNull(hook,
+			L"libplacebo rejected deterministic standard OUTPUT test hook");
+		return hook;
+	}
+
 	const pl_hook* ParseBundledNlsShader(pl_gpu gpu, const char* fileName,
 		double axisBalance, double strength = 1.0)
 	{
@@ -315,7 +348,8 @@ namespace
 		}
 
 		std::vector<RgbaPixel> RenderCoordinateField(
-			const pl_hook* hook, int width = 64, int height = 64)
+			const std::vector<const pl_hook*>& hooks,
+			int width = 64, int height = 64)
 		{
 			pl_gpu gpu = m_d3d11->gpu;
 			const enum pl_fmt_caps requiredCaps = static_cast<enum pl_fmt_caps>(
@@ -355,10 +389,10 @@ namespace
 			pl_frame image = MakeRgbFrame(sourceTexture);
 			pl_frame target = MakeRgbFrame(targetTexture);
 			pl_render_params params = pl_render_fast_params;
-			if (hook)
+			if (!hooks.empty())
 			{
-				params.hooks = &hook;
-				params.num_hooks = 1;
+				params.hooks = hooks.data();
+				params.num_hooks = static_cast<int>(hooks.size());
 			}
 			Assert::IsTrue(pl_render_image(
 				m_renderer, &image, &target, &params));
@@ -372,6 +406,21 @@ namespace
 			pl_tex_destroy(gpu, &targetTexture);
 			pl_tex_destroy(gpu, &sourceTexture);
 			return result;
+		}
+
+		std::vector<RgbaPixel> RenderCoordinateField(
+			const pl_hook* hook, int width = 64, int height = 64)
+		{
+			std::vector<const pl_hook*> hooks;
+			if (hook)
+				hooks.push_back(hook);
+			return RenderCoordinateField(hooks, width, height);
+		}
+
+		bool HasHookErrors() const
+		{
+			return m_renderer &&
+				(pl_renderer_get_errors(m_renderer).errors & PL_RENDER_ERR_HOOKS) != 0;
 		}
 
 	private:
@@ -762,6 +811,77 @@ namespace VideoProcessorTest
 
 			Assert::IsTrue(calibrated.r < 15 && calibrated.g > 240 && calibrated.b < 15,
 				L"The compatible high-quality target LUT path did not produce green output");
+		}
+
+		TEST_METHOD(BundledAdaptiveSharpenGlSlRendersOnTheRealGpuPath)
+		{
+			TargetLutGpuFixture fixture;
+			Assert::IsTrue(fixture.Create(),
+				L"Could not create the libplacebo WARP test device");
+			const pl_hook* adaptive = ParseBundledAdaptiveSharpen(
+				fixture.Gpu(), 0.5);
+			const std::vector<RgbaPixel> pixels =
+				fixture.RenderCoordinateField(adaptive);
+			Assert::IsTrue(pixels.size() == static_cast<size_t>(64 * 64));
+			Assert::IsFalse(fixture.HasHookErrors(),
+				L"Bundled Adaptive Sharpen raised a libplacebo hook error");
+			pl_mpv_user_shader_destroy(&adaptive);
+		}
+
+		TEST_METHOD(StandardGlSlAndNlsHooksComposeOnTheRealGpuPath)
+		{
+			TargetLutGpuFixture fixture;
+			Assert::IsTrue(fixture.Create(),
+				L"Could not create the libplacebo WARP test device");
+			const std::vector<RgbaPixel> baseline =
+				fixture.RenderCoordinateField(nullptr);
+
+			const pl_hook* standard =
+				ParseDeterministicStandardOutputShader(fixture.Gpu());
+			const pl_hook* nls = ParseBundledNlsShader(
+				fixture.Gpu(), "NLS.glsl", 0.0, 1.0);
+			BindNlsShader(nls, 1.32f, 0.0f);
+
+			const std::vector<RgbaPixel> standardOnly =
+				fixture.RenderCoordinateField(
+					std::vector<const pl_hook*>{ standard });
+			const std::vector<RgbaPixel> nlsOnly =
+				fixture.RenderCoordinateField(
+					std::vector<const pl_hook*>{ nls });
+			const std::vector<RgbaPixel> combined =
+				fixture.RenderCoordinateField(
+					std::vector<const pl_hook*>{ standard, nls });
+
+			size_t standardEvidence = 0;
+			size_t nlsEvidence = 0;
+			size_t composedEvidence = 0;
+			for (size_t index = 0; index < baseline.size(); ++index)
+			{
+				const int baseRed = static_cast<int>(baseline[index].r);
+				const int standardRed = static_cast<int>(standardOnly[index].r);
+				const int nlsRed = static_cast<int>(nlsOnly[index].r);
+				const int combinedRed = static_cast<int>(combined[index].r);
+				if (baseRed >= 16 &&
+					std::abs(standardRed * 2 - baseRed) <= 4)
+					++standardEvidence;
+				if (std::abs(nlsRed - baseRed) >= 8)
+					++nlsEvidence;
+				if (nlsRed >= 16 &&
+					std::abs(combinedRed * 2 - nlsRed) <= 4)
+					++composedEvidence;
+			}
+
+			Assert::IsTrue(standardEvidence > 3000,
+				L"The deterministic standard OUTPUT hook did not affect the GPU output");
+			Assert::IsTrue(nlsEvidence > 100,
+				L"The NLS hook did not retain measurable coordinate-warp evidence");
+			Assert::IsTrue(composedEvidence > 3000,
+				L"The standard OUTPUT hook and NLS hook did not compose in one hook array");
+			Assert::IsFalse(fixture.HasHookErrors(),
+				L"The composed standard+NLS chain raised a libplacebo hook error");
+
+			pl_mpv_user_shader_destroy(&standard);
+			pl_mpv_user_shader_destroy(&nls);
 		}
 
 		TEST_METHOD(BundledNlsGlSlHooksMovePixelsOnTheRealGpuPath)

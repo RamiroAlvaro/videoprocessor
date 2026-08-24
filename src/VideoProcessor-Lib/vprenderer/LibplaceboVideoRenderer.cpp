@@ -6384,6 +6384,9 @@ struct LibplaceboVideoRenderer::Impl
 
 	void BindActiveHooks(bool nlsActive)
 	{
+		// pl_render_params borrows this pointer array during pl_render_image.
+		// Keep the backing storage as renderer-owned state so neither standard
+		// hooks nor the optional NLS hook can outlive the array that exposes them.
 		activeRenderHooks.clear();
 		activeRenderHooks.insert(activeRenderHooks.end(),
 			standardHooks.begin(), standardHooks.end());
@@ -6453,10 +6456,10 @@ struct LibplaceboVideoRenderer::Impl
 			standardHooks.push_back(hook);
 			resolvedPaths.push_back(resolvedPath);
 			DebugLog::Log(
-				"Alpha shaders: loaded custom GLSL \"%s\" stage=%s order=%u",
+				"Alpha shaders: loaded custom GLSL \"%s\" logical_stage=%s order=%u hook_stages=0x%X",
 				rule.filename.c_str(),
 				rule.postResize ? "post_resize" : "pre_resize",
-				ordered.order);
+				ordered.order, static_cast<unsigned int>(hook->stages));
 		}
 		{
 			std::lock_guard<std::mutex> guard(shaderStatusMutex);
@@ -10372,7 +10375,6 @@ std::vector<CString> LibplaceboVideoRenderer::ActiveShaders() const
 	}
 	return shaders;
 }
-
 
 
 bool LibplaceboVideoRenderer::GetActiveShaderSections(
