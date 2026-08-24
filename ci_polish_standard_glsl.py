@@ -30,11 +30,9 @@ def replace_article(text, article_id, replacement):
     return text
 
 
-# ---------------------------------------------------------------------------
-# Documentation: DirectShow stage is physical; libplacebo //!HOOK is physical.
-# Keep stage/order as the cross-backend logical ordering contract without
-# pretending VP Renderer rewrites an mpv user shader's hook point.
-# ---------------------------------------------------------------------------
+# Documentation: stage/order are physical for HLSL and logical ordering metadata
+# for VP Renderer GLSL. The mpv user shader's //!HOOK directive remains the
+# authority for the actual libplacebo execution point.
 path = "CONFIGURATION.html"
 text = read(path)
 text = replace_article(
@@ -50,10 +48,7 @@ text = replace_article(
 write(path, text)
 
 
-# ---------------------------------------------------------------------------
 # Checked-in example: make the backend-specific strength behavior explicit.
-# Adaptive Sharpen stays opt-in; no automatic source rule is introduced.
-# ---------------------------------------------------------------------------
 path = "VideoProcessor.cfg"
 text = read(path)
 text = replace_once(
@@ -68,9 +63,7 @@ text = replace_once(
 write(path, text)
 
 
-# ---------------------------------------------------------------------------
-# Bundled Adaptive Sharpen: preserve upstream BSD license and clean formatting.
-# ---------------------------------------------------------------------------
+# Preserve upstream BSD text, record provenance, and remove trailing whitespace.
 path = "shaders/Adaptive sharpen.glsl"
 text = read(path)
 text = "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
@@ -87,10 +80,7 @@ if "gist.github.com/igv/8a77e4eb8276753b54bb94c1c50c317e" not in text:
 write(path, text)
 
 
-# ---------------------------------------------------------------------------
-# Renderer diagnostics/lifetime comments: make the borrowed pointer lifetime
-# and logical-vs-physical stage distinction explicit in code and logs.
-# ---------------------------------------------------------------------------
+# Make hook-array lifetime and logical/physical stage diagnostics explicit.
 path = "src/VideoProcessor-Lib/vprenderer/LibplaceboVideoRenderer.cpp"
 text = read(path)
 text = replace_once(
@@ -124,16 +114,16 @@ text = text.replace(
 write(path, text)
 
 
-# ---------------------------------------------------------------------------
-# GPU tests: prove the bundled Adaptive Sharpen compiles/runs through the real
-# D3D11 WARP/libplacebo path, and prove an ordinary OUTPUT hook composes with
-# the existing NLS hook in one pl_render_params hook array.
-# ---------------------------------------------------------------------------
+# GPU tests: exercise the shipped Adaptive Sharpen file and a real two-hook
+# standard+NLS chain through D3D11 WARP and libplacebo.
 path = "src/VideoProcessor-Test/LibplaceboLutParserTests.cpp"
 text = read(path)
 
-parse_anchor = """\tconst pl_hook* ParseBundledNlsShader(pl_gpu gpu, const char* fileName,\n\t\tdouble axisBalance, double strength = 1.0)\n\t{\n"""
-helpers = r'''\tconst pl_hook* ParseBundledAdaptiveSharpen(pl_gpu gpu,
+parse_anchor = """\tconst pl_hook* ParseBundledNlsShader(pl_gpu gpu, const char* fileName,
+\t\tdouble axisBalance, double strength = 1.0)
+\t{
+"""
+helpers = """\tconst pl_hook* ParseBundledAdaptiveSharpen(pl_gpu gpu,
 \t\tdouble strength = 0.5)
 \t{
 \t\tstd::string source = LoadBundledShader("Adaptive sharpen.glsl");
@@ -166,13 +156,9 @@ helpers = r'''\tconst pl_hook* ParseBundledAdaptiveSharpen(pl_gpu gpu,
 \t\treturn hook;
 \t}
 
-'''
-text = replace_once(
-    text,
-    parse_anchor,
-    helpers + parse_anchor,
-    "GPU shader parser helpers",
-)
+"""
+text = replace_once(text, parse_anchor, helpers + parse_anchor,
+    "GPU shader parser helpers")
 
 text = replace_once(
     text,
@@ -197,17 +183,38 @@ text = replace_once(
     "\t\t\t}",
     "multi-hook render parameters",
 )
-fixture_tail = """\t\t\tpl_tex_destroy(gpu, &sourceTexture);\n\t\t\treturn result;\n\t\t}\n\n\tprivate:\n"""
-fixture_additions = """\t\t\tpl_tex_destroy(gpu, &sourceTexture);\n\t\t\treturn result;\n\t\t}\n\n\t\tstd::vector<RgbaPixel> RenderCoordinateField(\n\t\t\tconst pl_hook* hook, int width = 64, int height = 64)\n\t\t{\n\t\t\tstd::vector<const pl_hook*> hooks;\n\t\t\tif (hook)\n\t\t\t\thooks.push_back(hook);\n\t\t\treturn RenderCoordinateField(hooks, width, height);\n\t\t}\n\n\t\tbool HasHookErrors() const\n\t\t{\n\t\t\treturn m_renderer &&\n\t\t\t\t(pl_renderer_get_errors(m_renderer).errors & PL_RENDER_ERR_HOOKS) != 0;\n\t\t}\n\n\tprivate:\n"""
-text = replace_once(
-    text,
-    fixture_tail,
-    fixture_additions,
-    "GPU fixture single-hook compatibility overload",
-)
+fixture_tail = """\t\t\tpl_tex_destroy(gpu, &sourceTexture);
+\t\t\treturn result;
+\t\t}
+
+\tprivate:
+"""
+fixture_additions = """\t\t\tpl_tex_destroy(gpu, &sourceTexture);
+\t\t\treturn result;
+\t\t}
+
+\t\tstd::vector<RgbaPixel> RenderCoordinateField(
+\t\t\tconst pl_hook* hook, int width = 64, int height = 64)
+\t\t{
+\t\t\tstd::vector<const pl_hook*> hooks;
+\t\t\tif (hook)
+\t\t\t\thooks.push_back(hook);
+\t\t\treturn RenderCoordinateField(hooks, width, height);
+\t\t}
+
+\t\tbool HasHookErrors() const
+\t\t{
+\t\t\treturn m_renderer &&
+\t\t\t\t(pl_renderer_get_errors(m_renderer).errors & PL_RENDER_ERR_HOOKS) != 0;
+\t\t}
+
+\tprivate:
+"""
+text = replace_once(text, fixture_tail, fixture_additions,
+    "GPU fixture single-hook compatibility overload")
 
 nls_test_anchor = "\t\tTEST_METHOD(BundledNlsGlSlHooksMovePixelsOnTheRealGpuPath)\n"
-new_tests = r'''\t\tTEST_METHOD(BundledAdaptiveSharpenGlSlRendersOnTheRealGpuPath)
+new_tests = """\t\tTEST_METHOD(BundledAdaptiveSharpenGlSlRendersOnTheRealGpuPath)
 \t\t{
 \t\t\tTargetLutGpuFixture fixture;
 \t\t\tAssert::IsTrue(fixture.Create(),
@@ -216,7 +223,7 @@ new_tests = r'''\t\tTEST_METHOD(BundledAdaptiveSharpenGlSlRendersOnTheRealGpuPat
 \t\t\t\tfixture.Gpu(), 0.5);
 \t\t\tconst std::vector<RgbaPixel> pixels =
 \t\t\t\tfixture.RenderCoordinateField(adaptive);
-\t\t\tAssert::AreEqual(static_cast<size_t>(64 * 64), pixels.size());
+\t\t\tAssert::IsTrue(pixels.size() == static_cast<size_t>(64 * 64));
 \t\t\tAssert::IsFalse(fixture.HasHookErrors(),
 \t\t\t\tL"Bundled Adaptive Sharpen raised a libplacebo hook error");
 \t\t\tpl_mpv_user_shader_destroy(&adaptive);
@@ -278,13 +285,9 @@ new_tests = r'''\t\tTEST_METHOD(BundledAdaptiveSharpenGlSlRendersOnTheRealGpuPat
 \t\t\tpl_mpv_user_shader_destroy(&nls);
 \t\t}
 
-'''
-text = replace_once(
-    text,
-    nls_test_anchor,
-    new_tests + nls_test_anchor,
-    "standard plus NLS GPU tests",
-)
+"""
+text = replace_once(text, nls_test_anchor, new_tests + nls_test_anchor,
+    "standard plus NLS GPU tests")
 write(path, text)
 
 print("Standard GLSL polish patch applied successfully")
