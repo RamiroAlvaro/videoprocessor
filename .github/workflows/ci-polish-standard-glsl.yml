@@ -102,6 +102,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          # MIDL regenerates this header while building and stamps the current
+          # timezone into a comment. Restore the feature-base copy after build
+          # so generated noise can never leak into this focused PR.
+          git checkout origin/feature/vprenderer-standard-glsl -- .\3rdparty\blackmagic_decklink\DeckLinkAPI_h.h
+
           $manifest = Get-Content .\packaging\release-manifest.json -Raw | ConvertFrom-Json
           $shaderFiles = @($manifest.files | Where-Object { $_.destination -like "shaders/*" })
           if ($shaderFiles.Count -ne 8) { throw "Expected 8 packaged shaders, found $($shaderFiles.Count)" }
