@@ -4,6 +4,7 @@ import sys
 
 path = Path("ci_apply_standard_glsl.py")
 text = path.read_text(encoding="utf-8")
+
 old = '''clear_pair = "\\t\\trenderParams.hooks = nullptr;\\n\\t\\trenderParams.num_hooks = 0;"
 clear_count = text.count(clear_pair)
 if clear_count != 7:
@@ -26,5 +27,30 @@ text = clear_pattern.sub(
 '''
 if text.count(old) != 1:
     raise RuntimeError("could not locate the original hook-clear patch block")
-path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+text = text.replace(old, new, 1)
+
+old_url = 'shader_url = "https://gist.githubusercontent.com/igv/8a77e4eb8276753b54bb94c1c50c317e/raw/adaptive-sharpen.glsl"'
+new_url = 'shader_url = "https://gist.githubusercontent.com/igv/8a77e4eb8276753b54bb94c1c50c317e/raw/572f59099cd0e3eb5e321a6da0a3d90a7382e2dc/adaptive-sharpen.glsl"'
+if text.count(old_url) != 1:
+    raise RuntimeError("could not locate Adaptive Sharpen source URL")
+text = text.replace(old_url, new_url, 1)
+
+old_strength = '''if "#define curve_height 1.0" not in shader:
+    raise RuntimeError("Adaptive Sharpen curve_height baseline not found")
+shader = shader.replace("#define curve_height 1.0", "#define curve_height {{strength}}", 1)
+'''
+new_strength = '''shader, strength_count = re.subn(
+    r"(?m)^(#define\\s+curve_height\\s+)1\\.0(\\b.*)$",
+    r"\\g<1>{{strength}}\\2",
+    shader,
+    count=1,
+)
+if strength_count != 1:
+    raise RuntimeError("Adaptive Sharpen curve_height baseline not found")
+'''
+if text.count(old_strength) != 1:
+    raise RuntimeError("could not locate Adaptive Sharpen strength patch block")
+text = text.replace(old_strength, new_strength, 1)
+
+path.write_text(text, encoding="utf-8", newline="\n")
 subprocess.run([sys.executable, str(path)], check=True)
