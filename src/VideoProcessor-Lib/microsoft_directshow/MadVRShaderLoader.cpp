@@ -1427,6 +1427,10 @@ ShaderRule LoadTargetRule(const ConfigFile& config, const std::string& name,
 		}
 		LoadTypedNlsSettings(config, section, rule);
 	}
+	else
+	{
+		LoadShaderParameters(config, section, rule);
+	}
 	std::string stage = "pre_resize";
 	config.TryGetString(section, "stage", stage);
 	stage = ConfigFile::NormalizeName(stage);
@@ -1610,6 +1614,16 @@ ConfiguredShaderRule ToConfiguredShaderRule(const ShaderRule& rule)
 	configured.parameters = rule.parameters;
 	configured.nls = rule.nls;
 	configured.none = rule.none;
+	if (!rule.postScale.empty())
+	{
+		configured.postResize = true;
+		configured.order = rule.postScale.front().order;
+	}
+	else if (!rule.preScale.empty())
+	{
+		configured.postResize = false;
+		configured.order = rule.preScale.front().order;
+	}
 	configured.aspectTolerancePercent =
 		std::max(0.0, rule.aspectTolerancePercent);
 	configured.maximumStretchRatio = rule.maximumStretchRatio;

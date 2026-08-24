@@ -191,11 +191,19 @@ new_create = r'''	bool CreateUserHook(const ConfiguredShaderRule& rule,
 text = text[:create_start] + new_create + text[create_end:]
 
 # Existing NLS/reset sites must leave selected standard hooks attached.
-clear_pair = "\t\trenderParams.hooks = nullptr;\n\t\trenderParams.num_hooks = 0;"
-clear_count = text.count(clear_pair)
-if clear_count != 7:
-    raise RuntimeError(f"per-frame hook clear sites: expected 7 after selection rewrite, found {clear_count}")
-text = text.replace(clear_pair, "\t\tBindActiveHooks(false);")
+clear_pattern = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)renderParams\.hooks = nullptr;\n"
+    r"(?P=indent)renderParams\.num_hooks = 0;"
+)
+clear_matches = list(clear_pattern.finditer(text))
+if len(clear_matches) < 5:
+    raise RuntimeError(
+        f"per-frame hook clear sites: expected at least 5, found {len(clear_matches)}"
+    )
+text = clear_pattern.sub(
+    lambda match: f"{match.group('indent')}BindActiveHooks(false);",
+    text,
+)
 
 text = replace_once(
     text,
@@ -378,16 +386,21 @@ write(path, text)
 # ---------------------------------------------------------------------------
 # Bundle one conservative, opt-in mpv/libplacebo user shader example.
 # ---------------------------------------------------------------------------
-shader_url = "https://gist.githubusercontent.com/igv/8a77e4eb8276753b54bb94c1c50c317e/raw/adaptive-sharpen.glsl"
+shader_url = "https://gist.githubusercontent.com/igv/8a77e4eb8276753b54bb94c1c50c317e/raw/572f59099cd0e3eb5e321a6da0a3d90a7382e2dc/adaptive-sharpen.glsl"
 with urllib.request.urlopen(shader_url, timeout=30) as response:
     shader = response.read().decode("utf-8")
 if "Copyright (c) 2015-2021, bacondither" not in shader:
     raise RuntimeError("Adaptive Sharpen license/copyright header not found")
 if "//!HOOK OUTPUT" not in shader:
     raise RuntimeError("Adaptive Sharpen OUTPUT hook not found")
-if "#define curve_height 1.0" not in shader:
+shader, strength_count = re.subn(
+    r"(?m)^(#define\s+curve_height\s+)1\.0(\b.*)$",
+    r"\g<1>{{strength}}\2",
+    shader,
+    count=1,
+)
+if strength_count != 1:
     raise RuntimeError("Adaptive Sharpen curve_height baseline not found")
-shader = shader.replace("#define curve_height 1.0", "#define curve_height {{strength}}", 1)
 write("shaders/Adaptive sharpen.glsl", shader)
 
 path = "VideoProcessor.cfg"
@@ -402,8 +415,8 @@ write(path, text)
 
 path = "packaging/release-manifest.json"
 text = read(path)
-needle = '    { "sourceRoot": "repository", "source": "shaders/Adaptive sharpen.hlsl", "destination": "shaders/Adaptive sharpen.hlsl", "owner": "bacondither", "sourceVersion": "Adaptive Sharpen 2021-10-17", "consumer": "madVR", "loadMechanism": "IMadVRExternalPixelShaders", "reason": "Bundled legacy configurable shader." },'
-replacement = needle + '\n    { "sourceRoot": "repository", "source": "shaders/Adaptive sharpen.glsl", "destination": "shaders/Adaptive sharpen.glsl", "owner": "bacondither", "sourceVersion": "Adaptive Sharpen 2021-10-17", "consumer": "VideoProcessorVPRenderer.dll", "loadMechanism": "Executable-relative mpv/libplacebo user-shader lookup", "reason": "Bundled optional Adaptive Sharpen implementation for VP Renderer." },'
+needle = '    { "sourceRoot": "repository", "source": "shaders/Adaptive sharpen.hlsl", "destination": "shaders/Adaptive sharpen.hlsl", "owner": "VideoProcessor shaders", "sourceVersion": "Current source commit", "consumer": "madVR", "loadMechanism": "Executable-relative shader lookup", "reason": "Built-in configurable HLSL shader." },'
+replacement = needle + '\n    { "sourceRoot": "repository", "source": "shaders/Adaptive sharpen.glsl", "destination": "shaders/Adaptive sharpen.glsl", "owner": "VideoProcessor shaders / bacondither", "sourceVersion": "Adaptive Sharpen 2021-10-17", "consumer": "VideoProcessorVPRenderer.dll", "loadMechanism": "Executable-relative mpv/libplacebo user-shader lookup", "reason": "Bundled optional Adaptive Sharpen implementation for VP Renderer." },'
 text = replace_once(text, needle, replacement, "release manifest Adaptive Sharpen GLSL entry")
 write(path, text)
 

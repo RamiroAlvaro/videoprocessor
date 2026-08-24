@@ -2828,6 +2828,47 @@ namespace VideoProcessorTest
 			DeleteFileA(path.c_str());
 		}
 
+		TEST_METHOD(Vp0079CustomGlslParametersResolveForAlpha)
+		{
+			char temporaryDirectory[MAX_PATH] = {};
+			Assert::IsTrue(GetTempPathA(
+				ARRAYSIZE(temporaryDirectory), temporaryDirectory) > 0);
+			const std::string path = std::string(temporaryDirectory) +
+				"VideoProcessor-vp0079-custom-glsl.cfg";
+			{
+				std::ofstream file(path, std::ios::out | std::ios::trunc);
+				file
+					<< "[shader.standard]\n"
+					<< "type: multi\n"
+					<< "[shader.standard.adaptive]\n"
+					<< "shortcut: Ctrl+Shift+S\n"
+					<< "shader_type: custom\n"
+					<< "stage: post_resize\n"
+					<< "order: 10\n"
+					<< "glsl_file: NLS.glsl\n"
+					<< "param_strength: 0.5\n";
+			}
+
+			ConfigFile config;
+			Assert::IsTrue(config.Load(path));
+			std::vector<ConfiguredShaderRule> selection;
+			std::string error;
+			Assert::IsTrue(MadVRShaderLoader::ResolveConfiguredRuleSelection(
+				config, "@shader-key:Ctrl+Shift+S",
+				ShaderRendererBackend::LIBPLACEBO, selection, error),
+				std::wstring(error.begin(), error.end()).c_str());
+			Assert::AreEqual(static_cast<size_t>(1), selection.size());
+			Assert::IsFalse(selection.front().nls);
+			Assert::AreEqual("NLS.glsl", selection.front().filename.c_str());
+			Assert::IsTrue(selection.front().postResize);
+			Assert::AreEqual(static_cast<unsigned int>(10),
+				selection.front().order);
+			Assert::AreEqual(0.5,
+				std::stod(selection.front().parameters.at("strength")),
+				0.000001);
+			DeleteFileA(path.c_str());
+		}
+
 		TEST_METHOD(CheckedInVp0079ConfigurationPassesStartupSchemas)
 		{
 			std::string path = __FILE__;
@@ -2898,6 +2939,12 @@ namespace VideoProcessorTest
 			Assert::AreEqual("10", value.c_str());
 			Assert::IsTrue(config.TryGetString("shader.standard", "type", value));
 			Assert::AreEqual("multi", value.c_str());
+			Assert::IsTrue(config.TryGetString(
+				"shader.standard.adaptive_sharpen", "glsl_file", value));
+			Assert::AreEqual("Adaptive sharpen.glsl", value.c_str());
+			Assert::IsTrue(config.TryGetString(
+				"shader.standard.adaptive_sharpen", "param_strength", value));
+			Assert::AreEqual("0.5", value.c_str());
 			const std::pair<const char*, const char*> standardShaders[] = {
 				{ "shader.standard.debanding_mild", "Debanding mild.hlsl" },
 				{ "shader.standard.denoise", "Denoise.hlsl" },

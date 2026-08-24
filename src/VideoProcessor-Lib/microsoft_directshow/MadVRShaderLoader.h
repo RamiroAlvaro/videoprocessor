@@ -54,6 +54,8 @@ struct ConfiguredShaderRule
 	std::map<std::string, std::string> parameters;
 	bool nls = false;
 	bool none = false;
+	bool postResize = false;
+	unsigned int order = 0;
 	double aspectTolerancePercent = 5.0;
 	double maximumStretchRatio = NLS_DEFAULT_MAXIMUM_STRETCH_RATIO;
 	double stableGeometryDeadbandPercent = 2.0;
