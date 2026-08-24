@@ -23,8 +23,11 @@ jobs:
       - name: Apply staged implementation
         shell: pwsh
         run: |
-          python .\ci_apply_standard_glsl.py
+          $ErrorActionPreference = "Stop"
+          python .\ci_apply_standard_glsl_v2.py
+          if ($LASTEXITCODE -ne 0) { throw "Patch staging failed with exit code $LASTEXITCODE" }
           git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
           git status --short
 
       - name: Install required Visual Studio components
@@ -115,6 +118,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .\ci_apply_standard_glsl.py
+          git rm .\ci_apply_standard_glsl_v2.py
           git rm .\.github\workflows\ci-standard-glsl.yml
           git add -A
           git diff --cached --check
