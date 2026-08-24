@@ -52,5 +52,15 @@ if text.count(old_strength) != 1:
     raise RuntimeError("could not locate Adaptive Sharpen strength patch block")
 text = text.replace(old_strength, new_strength, 1)
 
+old_manifest = '''needle = '    { "sourceRoot": "repository", "source": "shaders/Adaptive sharpen.hlsl", "destination": "shaders/Adaptive sharpen.hlsl", "owner": "bacondither", "sourceVersion": "Adaptive Sharpen 2021-10-17", "consumer": "madVR", "loadMechanism": "IMadVRExternalPixelShaders", "reason": "Bundled legacy configurable shader." },'
+replacement = needle + '\\n    { "sourceRoot": "repository", "source": "shaders/Adaptive sharpen.glsl", "destination": "shaders/Adaptive sharpen.glsl", "owner": "bacondither", "sourceVersion": "Adaptive Sharpen 2021-10-17", "consumer": "VideoProcessorVPRenderer.dll", "loadMechanism": "Executable-relative mpv/libplacebo user-shader lookup", "reason": "Bundled optional Adaptive Sharpen implementation for VP Renderer." },'
+'''
+new_manifest = '''needle = '    { "sourceRoot": "repository", "source": "shaders/Adaptive sharpen.hlsl", "destination": "shaders/Adaptive sharpen.hlsl", "owner": "VideoProcessor shaders", "sourceVersion": "Current source commit", "consumer": "madVR", "loadMechanism": "Executable-relative shader lookup", "reason": "Built-in configurable HLSL shader." },'
+replacement = needle + '\\n    { "sourceRoot": "repository", "source": "shaders/Adaptive sharpen.glsl", "destination": "shaders/Adaptive sharpen.glsl", "owner": "VideoProcessor shaders / bacondither", "sourceVersion": "Adaptive Sharpen 2021-10-17", "consumer": "VideoProcessorVPRenderer.dll", "loadMechanism": "Executable-relative mpv/libplacebo user-shader lookup", "reason": "Bundled optional Adaptive Sharpen implementation for VP Renderer." },'
+'''
+if text.count(old_manifest) != 1:
+    raise RuntimeError("could not locate release manifest staging block")
+text = text.replace(old_manifest, new_manifest, 1)
+
 path.write_text(text, encoding="utf-8", newline="\n")
 subprocess.run([sys.executable, str(path)], check=True)
