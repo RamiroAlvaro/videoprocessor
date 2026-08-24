@@ -1,9 +1,9 @@
 name: Validate standard GLSL implementation
 
 on:
-  push:
+  pull_request:
     branches:
-      - work/vprenderer-standard-glsl
+      - feature/vprenderer-standard-glsl
 
 permissions:
   contents: write
@@ -17,6 +17,7 @@ jobs:
       - name: Checkout work branch
         uses: actions/checkout@v4
         with:
+          ref: work/vprenderer-standard-glsl
           fetch-depth: 0
 
       - name: Apply staged implementation
