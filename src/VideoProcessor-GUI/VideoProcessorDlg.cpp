@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <dwmapi.h>
 #include <dxgi1_2.h>
+#include <psapi.h>
 #include <shellapi.h>
 #include <wrl/client.h>
 #include <chrono>
@@ -32,6 +33,7 @@
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "psapi.lib")
 
 #include <version.h>
 #include <cie.h>
@@ -68,6 +70,31 @@ using Microsoft::WRL::ComPtr;
 
 constexpr wchar_t ConfigurationEditorRelativePath[] =
 	L"config\\VideoProcessorConfig.exe";
+
+void LogRendererResourceCensus(uint32_t generation, const CString& renderer,
+	uint64_t token)
+{
+	const HANDLE process = GetCurrentProcess();
+	PROCESS_MEMORY_COUNTERS_EX memory = {};
+	memory.cb = sizeof(memory);
+	const BOOL memoryAvailable = GetProcessMemoryInfo(process,
+		reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
+	DWORD handleCount = 0;
+	const BOOL handlesAvailable = GetProcessHandleCount(process, &handleCount);
+	DebugLog::Log(
+		"Renderer resource census: phase=old-surface-retired generation=%u "
+		"renderer=%S token=%llu private_kib=%llu working_set_kib=%llu "
+		"peak_working_set_kib=%llu handles=%lu gdi=%lu user=%lu "
+		"memory_ok=%d handles_ok=%d",
+		generation, static_cast<LPCTSTR>(renderer),
+		static_cast<unsigned long long>(token),
+		static_cast<unsigned long long>(memory.PrivateUsage / 1024),
+		static_cast<unsigned long long>(memory.WorkingSetSize / 1024),
+		static_cast<unsigned long long>(memory.PeakWorkingSetSize / 1024),
+		handleCount, GetGuiResources(process, GR_GDIOBJECTS),
+		GetGuiResources(process, GR_USEROBJECTS),
+		memoryAvailable ? 1 : 0, handlesAvailable ? 1 : 0);
+}
 
 bool GetApplicationDirectory(std::wstring& directory)
 {
@@ -443,6 +470,7 @@ const ShortcutDefinition SHORTCUT_DEFINITIONS[] =
 		ConfigurationLiveApply::ViewToggleDefaultModifiers },
 	{ "toggle_stats_overlay",  ID_COMMAND_TOGGLE_STATS_OVERLAY,   'I',       FCONTROL },
 	{ "capture_rendered_output", ID_COMMAND_CAPTURE_RENDERED_OUTPUT, 'S',     FCONTROL | FALT },
+	{ "reapply_rules",         ID_COMMAND_REAPPLY_RULES,            0,         0 },
 	{ "pq_set",                ID_COMMAND_PQ_SET,                 'P',       FCONTROL | FSHIFT },
 	{ "renderer_restart",      ID_COMMAND_RENDERER_RESTART,       'R',       FSHIFT },
 	{ "renderer_reset",        ID_COMMAND_RENDERER_RESET,         'R',       0 },
@@ -681,6 +709,7 @@ HACCEL CreateConfiguredAccelerators(
 		if (hasUnifiedRendererConfig && definition.rendererSpecific)
 			continue;
 		ACCEL accelerator = { static_cast<BYTE>(FVIRTKEY | definition.defaultModifiers), definition.defaultKey, definition.command };
+		bool hasBinding = definition.defaultKey != 0;
 		std::string configuredValue;
 		const ConfigFile& config =
 			definition.rendererSpecific ? rendererConfig : mainConfig;
@@ -700,6 +729,7 @@ HACCEL CreateConfiguredAccelerators(
 			{
 				configuredAccelerator.cmd = definition.command;
 				accelerator = configuredAccelerator;
+				hasBinding = true;
 			}
 			else if (rejectInvalidBindings)
 			{
@@ -708,6 +738,8 @@ HACCEL CreateConfiguredAccelerators(
 				return nullptr;
 			}
 		}
+		if (!hasBinding)
+			continue;
 
 		const unsigned int binding = (static_cast<unsigned int>(accelerator.fVirt) << 16) | accelerator.key;
 		if (bindings.insert(binding).second)
@@ -724,6 +756,8 @@ HACCEL CreateConfiguredAccelerators(
 			}
 			// A duplicate user binding is ambiguous, so retain the command's
 			// compiled default when it is still available.
+			if (definition.defaultKey == 0)
+				continue;
 			accelerator = { static_cast<BYTE>(FVIRTKEY | definition.defaultModifiers), definition.defaultKey, definition.command };
 			const unsigned int defaultBinding = (static_cast<unsigned int>(accelerator.fVirt) << 16) | accelerator.key;
 			if (bindings.insert(defaultBinding).second)
@@ -1031,9 +1065,44 @@ HACCEL CreateConfiguredAccelerators(
 				ACCEL accelerator = {};
 				if (!TryParseShortcut(chord, accelerator)) { if (rejectInvalidBindings) { failBinding("invalid unified profile shortcut " + chord); return nullptr; } DEBUGLOG("Invalid unified profile shortcut '%s'", chord.c_str()); continue; }
 				const unsigned int binding = (static_cast<unsigned int>(accelerator.fVirt) << 16) | accelerator.key;
-				if (!bindings.insert(binding).second) { if (rejectInvalidBindings) { failBinding("duplicate unified profile shortcut " + chord); return nullptr; } DEBUGLOG("Duplicate unified profile shortcut '%s' ignored", chord.c_str()); continue; }
-				accelerator.cmd = nextCommand;
-				accelerators.push_back(accelerator);
+				const bool isNewBinding = bindings.insert(binding).second;
+				if (isNewBinding)
+				{
+					accelerator.cmd = nextCommand;
+					accelerators.push_back(accelerator);
+				}
+				else
+				{
+					auto existing = accelerators.end();
+					for (auto candidate = accelerators.begin();
+						candidate != accelerators.end(); ++candidate)
+						if (((static_cast<unsigned int>(candidate->fVirt) << 16) |
+							candidate->key) == binding)
+						{
+							existing = candidate;
+							break;
+						}
+					const auto renderer = existing != accelerators.end() ?
+						rendererShortcutIndices.find(existing->cmd) :
+						rendererShortcutIndices.end();
+					if (renderer == rendererShortcutIndices.end())
+					{
+						if (rejectInvalidBindings) { failBinding("duplicate unified profile shortcut " + chord); return nullptr; }
+						DEBUGLOG("Duplicate unified profile shortcut '%s' ignored", chord.c_str());
+						continue;
+					}
+
+					// A renderer selection and a unified profile are intentionally
+					// composable: one chord selects both. Reuse the physical
+					// accelerator and retain the renderer index under the unified
+					// command so its handler can dispatch both operations.
+					const unsigned int rendererIndex = renderer->second;
+					rendererShortcutIndices.erase(renderer);
+					existing->cmd = nextCommand;
+					rendererShortcutIndices[nextCommand] = rendererIndex;
+					DEBUGLOG("Paired shortcut '%s': render.%u plus unified profile",
+						chord.c_str(), rendererIndex);
+				}
 				CString keyName; keyName.Format(TEXT("%S"), chord.c_str());
 				unifiedProfileShortcutKeys[nextCommand] = keyName;
 				++nextCommand;
@@ -1053,13 +1122,15 @@ HACCEL CreateConfiguredAccelerators(
 class GlobalShortcutObserver
 {
 public:
-	static bool Start(HWND target, const std::vector<ACCEL>& accelerators)
+	static bool Start(HWND target, const std::vector<ACCEL>& accelerators,
+		bool sameProcessOnly = false)
 	{
 		Stop();
 		if (!target || accelerators.empty())
 			return false;
 		s_target = target;
 		s_accelerators = accelerators;
+		s_sameProcessOnly = sameProcessOnly;
 		s_readyEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
 		if (!s_readyEvent)
 		{
@@ -1109,6 +1180,7 @@ private:
 		s_target = nullptr;
 		s_accelerators.clear();
 		s_pressedKeys.clear();
+		s_sameProcessOnly = false;
 	}
 
 	static DWORD WINAPI ThreadProcedure(void*)
@@ -1163,8 +1235,15 @@ private:
 		const bool configurationModal =
 			configurationEditorProcessId != 0 &&
 			foregroundProcessId == configurationEditorProcessId;
-		if (!ConfigurationLiveApply::MayDispatchGlobalShortcut(
-			::GetCurrentProcessId(), foregroundProcessId, configurationModal))
+		// When foreground-only shortcuts are configured, retain only the Config
+		// chord here and accept it only while a VP-owned presentation window is
+		// foreground. Fullscreen video does not route keyboard input through the
+		// main dialog, so without this narrow observer Ctrl+Shift+S is lost.
+		const bool mayDispatch = s_sameProcessOnly ?
+			!configurationModal && foregroundProcessId == ::GetCurrentProcessId() :
+			ConfigurationLiveApply::MayDispatchGlobalShortcut(
+				::GetCurrentProcessId(), foregroundProcessId, configurationModal);
+		if (!mayDispatch)
 		{
 			return ::CallNextHookEx(s_hook, code, message, parameter);
 		}
@@ -1254,6 +1333,7 @@ private:
 	static HWND s_target;
 	static std::vector<ACCEL> s_accelerators;
 	static std::set<WORD> s_pressedKeys;
+	static bool s_sameProcessOnly;
 };
 
 HANDLE GlobalShortcutObserver::s_thread = nullptr;
@@ -1263,6 +1343,7 @@ HHOOK GlobalShortcutObserver::s_hook = nullptr;
 HWND GlobalShortcutObserver::s_target = nullptr;
 std::vector<ACCEL> GlobalShortcutObserver::s_accelerators;
 std::set<WORD> GlobalShortcutObserver::s_pressedKeys;
+bool GlobalShortcutObserver::s_sameProcessOnly = false;
 
 struct DisplayTimingSnapshot
 {
@@ -1873,9 +1954,11 @@ BEGIN_MESSAGE_MAP(CVideoProcessorDlg, CDialog)
 	ON_MESSAGE(WM_MESSAGE_EVALUATE_RENDERER_START, &CVideoProcessorDlg::OnMessageEvaluateRendererStart)
 	ON_MESSAGE(WM_MESSAGE_CAPTURE_DEVICE_ERROR, &CVideoProcessorDlg::OnMessageCaptureDeviceError)
 	ON_MESSAGE(WM_MESSAGE_DIRECTSHOW_NOTIFICATION, &CVideoProcessorDlg::OnMessageDirectShowNotification)
+	ON_MESSAGE(WM_MESSAGE_DIRECTSHOW_OWNER_COMPLETION, &CVideoProcessorDlg::OnMessageDirectShowOwnerCompletion)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_STATE_CHANGE, &CVideoProcessorDlg::OnMessageRendererStateChange)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_DETAIL_STRING, &CVideoProcessorDlg::OnMessageRendererDetailString)
 	ON_MESSAGE(WM_MESSAGE_EXTERNAL_SHORTCUT, &CVideoProcessorDlg::OnMessageExternalShortcut)
+	ON_MESSAGE(WM_MESSAGE_FULLSCREEN_HOST_RESIZED, &CVideoProcessorDlg::OnMessageFullscreenHostResized)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_LIVE_FRAME, &CVideoProcessorDlg::OnMessageRendererLiveFrame)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_RESET_REQUEST, &CVideoProcessorDlg::OnMessageRendererResetRequest)
 	ON_MESSAGE(WM_MESSAGE_RENDERER_RETIRED, &CVideoProcessorDlg::OnMessageRendererRetired)
@@ -1889,6 +1972,7 @@ BEGIN_MESSAGE_MAP(CVideoProcessorDlg, CDialog)
 	ON_COMMAND(ID_COMMAND_FULLSCREEN_EXIT, &CVideoProcessorDlg::OnCommandFullScreenExit)
 	ON_COMMAND(ID_COMMAND_RENDERER_RESET, &CVideoProcessorDlg::OnCommandRendererReset)
 	ON_COMMAND(ID_COMMAND_RENDERER_RESTART, &CVideoProcessorDlg::OnCommandRendererRestart)
+	ON_COMMAND(ID_COMMAND_REAPPLY_RULES, &CVideoProcessorDlg::OnCommandReapplyRules)
 
 	ON_COMMAND(ID_COMMAND_PQ_SET, &CVideoProcessorDlg::OnCommandPQSet)
 	ON_COMMAND(ID_COMMAND_AUTO_SET, &CVideoProcessorDlg::OnCommandAutoSet)
@@ -2193,24 +2277,38 @@ void CVideoProcessorDlg::ReloadConfiguredAccelerators()
 void CVideoProcessorDlg::StartGlobalShortcutObserver()
 {
 	StopGlobalShortcutObserver();
-	if (!ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(
+	const bool enableAllBackgroundShortcuts =
+		ConfigurationLiveApply::ShouldEnableBackgroundShortcuts(
 		m_interfaceMode == ApplicationInterface::Mode::Modern, m_hideUI,
-		m_shortcutsForegroundOnly) ||
-		!GetSafeHwnd())
+		m_shortcutsForegroundOnly);
+	std::vector<ACCEL> observedAccelerators = m_configuredAccelerators;
+	const bool sameProcessOnly = !enableAllBackgroundShortcuts &&
+		m_shortcutsForegroundOnly;
+	if (sameProcessOnly)
+	{
+		observedAccelerators.erase(std::remove_if(observedAccelerators.begin(),
+			observedAccelerators.end(), [](const ACCEL& accelerator)
+			{
+				return accelerator.cmd != ID_COMMAND_CONFIG_EDITOR;
+			}), observedAccelerators.end());
+	}
+	if ((!enableAllBackgroundShortcuts && !sameProcessOnly) ||
+		!GetSafeHwnd() || observedAccelerators.empty())
 	{
 		DebugLog::Log(
-			"Background shortcut observer suppressed: modern=%d noui=%d foreground_only=%d",
+			"Background shortcut observer suppressed: modern=%d noui=%d foreground_only=%d config_only=%d",
 			m_interfaceMode == ApplicationInterface::Mode::Modern ? 1 : 0,
-			m_hideUI ? 1 : 0, m_shortcutsForegroundOnly ? 1 : 0);
+			m_hideUI ? 1 : 0, m_shortcutsForegroundOnly ? 1 : 0,
+			sameProcessOnly ? 1 : 0);
 		return;
 	}
 
 	const bool observerStarted = GlobalShortcutObserver::Start(GetSafeHwnd(),
-		m_configuredAccelerators);
+		observedAccelerators, sameProcessOnly);
 	DebugLog::Log(
-		"Background shortcut observer %s (%zu bindings)",
+		"Background shortcut observer %s (%zu bindings, config_only=%d)",
 		observerStarted ? "started" : "unavailable",
-		m_configuredAccelerators.size());
+		observedAccelerators.size(), sameProcessOnly ? 1 : 0);
 }
 
 void CVideoProcessorDlg::StopGlobalShortcutObserver()
@@ -4984,6 +5082,7 @@ void CVideoProcessorDlg::OnRendererSelected()
 {
 	EstablishSessionRendererOverrideFromSelection("operator-selection");
 	UpdateRendererBackendUi();
+	RefreshUnifiedProfilesForRuleContext("renderer-selection");
 	OnBnClickedRendererRestart();
 }
 
@@ -5829,6 +5928,40 @@ LRESULT CVideoProcessorDlg::OnMessageDirectShowNotification(WPARAM wParam, LPARA
 }
 
 
+LRESULT CVideoProcessorDlg::OnMessageDirectShowOwnerCompletion(
+	WPARAM wParam, LPARAM lParam)
+{
+	const uint32_t messageGeneration = static_cast<uint32_t>(lParam);
+	const uint32_t currentGeneration =
+		m_rendererGeneration.load(std::memory_order_acquire);
+	const std::shared_ptr<IVideoRenderer> renderer =
+		std::atomic_load_explicit(
+			&m_videoRenderer, std::memory_order_acquire);
+	if (!RendererGenerationGate::Accept(
+		messageGeneration, currentGeneration, renderer != nullptr) ||
+		!m_activeRendererIsDirectShow)
+	{
+		DebugLog::Log(
+			"DirectShow owner completion rejected: message_generation=%u "
+			"current_generation=%u renderer=%d directshow=%d",
+			messageGeneration, currentGeneration, renderer ? 1 : 0,
+			m_activeRendererIsDirectShow ? 1 : 0);
+		return 0;
+	}
+
+	const HRESULT hr = renderer->OnOwnerCompletionWake(wParam, lParam);
+	if (FAILED(hr))
+		FatalError(TEXT("Failed to handle DirectShow owner completion"));
+	DebugLog::Log(
+		"Renderer handoff audit: phase=owner-completion-accepted "
+		"generation=%u renderer=%S target=%p fullscreen_host=%p",
+		messageGeneration, static_cast<LPCTSTR>(m_activeRendererName),
+		m_rendererTargetHwnd,
+		m_fullScreenVideoWindow ? m_fullScreenVideoWindow->GetHWND() : nullptr);
+	return 0;
+}
+
+
 LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM lParam)
 {
 	const RendererState newRendererState = (RendererState)wParam;
@@ -6079,24 +6212,15 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 			DbgLog((LOG_TRACE, 1,
 				TEXT("LLDV confirmed during renderer startup - scheduling renderer restart")));
 		}
-		if (m_queueProfileRestartCompletionPending &&
-			!m_wantToRestartRenderer &&
-			m_rendererGeneration.load(std::memory_order_acquire) >=
-				m_queueProfileRestartStartingGeneration)
+		if (m_queueProfileResetRequest.pending)
 		{
-			const auto profileSnapshot = m_profileRuntime.GetSnapshot();
-			const std::string effectiveProfile = profileSnapshot ?
-				profileSnapshot->queue.profile : std::string();
 			DebugLog::Log(
-				"Queue profile restart: profile=%s source=%s generation=%u "
-				"outcome=completed effective_profile=%s",
-				m_queueProfileRestartCompletionProfile.c_str(),
-				m_queueProfileRestartCompletionSource.c_str(),
-				m_rendererGeneration.load(std::memory_order_acquire),
-				effectiveProfile.c_str());
-			m_queueProfileRestartCompletionPending = false;
-			m_queueProfileRestartCompletionProfile.clear();
-			m_queueProfileRestartCompletionSource.clear();
+				"Queue profile reset: renderer=%S generation=%u "
+				"action=dispatch-after-renderer-ready",
+				m_activeRendererName.GetString(),
+				m_rendererGeneration.load(std::memory_order_acquire));
+			KillTimer(QUEUE_PROFILE_RESET_TIMER_ID);
+			SetTimer(QUEUE_PROFILE_RESET_TIMER_ID, 1, nullptr);
 		}
 		break;
 	}
@@ -6115,15 +6239,6 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 		break;
 
 	case RendererState::RENDERSTATE_FAILED:
-		if (m_queueProfileRestartCompletionPending)
-		{
-			DebugLog::Log(
-				"Queue profile restart: profile=%s source=%s generation=%u "
-				"outcome=failed action=resolve-renderer-error-then-use-Restart-Renderer",
-				m_queueProfileRestartCompletionProfile.c_str(),
-				m_queueProfileRestartCompletionSource.c_str(),
-				m_rendererGeneration.load(std::memory_order_acquire));
-		}
 		PauseRendererIngress();
 		DestroyVideoRenderer();
 		if (m_rendererRetirementPending)
@@ -6139,19 +6254,8 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 			m_windowedVideoWindow.ShowLogo(true);
 		}
 		m_rendererStateText.SetWindowText(TEXT("Failed"));
-		if (m_queueProfileRestartCompletionPending)
-		{
-			m_windowedVideoWindow.SetWindowText(
-				TEXT("Queue profile applied, but renderer restart failed. Resolve the renderer error, then use Restart Renderer."));
-			m_queueProfileRestartCompletionPending = false;
-			m_queueProfileRestartCompletionProfile.clear();
-			m_queueProfileRestartCompletionSource.clear();
-		}
-		else
-		{
-			m_windowedVideoWindow.SetWindowText(
-				TEXT("DirectShow renderer failed to build or start"));
-		}
+		m_windowedVideoWindow.SetWindowText(
+			TEXT("DirectShow renderer failed to build or start"));
 		m_rendererFullscreenCheck.SetCheck(FALSE);
 		enableButtons = !m_rendererResetTransitionActive;
 		break;
@@ -6257,15 +6361,39 @@ bool CVideoProcessorDlg::TryFinalizeRendererRetirement(
 	const bool completedRetry = m_rendererRetirementRetryActive;
 	m_rendererRetirementRetryActive = false;
 	m_failedRendererRetirementNextRetryTick = 0;
+	// The retiring graph has revoked SetNotifyWindow and its owner apartment is
+	// now gone. Remove only its dedicated graph-event wakes before any successor
+	// can reuse this message ID. Lifecycle completion has a different message
+	// and therefore cannot be consumed by this purge.
+	MSG staleGraphEvent = {};
+	size_t purgedGraphEvents = 0;
+	while (PeekMessage(&staleGraphEvent, GetSafeHwnd(),
+		WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
+		WM_MESSAGE_DIRECTSHOW_NOTIFICATION, PM_REMOVE))
+	{
+		++purgedGraphEvents;
+	}
+	if (purgedGraphEvents != 0)
+	{
+		DebugLog::Log(
+			"DirectShow retiring graph-event wakes purged: count=%zu token=%llu",
+			purgedGraphEvents, static_cast<unsigned long long>(token));
+	}
 	DebugLog::Log(
 		"Renderer transition: process=%lu generation=%u event=old-surface-retired "
-		"renderer=%S target=%p cover=%p token=%llu source=%s "
+		"renderer=%S target=%p fullscreen_host=%p fullscreen_intent=%d "
+		"cover=%p token=%llu source=%s "
 		"wake_posted=%d wake_error=%lu",
 		GetCurrentProcessId(), m_retiringRendererGeneration,
 		static_cast<LPCTSTR>(m_retiringRendererName),
-		m_rendererTargetHwnd, m_rendererTransitionWindow.GetHWND(),
+		m_rendererTargetHwnd,
+		m_fullScreenVideoWindow ? m_fullScreenVideoWindow->GetHWND() : nullptr,
+		m_rendererFullscreenCheck.GetCheck() ? 1 : 0,
+		m_rendererTransitionWindow.GetHWND(),
 		static_cast<unsigned long long>(token), completionSource,
 		completion.wakePosted ? 1 : 0, completion.wakePostError);
+	LogRendererResourceCensus(m_retiringRendererGeneration,
+		m_retiringRendererName, token);
 	m_retiringRendererName.Empty();
 	m_retiringRendererGeneration = 0;
 	if (completedRetry)
@@ -6466,6 +6594,33 @@ LRESULT CVideoProcessorDlg::OnMessageExternalShortcut(WPARAM wParam,
 	return 0;
 }
 
+
+LRESULT CVideoProcessorDlg::OnMessageFullscreenHostResized(
+	WPARAM wParam, LPARAM lParam)
+{
+	const HWND host = reinterpret_cast<HWND>(wParam);
+	const bool currentFullscreenHost = m_fullScreenVideoWindow &&
+		m_fullScreenVideoWindow->GetHWND() == host &&
+		m_rendererTargetHwnd == host;
+	const bool rendererNotified = currentFullscreenHost && m_videoRenderer &&
+		!RendererResetOperationInProgress();
+	if (rendererNotified)
+		m_videoRenderer->OnSize();
+
+	RECT rect{};
+	const BOOL haveRect = host && ::IsWindow(host) &&
+		::GetWindowRect(host, &rect);
+	DebugLog::Log(
+		"Fullscreen host resize: host=%p size=%dx%d current_target=%d "
+		"renderer_notified=%d reset_active=%d rect=%ld,%ld-%ld,%ld",
+		host, LOWORD(lParam), HIWORD(lParam),
+		currentFullscreenHost ? 1 : 0, rendererNotified ? 1 : 0,
+		RendererResetOperationInProgress() ? 1 : 0,
+		haveRect ? rect.left : 0, haveRect ? rect.top : 0,
+		haveRect ? rect.right : 0, haveRect ? rect.bottom : 0);
+	return 0;
+}
+
 //
 // Command handlers
 //
@@ -6660,6 +6815,10 @@ void CVideoProcessorDlg::OnCommandDisplayRule(UINT commandId)
 	const auto unifiedKey = m_unifiedProfileShortcutKeys.find(static_cast<WORD>(commandId));
 	if (unifiedKey != m_unifiedProfileShortcutKeys.end())
 	{
+		const auto pairedRenderer =
+			m_rendererShortcutIndices.find(static_cast<WORD>(commandId));
+		if (pairedRenderer != m_rendererShortcutIndices.end())
+			SelectRendererFromShortcut(pairedRenderer->second);
 		const DWORD commandTime = static_cast<DWORD>(GetMessageTime());
 		if (m_lastUnifiedProfileCommand == commandId &&
 			commandTime - m_lastUnifiedProfileCommandTime < 100)
@@ -6670,7 +6829,6 @@ void CVideoProcessorDlg::OnCommandDisplayRule(UINT commandId)
 		}
 		m_lastUnifiedProfileCommand = static_cast<WORD>(commandId);
 		m_lastUnifiedProfileCommandTime = commandTime;
-		const auto previousSnapshot = m_profileRuntime.GetSnapshot();
 		UnifiedProfileRuntime::SelectionResult result;
 		std::string error;
 		if (!m_profileRuntime.SelectKey(
@@ -6691,21 +6849,25 @@ void CVideoProcessorDlg::OnCommandDisplayRule(UINT commandId)
 		}
 		DebugLog::Log("Unified profile key selected: %s",
 			activeProfiles.str().c_str());
+		const bool queueWasSelected = std::any_of(result.selections.begin(),
+			result.selections.end(), [](const RendererProfileConfig::KeySelection&
+			selection)
+			{
+				return selection.group == "queue";
+			});
+		const bool queueProfileReset = result.snapshot &&
+			QueueProfileRestartPolicy::RequiresResetAfterManualSelection(
+				queueWasSelected, result.snapshot->queue.profile);
 		if (result.changed)
 		{
-			const std::string previousQueueProfile = previousSnapshot ?
-				previousSnapshot->queue.profile : std::string();
-			const bool queueProfileRestart = result.snapshot &&
-				QueueProfileRestartPolicy::RequiresRestartAfterManualSelection(
-					true, previousQueueProfile, result.snapshot->queue.profile);
 			ApplyUnifiedProfileSnapshot(result.snapshot, true,
-				queueProfileRestart);
-			if (queueProfileRestart)
-				QueueUnifiedQueueProfileRendererRestart(result.snapshot,
-					"shortcut:" + std::string(
-						CStringA(unifiedKey->second).GetString()));
+				queueProfileReset);
 			ScheduleUnifiedProfileActions(result.actions);
 		}
+		if (queueProfileReset)
+			QueueUnifiedQueueProfileReset(result.snapshot,
+				"shortcut:" + std::string(
+					CStringA(unifiedKey->second).GetString()));
 		return;
 	}
 	const auto rule = m_displayRuleShortcutRules.find(static_cast<WORD>(commandId));
@@ -6739,7 +6901,11 @@ void CVideoProcessorDlg::OnCommandRendererSelect(UINT commandId)
 	if (shortcut == m_rendererShortcutIndices.end())
 		return;
 
-	const unsigned int oneBasedIndex = shortcut->second;
+	SelectRendererFromShortcut(shortcut->second);
+}
+
+void CVideoProcessorDlg::SelectRendererFromShortcut(unsigned int oneBasedIndex)
+{
 	if (oneBasedIndex == 0 ||
 		oneBasedIndex > static_cast<unsigned int>(m_rendererCombo.GetCount()))
 	{
@@ -6757,6 +6923,7 @@ void CVideoProcessorDlg::OnCommandRendererSelect(UINT commandId)
 	{
 		EstablishSessionRendererOverrideFromSelection(
 			"renderer-shortcut-already-selected");
+		RefreshUnifiedProfilesForRuleContext("renderer-shortcut");
 		DEBUGLOG("Renderer shortcut render.%u already selected: %s",
 			oneBasedIndex,
 			rendererName.GetString());
@@ -6769,6 +6936,7 @@ void CVideoProcessorDlg::OnCommandRendererSelect(UINT commandId)
 		oneBasedIndex,
 		rendererName.GetString());
 	UpdateRendererBackendUi();
+	RefreshUnifiedProfilesForRuleContext("renderer-shortcut");
 	OnBnClickedRendererRestart();
 }
 
@@ -6844,6 +7012,20 @@ void CVideoProcessorDlg::OnCommandConfigEditor()
 	m_configurationEditorLastRevealAttemptTick = 0;
 	DebugLog::Log(
 		"Configuration editor fresh reveal intent started: timeout_ms=20000");
+	// Config normally stays warm in the tray.  A reveal through its stable
+	// process event bypasses the association/reveal path below, so refresh the
+	// presentation target first.  Otherwise Config can retain the monitor from
+	// the previous reveal after VP has moved, or after fullscreen has retargeted
+	// a different display.
+	HWND existingEditor = FindConfigurationEditorForCurrentInstallation();
+	if (!existingEditor && IsConfigurationEditorTopLevel(
+		m_configurationEditorHwnd, m_configurationEditorProcessId, false))
+	{
+		existingEditor = m_configurationEditorHwnd;
+	}
+	TrackConfigurationEditor(existingEditor);
+	if (existingEditor)
+		PublishConfigurationEditorPresentationTarget(existingEditor);
 	if (m_configurationEditorProcessId &&
 		SignalConfigurationEditorReveal(m_configurationEditorProcessId))
 	{
@@ -6855,11 +7037,6 @@ void CVideoProcessorDlg::OnCommandConfigEditor()
 			m_configurationEditorProcessId);
 		return;
 	}
-	HWND existingEditor = FindConfigurationEditorForCurrentInstallation();
-	if (!existingEditor && IsConfigurationEditorTopLevel(
-		m_configurationEditorHwnd, m_configurationEditorProcessId, false))
-		existingEditor = m_configurationEditorHwnd;
-	TrackConfigurationEditor(existingEditor);
 	if (existingEditor && m_configurationEditorProcessId &&
 		SignalConfigurationEditorReveal(m_configurationEditorProcessId))
 	{
@@ -8179,6 +8356,17 @@ void CVideoProcessorDlg::RenderStart()
 	}
 	m_preserveFullscreenHostForProfileRestart = false;
 	++m_rendererTargetRevision;
+	DebugLog::Log(
+		"Renderer handoff audit: phase=successor-selected generation=%u "
+		"renderer=%S backend=%s target=%p target_revision=%llu "
+		"fullscreen_host=%p fullscreen_intent=%d previous_renderer=%S",
+		rendererGeneration, static_cast<LPCTSTR>(m_activeRendererName),
+		m_activeRendererIsDirectShow ? "directshow" : "vp-renderer",
+		m_rendererTargetHwnd,
+		static_cast<unsigned long long>(m_rendererTargetRevision),
+		m_fullScreenVideoWindow ? m_fullScreenVideoWindow->GetHWND() : nullptr,
+		m_rendererFullscreenCheck.GetCheck() ? 1 : 0,
+		static_cast<LPCTSTR>(previousRendererName));
 	m_transitionGeneration = rendererGeneration;
 	if (m_rendererResetTransitionActive)
 	{
@@ -8273,7 +8461,10 @@ void CVideoProcessorDlg::RenderStart()
 				videoConversionOverride);
 			BindRendererResetSink();
 
-			ApplyUnifiedProfileSnapshot(m_profileRuntime.GetSnapshot(), false);
+			const auto profileSnapshot = m_profileRuntime.GetSnapshot();
+			ApplyUnifiedProfileSnapshot(profileSnapshot, false);
+			if (profileSnapshot && !profileSnapshot->queue.profile.empty())
+				QueueUnifiedQueueProfileReset(profileSnapshot, "renderer-start");
 
 			if (m_captureDeviceVideoState)
 				m_videoRenderer->OnVideoState(m_builtVideoState);
@@ -8338,7 +8529,8 @@ void CVideoProcessorDlg::RenderStart()
 		if (IsEqualCLSID(*rendererClSID, CLSID_MPCVR))
 			m_videoRenderer = std::make_shared<DirectShowMPCVideoRenderer>(
 				*this, rendererGeneration, m_rendererTargetHwnd, GetSafeHwnd(),
-				WM_MESSAGE_DIRECTSHOW_NOTIFICATION, timingClock,
+				WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
+				WM_MESSAGE_DIRECTSHOW_OWNER_COMPLETION, timingClock,
 				directShowStartStopTimeMethod,
 				GetRendererVideoFrameUseQueue(),
 				GetRendererVideoFrameQueueSizeMax(),
@@ -8350,7 +8542,8 @@ void CVideoProcessorDlg::RenderStart()
 			m_videoRenderer =
 				std::make_shared<DirectShowEnhancedVideoRenderer>(
 					*this, rendererGeneration, m_rendererTargetHwnd, GetSafeHwnd(),
-					WM_MESSAGE_DIRECTSHOW_NOTIFICATION, timingClock,
+					WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
+					WM_MESSAGE_DIRECTSHOW_OWNER_COMPLETION, timingClock,
 					directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
 					GetRendererVideoFrameQueueSizeMax(),
@@ -8360,7 +8553,8 @@ void CVideoProcessorDlg::RenderStart()
 				std::make_shared<DirectShowGenericHDRVideoRenderer>(
 					*rendererClSID, *this, rendererGeneration, m_rendererTargetHwnd,
 					GetSafeHwnd(), WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
-					timingClock, directShowStartStopTimeMethod,
+					WM_MESSAGE_DIRECTSHOW_OWNER_COMPLETION, timingClock,
+					directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
 					GetRendererVideoFrameQueueSizeMax(),
 					videoConversionOverride, forceNominalRange,
@@ -8371,13 +8565,17 @@ void CVideoProcessorDlg::RenderStart()
 				std::make_shared<DirectShowGenericVideoRenderer>(
 					*rendererClSID, *this, rendererGeneration, m_rendererTargetHwnd,
 					GetSafeHwnd(), WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
-					timingClock, directShowStartStopTimeMethod,
+					WM_MESSAGE_DIRECTSHOW_OWNER_COMPLETION, timingClock,
+					directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
 					GetRendererVideoFrameQueueSizeMax(),
 					videoConversionOverride);
 		BindRendererResetSink();
 
-		ApplyUnifiedProfileSnapshot(m_profileRuntime.GetSnapshot(), false);
+		const auto profileSnapshot = m_profileRuntime.GetSnapshot();
+		ApplyUnifiedProfileSnapshot(profileSnapshot, false);
+		if (profileSnapshot && !profileSnapshot->queue.profile.empty())
+			QueueUnifiedQueueProfileReset(profileSnapshot, "renderer-start");
 
 		if (m_captureDeviceVideoState)
 			m_videoRenderer->OnVideoState(m_builtVideoState);
@@ -8432,6 +8630,7 @@ void CVideoProcessorDlg::RenderStart()
 					m_rendererTargetHwnd,
 					this->GetSafeHwnd(),
 					WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
+					WM_MESSAGE_DIRECTSHOW_OWNER_COMPLETION,
 					timingClock,
 					directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
@@ -8450,6 +8649,7 @@ void CVideoProcessorDlg::RenderStart()
 					m_rendererTargetHwnd,
 					this->GetSafeHwnd(),
 					WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
+					WM_MESSAGE_DIRECTSHOW_OWNER_COMPLETION,
 					timingClock,
 					directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
@@ -8464,6 +8664,7 @@ void CVideoProcessorDlg::RenderStart()
 					m_rendererTargetHwnd,
 					this->GetSafeHwnd(),
 					WM_MESSAGE_DIRECTSHOW_NOTIFICATION,
+					WM_MESSAGE_DIRECTSHOW_OWNER_COMPLETION,
 					timingClock,
 					directShowStartStopTimeMethod,
 					GetRendererVideoFrameUseQueue(),
@@ -8598,9 +8799,15 @@ void CVideoProcessorDlg::RenderStop()
 		m_rendererIngressState;
 	const ULONGLONG stopQueuedTick = GetTickCount64();
 	DebugLog::Log(
-		"Renderer stop dispatch: phase=before-stop generation=%u renderer_state=%d foreground=%p focus=%p",
+		"Renderer stop dispatch: phase=before-stop generation=%u "
+		"renderer=%S renderer_state=%d target=%p fullscreen_host=%p "
+		"fullscreen_intent=%d foreground=%p focus=%p",
 		m_rendererGeneration.load(std::memory_order_acquire),
+		static_cast<LPCTSTR>(m_activeRendererName),
 		static_cast<int>(m_rendererState),
+		m_rendererTargetHwnd,
+		m_fullScreenVideoWindow ? m_fullScreenVideoWindow->GetHWND() : nullptr,
+		m_rendererFullscreenCheck.GetCheck() ? 1 : 0,
 		reinterpret_cast<void*>(::GetForegroundWindow()),
 		reinterpret_cast<void*>(::GetFocus()));
 	m_videoRenderer->StopWithIngressDrain([ingress]()
@@ -8608,10 +8815,15 @@ void CVideoProcessorDlg::RenderStop()
 			ingress->WaitForDrain();
 		});
 	DebugLog::Log(
-		"Renderer stop dispatch: phase=after-stop-call return_ms=%llu generation=%u renderer_state=%d foreground=%p focus=%p",
+		"Renderer stop dispatch: phase=after-stop-call return_ms=%llu "
+		"generation=%u renderer_state=%d target=%p fullscreen_host=%p "
+		"fullscreen_intent=%d foreground=%p focus=%p",
 		static_cast<unsigned long long>(GetTickCount64() - stopQueuedTick),
 		m_rendererGeneration.load(std::memory_order_acquire),
 		static_cast<int>(m_rendererState),
+		m_rendererTargetHwnd,
+		m_fullScreenVideoWindow ? m_fullScreenVideoWindow->GetHWND() : nullptr,
+		m_rendererFullscreenCheck.GetCheck() ? 1 : 0,
 		reinterpret_cast<void*>(::GetForegroundWindow()),
 		reinterpret_cast<void*>(::GetFocus()));
 
@@ -8679,10 +8891,14 @@ void CVideoProcessorDlg::DestroyVideoRenderer()
 		m_rendererGeneration.load(std::memory_order_acquire);
 	DebugLog::Log(
 		"Renderer retirement queued: process=%lu generation=%u renderer=%S "
-		"token=%llu ui_thread=%lu",
+		"token=%llu target=%p fullscreen_host=%p fullscreen_intent=%d "
+		"ui_thread=%lu",
 		GetCurrentProcessId(), m_retiringRendererGeneration,
 		static_cast<LPCTSTR>(m_retiringRendererName),
 		static_cast<unsigned long long>(m_rendererRetirementToken),
+		m_rendererTargetHwnd,
+		m_fullScreenVideoWindow ? m_fullScreenVideoWindow->GetHWND() : nullptr,
+		m_rendererFullscreenCheck.GetCheck() ? 1 : 0,
 		GetCurrentThreadId());
 	const bool queued = m_rendererRetirementService.Retire(
 		std::move(rendererToDestroy), m_rendererRetirementToken,
@@ -8835,10 +9051,15 @@ void CVideoProcessorDlg::PumpRendererResetMailbox()
 					RendererTransitionState::AwaitingFrame :
 				m_rendererTransitionModel.State() ==
 					RendererTransitionState::FailedCovered);
+		const bool expectedLifecycleCancellation = !currentSuccess &&
+			completion.failure == "renderer selection is no longer usable" &&
+			(completion.staleGeneration || !m_videoRenderer ||
+				m_rendererState != RendererState::RENDERSTATE_RENDERING);
 		DEBUGLOG(
 			"Reset %s: operation=%llu request=%llu generation=%u "
 			"current_generation=%u reason=%s scope=%s%s%s",
-			currentSuccess ? "completed" : "failed",
+			currentSuccess ? "completed" :
+				expectedLifecycleCancellation ? "cancelled" : "failed",
 			static_cast<unsigned long long>(completion.operationId),
 			static_cast<unsigned long long>(completion.request.sequence),
 			completion.rendererGeneration,
@@ -9323,12 +9544,15 @@ void CVideoProcessorDlg::TryRevealRendererTransition(uint32_t generation)
 	RequestPresentationFocus("first-live-frame", generation);
 	DebugLog::Log(
 		"Renderer transition: process=%lu generation=%u event=first-live-frame-reveal "
-		"renderer=%S target=%p evidence=%s black_ms=%llu "
+		"renderer=%S target=%p fullscreen_host=%p fullscreen_intent=%d "
+		"evidence=%s black_ms=%llu "
 		"composition_sync=0x%08lx composition_sync_ms=%llu",
 		GetCurrentProcessId(),
 		generation,
 		static_cast<LPCTSTR>(m_activeRendererName),
 		m_rendererTargetHwnd,
+		m_fullScreenVideoWindow ? m_fullScreenVideoWindow->GetHWND() : nullptr,
+		m_rendererFullscreenCheck.GetCheck() ? 1 : 0,
 		evidence ? evidence : "unknown",
 		static_cast<unsigned long long>(blackDurationMs),
 		static_cast<unsigned long>(compositionSyncResult),
@@ -9518,36 +9742,60 @@ void CVideoProcessorDlg::FullScreenVideoWindowConstruct()
 	{
 		PublishConfigurationEditorPresentationTarget(configurationEditor);
 	}
-	HMONITOR actualMonitor = MonitorFromWindow(
-		fullscreenHwnd, MONITOR_DEFAULTTONULL);
-	if (actualMonitor != hmon)
+	// The monitor may be selected correctly while a display-mode/topology race
+	// leaves the new popup at a stale size.  Normalize the complete rectangle
+	// before DirectShow/madVR can bind its child window; checking only the
+	// monitor allows a top-left, quarter-sized presentation to become sticky.
+	RECT rectBefore{};
+	::GetWindowRect(fullscreenHwnd, &rectBefore);
+	HMONITOR actualMonitor = MonitorFromWindow(fullscreenHwnd,
+		MONITOR_DEFAULTTONULL);
+	MONITORINFO monitorInfo = { sizeof(monitorInfo) };
+	BOOL placed = FALSE;
+	if (GetMonitorInfo(hmon, &monitorInfo))
 	{
-		MONITORINFO monitorInfo = { sizeof(monitorInfo) };
-		if (GetMonitorInfo(hmon, &monitorInfo))
-		{
-			const RECT& rect = monitorInfo.rcMonitor;
-			const BOOL moved = ::SetWindowPos(fullscreenHwnd, nullptr,
-				rect.left, rect.top, rect.right - rect.left,
-				rect.bottom - rect.top,
-				SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER |
-				SWP_SHOWWINDOW);
-			actualMonitor = MonitorFromWindow(
-				fullscreenHwnd, MONITOR_DEFAULTTONULL);
-			DebugLog::Log(
-				"Fullscreen monitor placement correction: requested=%p before=%p moved=%d after=%p",
-				reinterpret_cast<void*>(hmon),
-				reinterpret_cast<void*>(MonitorFromWindow(
-					this->GetSafeHwnd(), MONITOR_DEFAULTTONEAREST)),
-				moved ? 1 : 0, reinterpret_cast<void*>(actualMonitor));
-		}
+		const RECT& target = monitorInfo.rcMonitor;
+		placed = ::SetWindowPos(fullscreenHwnd, nullptr,
+			target.left, target.top, target.right - target.left,
+			target.bottom - target.top,
+			SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER |
+			SWP_SHOWWINDOW);
 	}
+	RECT rectAfter{};
+	::GetWindowRect(fullscreenHwnd, &rectAfter);
+	actualMonitor = MonitorFromWindow(fullscreenHwnd, MONITOR_DEFAULTTONULL);
 	DebugLog::Log(
-		"Fullscreen monitor placement verified: requested=%p actual=%p matched=%d",
+		"Fullscreen host initial geometry: requested_monitor=%p actual_monitor=%p "
+		"monitor_matched=%d placement=%d before=%ld,%ld-%ld,%ld "
+		"target=%ld,%ld-%ld,%ld after=%ld,%ld-%ld,%ld",
 		reinterpret_cast<void*>(hmon), reinterpret_cast<void*>(actualMonitor),
-		actualMonitor == hmon ? 1 : 0);
+		actualMonitor == hmon ? 1 : 0, placed ? 1 : 0,
+		rectBefore.left, rectBefore.top, rectBefore.right, rectBefore.bottom,
+		monitorInfo.rcMonitor.left, monitorInfo.rcMonitor.top,
+		monitorInfo.rcMonitor.right, monitorInfo.rcMonitor.bottom,
+		rectAfter.left, rectAfter.top, rectAfter.right, rectAfter.bottom);
+	// Fullscreen is an explicit VP presentation transition. Activate its native
+	// surface now, while the transition is current, so keyboard shortcuts keep
+	// working immediately after the video expands. The later placement timer is
+	// intentionally passive; it must not steal focus after the operator has
+	// moved to another application.
+	if ((!configurationEditor || !::IsWindowVisible(configurationEditor)) &&
+		fullscreenHwnd && ::IsWindow(fullscreenHwnd))
+	{
+		::ShowWindow(fullscreenHwnd, SW_RESTORE);
+		::BringWindowToTop(fullscreenHwnd);
+		const BOOL activated = ::SetForegroundWindow(fullscreenHwnd);
+		::SetFocus(fullscreenHwnd);
+		DebugLog::Log(
+			"Fullscreen presentation activation: target=%p requested=%d foreground=%p acquired=%d",
+			reinterpret_cast<void*>(fullscreenHwnd), activated ? 1 : 0,
+			reinterpret_cast<void*>(::GetForegroundWindow()),
+			::GetForegroundWindow() == fullscreenHwnd ? 1 : 0);
+	}
 
 	// One normal delayed focus pass gives the renderer and the shell time to
-	// finish fullscreen creation. It is not retried or coupled to Config.
+	// finish fullscreen creation. It corrects placement only; activation above
+	// remains the one user-initiated fullscreen focus handoff.
 	SetTimer(FULLSCREEN_FOCUS_TIMER_ID, 5000, nullptr);
 }
 
@@ -10393,9 +10641,83 @@ bool CVideoProcessorDlg::BuildPushVideoState()
 }
 
 DisplayRuleExpression::ValueLookup
-CVideoProcessorDlg::GetUnifiedProfileSourceLookup() const
+CVideoProcessorDlg::GetUnifiedProfileSourceLookup()
 {
-	return StateVariables::VideoStateLookup(m_builtVideoState);
+	const DisplayRuleExpression::ValueLookup sourceValues =
+		StateVariables::VideoStateLookup(m_builtVideoState);
+	CString rendererName = m_activeRendererName;
+	const int selectedRenderer = m_rendererCombo.GetCurSel();
+	if (selectedRenderer >= 0)
+		m_rendererCombo.GetLBText(selectedRenderer, rendererName);
+
+	HWND displayWindow = nullptr;
+	if (m_fullScreenVideoWindow &&
+		IsWindow(m_fullScreenVideoWindow->GetHWND()))
+	{
+		displayWindow = m_fullScreenVideoWindow->GetHWND();
+	}
+	else if (m_windowedVideoWindow.GetSafeHwnd())
+	{
+		displayWindow = m_windowedVideoWindow.GetSafeHwnd();
+	}
+	else
+	{
+		displayWindow = GetSafeHwnd();
+	}
+	const double actualRefreshRate = GetActiveTargetRefreshRate(displayWindow);
+	const std::string renderer = CStringA(rendererName).GetString();
+	return [sourceValues, renderer, actualRefreshRate](const std::string& name,
+		std::string& value)
+	{
+		if (name == "renderer")
+		{
+			if (renderer.empty()) return false;
+			value = renderer;
+			return true;
+		}
+		if (name == "actual_refresh")
+		{
+			if (actualRefreshRate <= 0.0) return false;
+			std::ostringstream refresh;
+			refresh.imbue(std::locale::classic());
+			refresh.precision(17);
+			refresh << actualRefreshRate;
+			value = refresh.str();
+			return true;
+		}
+		return sourceValues(name, value);
+	};
+}
+
+void CVideoProcessorDlg::RefreshUnifiedProfilesForRuleContext(
+	const char* reason)
+{
+	if (!m_profileRuntime.IsInitialized())
+		return;
+
+	const auto previousSnapshot = m_profileRuntime.GetSnapshot();
+	UnifiedProfileRuntime::RefreshResult result;
+	std::string error;
+	if (!m_profileRuntime.Refresh(GetUnifiedProfileSourceLookup(), result, error))
+	{
+		DebugLog::Log("Unified profile rule-context refresh failed: reason=%s detail=%s",
+			reason ? reason : "unknown", error.c_str());
+		return;
+	}
+	if (!result.changed)
+		return;
+
+	DebugLog::Log("Unified profile rule-context changed: reason=%s generation=%llu",
+		reason ? reason : "unknown",
+		static_cast<unsigned long long>(result.snapshot ? result.snapshot->generation : 0));
+	const bool queueProfileReset = previousSnapshot && result.snapshot &&
+		!result.snapshot->queue.profile.empty() &&
+		previousSnapshot->queue.profile != result.snapshot->queue.profile;
+	ApplyUnifiedProfileSnapshot(result.snapshot, true, queueProfileReset);
+	if (queueProfileReset)
+		QueueUnifiedQueueProfileReset(result.snapshot,
+			"rule-context:" + std::string(reason ? reason : "unknown"));
+	ScheduleUnifiedProfileActions(result.actions);
 }
 
 void CVideoProcessorDlg::PublishActiveProfileStatus()
@@ -10422,11 +10744,40 @@ void CVideoProcessorDlg::PublishActiveProfileStatus()
 
 void CVideoProcessorDlg::ApplyUnifiedProfileSnapshot(
 	const std::shared_ptr<const UnifiedProfileRuntime::Snapshot>& snapshot,
-	bool allowRestart, bool queueProfileRestart)
+	bool allowRestart, bool queueProfileResetPending)
 {
 	if (!snapshot)
 		return;
 	PublishActiveProfileStatus();
+
+	// A paired renderer/profile shortcut can commit a new queue while the old
+	// renderer is being retired. In particular, a DirectShow graph owns madVR's
+	// filter callbacks until its asynchronous teardown completes. Do not mutate
+	// that old graph with settings meant for the selected replacement renderer.
+	// The committed snapshot is retained by m_profileRuntime and is applied when
+	// the fresh renderer is constructed below the lifecycle boundary.
+	CString selectedRendererName;
+	const int selectedRenderer = m_rendererCombo.GetCurSel();
+	if (selectedRenderer >= 0)
+		m_rendererCombo.GetLBText(selectedRenderer, selectedRendererName);
+	const bool selectedRendererDiffers = m_videoRenderer &&
+		!selectedRendererName.IsEmpty() &&
+		!m_activeRendererName.IsEmpty() &&
+		selectedRendererName.CompareNoCase(m_activeRendererName) != 0;
+	if (m_rendererState == RendererState::RENDERSTATE_STOPPING ||
+		selectedRendererDiffers)
+	{
+		DebugLog::Log(
+			"Unified profile application deferred: renderer_state=%d active=%S selected=%S queue=%s reason=renderer-transition",
+			static_cast<int>(m_rendererState),
+			m_activeRendererName.IsEmpty() ? L"(none)" :
+				m_activeRendererName.GetString(),
+			selectedRendererName.IsEmpty() ? L"(none)" :
+				selectedRendererName.GetString(),
+			snapshot->queue.profile.empty() ? "(none)" :
+				snapshot->queue.profile.c_str());
+		return;
+	}
 
 	bool lldvPolicyChanged = false;
 	if (!snapshot->lldv.profile.empty())
@@ -10572,7 +10923,7 @@ void CVideoProcessorDlg::ApplyUnifiedProfileSnapshot(
 
 	DebugLog::Log("Applied unified profile state: %s",
 		CStringA(activeState).GetString());
-	if (allowRestart && rendererRestartRequired && !queueProfileRestart)
+	if (allowRestart && rendererRestartRequired && !queueProfileResetPending)
 	{
 		if (m_rendererFullscreenCheck.GetCheck() && m_fullScreenVideoWindow &&
 			IsWindow(m_fullScreenVideoWindow->GetHWND()))
@@ -10588,54 +10939,54 @@ void CVideoProcessorDlg::ApplyUnifiedProfileSnapshot(
 		m_wantToRestartRenderer = true;
 		UpdateState();
 	}
-	else if (allowRestart && liveResetRequired && !queueProfileRestart)
+	else if (allowRestart && liveResetRequired && !queueProfileResetPending)
 	{
 		DebugLog::Log(
 			"Rendering profile applied live; requesting cache-preserving queue reset");
 		RequestRendererReset(RendererResetReason::ProfileChange, false, 0);
 	}
-	else if (allowRestart && queuePolicyChanged && !queueProfileRestart)
+	else if (allowRestart && queuePolicyChanged && !queueProfileResetPending)
 	{
-		const bool requiresGraph = QueuePolicyApplyRequiresGraphReset(
-			m_activeRendererIsDirectShow);
+		const UINT delayMs = static_cast<UINT>(
+			(std::max)(0, m_queueResetDelaySeconds)) * 1000;
 		DebugLog::Log(
-			"Queue policy apply reset selected: backend=%s scope=%s renderer_reconstruction=0",
-			m_activeRendererIsDirectShow ? "DirectShow" : "Alpha",
-			requiresGraph ? "graph" : "live-queue");
-		RequestRendererReset(RendererResetReason::QueueSizeChange,
-			requiresGraph, 0);
+			"Queue policy apply reset selected: backend=%s scope=manual-graph "
+			"delay=%u",
+			m_activeRendererIsDirectShow ? "DirectShow/madVR" : "VP Renderer",
+			delayMs);
+		RequestRendererReset(RendererResetReason::Manual, true, delayMs);
 	}
 }
 
 
-void CVideoProcessorDlg::QueueUnifiedQueueProfileRendererRestart(
+void CVideoProcessorDlg::QueueUnifiedQueueProfileReset(
 	const std::shared_ptr<const UnifiedProfileRuntime::Snapshot>& snapshot,
 	const std::string& source)
 {
 	if (!snapshot)
 		return;
 	const QueueProfileRestartPolicy::EnqueueResult result =
-		QueueProfileRestartPolicy::Enqueue(m_queueProfileRestartRequest,
+		QueueProfileRestartPolicy::Enqueue(m_queueProfileResetRequest,
 			snapshot->generation, snapshot->queue.profile, source);
 	if (result == QueueProfileRestartPolicy::EnqueueResult::Ignored)
 		return;
 	DebugLog::Log(
-		"Queue profile restart: profile=%s source=%s generation=%llu outcome=%s "
+		"Queue profile reset: profile=%s source=%s generation=%llu outcome=%s "
 		"action=awaiting-selection-settle",
 		snapshot->queue.profile.c_str(), source.c_str(),
 		static_cast<unsigned long long>(snapshot->generation),
 		result == QueueProfileRestartPolicy::EnqueueResult::Coalesced ?
 			"coalesced" : "queued");
-	KillTimer(QUEUE_PROFILE_RESTART_TIMER_ID);
-	SetTimer(QUEUE_PROFILE_RESTART_TIMER_ID,
-		QUEUE_PROFILE_RESTART_DEBOUNCE_MS, nullptr);
+	KillTimer(QUEUE_PROFILE_RESET_TIMER_ID);
+	SetTimer(QUEUE_PROFILE_RESET_TIMER_ID,
+		QUEUE_PROFILE_RESET_DEBOUNCE_MS, nullptr);
 }
 
 
-void CVideoProcessorDlg::DispatchQueuedQueueProfileRendererRestart()
+void CVideoProcessorDlg::DispatchQueuedQueueProfileReset()
 {
 	QueueProfileRestartPolicy::PendingRequest request;
-	if (!QueueProfileRestartPolicy::Consume(m_queueProfileRestartRequest,
+	if (!QueueProfileRestartPolicy::Consume(m_queueProfileResetRequest,
 		request))
 		return;
 	const auto currentSnapshot = m_profileRuntime.GetSnapshot();
@@ -10644,9 +10995,11 @@ void CVideoProcessorDlg::DispatchQueuedQueueProfileRendererRestart()
 		currentSnapshot->queue.profile : request.profile;
 	if (!m_videoRenderer)
 	{
+		QueueProfileRestartPolicy::Enqueue(m_queueProfileResetRequest,
+			request.snapshotGeneration, profile, request.source);
 		DebugLog::Log(
-			"Queue profile restart: profile=%s source=%s generation=%llu "
-			"outcome=not-required action=fresh-renderer-uses-committed-profile",
+			"Queue profile reset: profile=%s source=%s generation=%llu "
+			"outcome=deferred action=await-renderer-ready",
 			profile.c_str(), request.source.c_str(),
 			static_cast<unsigned long long>(request.snapshotGeneration));
 		return;
@@ -10654,55 +11007,86 @@ void CVideoProcessorDlg::DispatchQueuedQueueProfileRendererRestart()
 	if (m_rendererState == RendererState::RENDERSTATE_FAILED)
 	{
 		DebugLog::Log(
-			"Queue profile restart: profile=%s source=%s generation=%llu "
+			"Queue profile reset: profile=%s source=%s generation=%llu "
 			"outcome=failed action=resolve-renderer-error-then-use-Restart-Renderer",
 			profile.c_str(), request.source.c_str(),
 			static_cast<unsigned long long>(request.snapshotGeneration));
-		m_rendererStateText.SetWindowText(TEXT("Queue profile restart unavailable"));
+		m_rendererStateText.SetWindowText(TEXT("Queue profile reset unavailable"));
 		m_windowedVideoWindow.SetWindowText(
-			TEXT("Queue profile applied. Resolve the renderer error, then use Restart Renderer."));
+			TEXT("Queue profile applied. Resolve the renderer error, then use Reset queues."));
 		return;
 	}
-
-	m_queueProfileRestartCompletionPending = true;
-	m_queueProfileRestartStartingGeneration =
-		m_rendererGeneration.load(std::memory_order_acquire);
-	m_queueProfileRestartCompletionProfile = profile;
-	m_queueProfileRestartCompletionSource = request.source;
 	if (m_rendererState != RendererState::RENDERSTATE_RENDERING ||
 		m_wantToRestartRenderer)
 	{
+		QueueProfileRestartPolicy::Enqueue(m_queueProfileResetRequest,
+			request.snapshotGeneration, profile, request.source);
 		DebugLog::Log(
-			"Queue profile restart: profile=%s source=%s generation=%llu "
-			"outcome=coalesced-with-renderer-lifecycle state=%d restart_pending=%d",
+			"Queue profile reset: profile=%s source=%s generation=%llu "
+			"outcome=deferred action=await-renderer-ready state=%d restart_pending=%d",
 			profile.c_str(), request.source.c_str(),
 			static_cast<unsigned long long>(request.snapshotGeneration),
 			static_cast<int>(m_rendererState), m_wantToRestartRenderer ? 1 : 0);
 		return;
 	}
 
-	if (m_rendererFullscreenCheck.GetCheck() && m_fullScreenVideoWindow &&
-		IsWindow(m_fullScreenVideoWindow->GetHWND()))
-	{
-		m_preserveFullscreenHostForProfileRestart = true;
-		DebugLog::Log(
-			"Queue profile restart: preserving fullscreen host hwnd=%p",
-			m_fullScreenVideoWindow->GetHWND());
-	}
-	m_postRendererStartRequiresGraph = false;
-	m_wantToRestartRenderer = true;
-	const RendererRestartDispatch dispatch = ClassifyRendererRestartDispatch(
-		m_rendererConstructionActive, m_rendererRetirementPending);
+	const UINT delayMs = static_cast<UINT>(
+		(std::max)(0, m_queueResetDelaySeconds)) * 1000;
 	DebugLog::Log(
-		"Queue profile restart: profile=%s source=%s generation=%llu backend=%s "
-		"outcome=%s action=controlled-renderer-restart",
+		"Queue profile reset: profile=%s source=%s generation=%llu backend=%s "
+		"action=manual-queue-reset delay=%u",
 		profile.c_str(), request.source.c_str(),
 		static_cast<unsigned long long>(request.snapshotGeneration),
 		m_activeRendererIsDirectShow ? "DirectShow/madVR" : "VP Renderer",
-		dispatch == RendererRestartDispatch::DispatchNow ?
-			"restart-requested" : "coalesced-with-lifecycle-boundary");
-	if (dispatch == RendererRestartDispatch::DispatchNow)
-		UpdateState();
+		delayMs);
+	// Match the operator's lowercase r reset command exactly, but let the selected queue
+	// profile's configured reset delay provide the settling interval.
+	RequestRendererReset(RendererResetReason::Manual, true, delayMs);
+}
+
+
+void CVideoProcessorDlg::OnCommandReapplyRules()
+{
+	if (!m_profileRuntime.IsInitialized())
+	{
+		DebugLog::Log("Re-apply rules ignored: unified profile runtime is unavailable");
+		return;
+	}
+
+	const auto previousSnapshot = m_profileRuntime.GetSnapshot();
+	UnifiedProfileRuntime::RefreshResult result;
+	std::vector<std::string> clearedGroups;
+	std::string error;
+	if (!m_profileRuntime.ReapplyRules(GetUnifiedProfileSourceLookup(), result,
+		clearedGroups, error))
+	{
+		DebugLog::Log("Re-apply rules failed: %s", error.c_str());
+		return;
+	}
+
+	std::ostringstream cleared;
+	for (size_t index = 0; index < clearedGroups.size(); ++index)
+	{
+		if (index != 0)
+			cleared << ',';
+		cleared << clearedGroups[index];
+	}
+	const bool queueProfileReset = previousSnapshot && result.snapshot &&
+		!result.snapshot->queue.profile.empty() &&
+		previousSnapshot->queue.profile != result.snapshot->queue.profile;
+	DebugLog::Log(
+		"Profile rules re-applied: cleared_overrides=%s changed=%d queue=%s->%s",
+		clearedGroups.empty() ? "none" : cleared.str().c_str(),
+		result.changed ? 1 : 0,
+		previousSnapshot ? previousSnapshot->queue.profile.c_str() : "none",
+		result.snapshot ? result.snapshot->queue.profile.c_str() : "none");
+	if (!result.changed)
+		return;
+
+	ApplyUnifiedProfileSnapshot(result.snapshot, true, queueProfileReset);
+	if (queueProfileReset)
+		QueueUnifiedQueueProfileReset(result.snapshot, "reapply-rules");
+	ScheduleUnifiedProfileActions(result.actions);
 }
 
 
@@ -11962,6 +12346,7 @@ void CVideoProcessorDlg::OnDisplayChange(UINT bitsPerPixel, int width, int heigh
 	else if (m_windowedVideoWindow.GetSafeHwnd())
 		displayWindow = m_windowedVideoWindow.GetSafeHwnd();
 	const double configuredRefreshRate = GetActiveTargetRefreshRate(displayWindow);
+	RefreshUnifiedProfilesForRuleContext("display-refresh-change");
 	const double previousRefreshRate = m_lastAlphaTargetRefreshRateHz;
 	const bool materiallyDifferentRefreshFamily =
 		previousRefreshRate > 0.0 && configuredRefreshRate > 0.0 &&
@@ -12171,10 +12556,10 @@ void CVideoProcessorDlg::OnTimer(UINT_PTR nIDEvent)
 		return;
 	}
 
-	if (nIDEvent == QUEUE_PROFILE_RESTART_TIMER_ID)
+	if (nIDEvent == QUEUE_PROFILE_RESET_TIMER_ID)
 	{
-		KillTimer(QUEUE_PROFILE_RESTART_TIMER_ID);
-		DispatchQueuedQueueProfileRendererRestart();
+		KillTimer(QUEUE_PROFILE_RESET_TIMER_ID);
+		DispatchQueuedQueueProfileReset();
 		return;
 	}
 
@@ -12371,9 +12756,9 @@ void CVideoProcessorDlg::OnTimer(UINT_PTR nIDEvent)
 		return;
 	}
 	
-	// Correct fullscreen placement after the shell/display settles. Renderer
-	// input activation belongs to the renderer's own lifecycle and HWND thread;
-	// this host-only timer must never take keyboard focus.
+	// Correct fullscreen placement after the shell/display settles. The direct
+	// fullscreen transition already activated the presentation target; this
+	// host-only timer must never take keyboard focus later.
 	if (nIDEvent == FULLSCREEN_FOCUS_TIMER_ID)
 	{
 		KillTimer(FULLSCREEN_FOCUS_TIMER_ID);
@@ -13522,6 +13907,9 @@ void CVideoProcessorDlg::UpdateStatsOverlay()
 
 	StatsData stats;
 	stats.outputSweep = m_activeOutputSweepStatus;
+	stats.surfaceMode = m_fullScreenVideoWindow &&
+		::IsWindow(m_fullScreenVideoWindow->GetHWND()) ?
+		TEXT("Fullscreen") : TEXT("Windowed");
 	const IVideoRenderer* const statsRenderer = m_videoRenderer.get();
 	const bool sameStatsTelemetryGeneration = statsRenderer != nullptr &&
 		statsRenderer == m_lastStatsTelemetryRenderer &&
@@ -13688,6 +14076,11 @@ void CVideoProcessorDlg::UpdateStatsOverlay()
 		stats.activeShaderRule = m_videoRenderer->ActiveShaderRule();
 		stats.activeShaders = m_videoRenderer->ActiveShaders();
 	}
+	// A graph reset can briefly make the renderer non-rendering while the same
+	// renderer and host generation still own the output contract. Do not let
+	// that diagnostics-only interval erase the last negotiated OSD value.
+	if (stats.outputMode.IsEmpty() && sameStatsTelemetryGeneration)
+		stats.outputMode = m_lastStatsData->outputMode;
 
 	// Capture device frame counts
 	if (m_captureDeviceState == CaptureDeviceState::CAPTUREDEVICESTATE_CAPTURING && m_captureDevice)
