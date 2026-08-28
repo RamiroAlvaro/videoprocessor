@@ -1,0 +1,291 @@
+name: Build VideoProcessor v1.3.001-beta
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show source revision
+        shell: pwsh
+        run: |
+          git log -1 --oneline
+          git status
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install required Visual Studio components
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          $installPath = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.Component.MSBuild `
+            -property installationPath
+
+          if (-not $installPath) {
+            throw "Visual Studio installation not found"
+          }
+
+          Write-Host "Visual Studio installation: $installPath"
+
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+
+          $arguments = @(
+            "modify",
+            "--installPath", "`"$installPath`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.MFC",
+            "--add", "Microsoft.VisualStudio.Component.Windows10SDK.19041",
+            "--add", "Microsoft.VisualStudio.Component.Windows11SDK.26100",
+            "--quiet",
+            "--norestart"
+          )
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList $arguments `
+            -Wait `
+            -PassThru
+
+          Write-Host "Visual Studio Installer exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+            throw "Visual Studio Installer failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Show MSBuild version
+        shell: pwsh
+        run: |
+          msbuild -version
+
+      - name: Install Qt 6.8.3 for Config editor
+        shell: pwsh
+        run: |
+          .\scripts\bootstrap-config-editor-qt.ps1
+
+      - name: Build VideoProcessor GUI x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Build VP Renderer x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Build Config Discovery x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\src\VideoProcessor-ConfigDiscovery\VideoProcessor-ConfigDiscovery.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Build Config Editor x64 Release
+        shell: pwsh
+        run: |
+          msbuild .\src\VideoProcessor-Config\VideoProcessor-Config.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Prepare canonical build root
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $buildRoot = Join-Path $env:GITHUB_WORKSPACE "x64\Release"
+
+          if (Test-Path $buildRoot) {
+            Remove-Item $buildRoot -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+          Write-Host "Finding VideoProcessor GUI..."
+
+          $gui = Get-ChildItem . `
+            -Filter "VideoProcessor-GUI.exe" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $gui) {
+            $gui = Get-ChildItem . `
+              -Filter "VideoProcessor.exe" `
+              -File `
+              -Recurse |
+              Select-Object -First 1
+          }
+
+          if (-not $gui) {
+            throw "VideoProcessor GUI executable not found"
+          }
+
+          Copy-Item `
+            $gui.FullName `
+            (Join-Path $buildRoot "VideoProcessor-GUI.exe") `
+            -Force
+
+          Write-Host "Finding Config editor..."
+
+          $configExe = Get-ChildItem .\src\VideoProcessor-Config `
+            -Filter "VideoProcessorConfig.exe" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $configExe) {
+            throw "VideoProcessorConfig.exe not found"
+          }
+
+          $configDir = $configExe.Directory.FullName
+
+          Write-Host "Config runtime directory:"
+          Write-Host $configDir
+
+          Copy-Item `
+            $configExe.FullName `
+            (Join-Path $buildRoot "VideoProcessorConfig.exe") `
+            -Force
+
+          $discovery = Get-ChildItem $configDir `
+            -Filter "VideoProcessorConfigDiscovery.dll" `
+            -File |
+            Select-Object -First 1
+
+          if (-not $discovery) {
+            $discovery = Get-ChildItem .\src\VideoProcessor-ConfigDiscovery `
+              -Filter "VideoProcessorConfigDiscovery.dll" `
+              -File `
+              -Recurse |
+              Select-Object -First 1
+          }
+
+          if (-not $discovery) {
+            throw "VideoProcessorConfigDiscovery.dll not found"
+          }
+
+          Copy-Item `
+            $discovery.FullName `
+            (Join-Path $buildRoot "VideoProcessorConfigDiscovery.dll") `
+            -Force
+
+          Get-ChildItem $configDir -Filter "Qt6*.dll" -File |
+            ForEach-Object {
+              Copy-Item $_.FullName $buildRoot -Force
+            }
+
+          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) {
+            Copy-Item `
+              (Join-Path $configDir "opengl32sw.dll") `
+              $buildRoot `
+              -Force
+          }
+
+          $qtPluginDirs = @(
+            "generic",
+            "iconengines",
+            "imageformats",
+            "networkinformation",
+            "platforms",
+            "styles",
+            "tls"
+          )
+
+          foreach ($dir in $qtPluginDirs) {
+            $source = Join-Path $configDir $dir
+
+            if (Test-Path $source) {
+              Copy-Item `
+                $source `
+                (Join-Path $buildRoot $dir) `
+                -Recurse `
+                -Force
+            }
+          }
+
+          Write-Host "Finding VP Renderer plugin..."
+
+          $renderer = Get-ChildItem . `
+            -Filter "VideoProcessorVPRenderer.dll" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $renderer) {
+            throw "VideoProcessorVPRenderer.dll not found"
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path (Join-Path $buildRoot "vprenderer") `
+            -Force | Out-Null
+
+          Copy-Item `
+            $renderer.FullName `
+            (Join-Path $buildRoot "vprenderer\VideoProcessorVPRenderer.dll") `
+            -Force
+
+          Write-Host "=== Canonical build root ==="
+
+          Get-ChildItem $buildRoot -Recurse |
+            Select-Object FullName
+
+      - name: Build official release package
+        shell: pwsh
+        run: |
+          .\tools\package_release.ps1
+
+      - name: Show official release tree
+        shell: pwsh
+        run: |
+          Get-ChildItem `
+            .\artifacts\release\VideoProcessor `
+            -Recurse |
+            Select-Object FullName
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path .\artifacts\release\VideoProcessor\* `
+            -DestinationPath .\VideoProcessor-v1.3.001-beta-x64.zip `
+            -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoProcessor-v1.3.001-beta-x64
+          path: VideoProcessor-v1.3.001-beta-x64.zip
+          retention-days: 14
