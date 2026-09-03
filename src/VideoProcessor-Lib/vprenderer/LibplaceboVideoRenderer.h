@@ -57,6 +57,8 @@ public:
 	bool FinalizeRetirementForShutdown() noexcept override;
 	void Reset() override;
 	void ResetLiveQueue() override;
+	void SetPostStallResetTelemetrySuppressedUntil(
+		uint64_t tick) override;
 	void OnSize() override;
 	void OnPaint() override;
 	void OnDisplayChange() override;
@@ -140,7 +142,8 @@ private:
 	void StopInternal(const std::function<void()>& drainAfterGraphStop);
 	void AnalyzeActivePictureLookahead(
 		std::vector<QueuedFrame>& previewFrames,
-		uint8_t availableLookahead);
+		uint8_t availableLookahead,
+		uint64_t lookaheadPolicyGeneration);
 	void ClearQueue(const char* reason = "queue clear");
 	void BeginQueueGeneration(const char* reason, bool clearStopRequest = false);
 	void ClearQueueLocked(const char* reason);

@@ -72,7 +72,20 @@ namespace
 				right.viewport.cropWiderContentAspectLimit.numerator &&
 			left.viewport.cropWiderContentAspectLimit.denominator ==
 				right.viewport.cropWiderContentAspectLimit.denominator &&
+			left.viewport.hasFixedCropAspect == right.viewport.hasFixedCropAspect &&
+			left.viewport.fixedCropAspect.numerator ==
+				right.viewport.fixedCropAspect.numerator &&
+			left.viewport.fixedCropAspect.denominator ==
+				right.viewport.fixedCropAspect.denominator &&
 			left.viewport.subtitleFit == right.viewport.subtitleFit &&
+			left.viewport.hdrPeakAnalysisPictureOnly ==
+				right.viewport.hdrPeakAnalysisPictureOnly &&
+			left.viewport.hdrPeakAnalysisMotionCompensation ==
+				right.viewport.hdrPeakAnalysisMotionCompensation &&
+			left.viewport.hdrPeakAnalysisHeightPercent ==
+				right.viewport.hdrPeakAnalysisHeightPercent &&
+			left.viewport.hdrPeakAnalysisPosition ==
+				right.viewport.hdrPeakAnalysisPosition &&
 			left.viewport.subtitleHoldMilliseconds ==
 				right.viewport.subtitleHoldMilliseconds &&
 			left.viewport.subtitleEngageDriftMilliseconds ==
@@ -430,6 +443,63 @@ namespace UnifiedProfileRuntime
 			"unified profile key=%s viewport=%s aspect=%s generation=%llu",
 			key.c_str(), candidate->viewport.profile.c_str(),
 			candidate->viewport.screenAspect.Canonical().c_str(),
+			static_cast<unsigned long long>(candidate->generation));
+		return true;
+	}
+
+	bool Runtime::SelectCycleKey(const std::string& key,
+		const DisplayRuleExpression::ValueLookup& sourceValues,
+		SelectionResult& result, std::string& error)
+	{
+		std::lock_guard<std::mutex> guard(m_mutex);
+		result = {};
+		error.clear();
+		if (!m_initialized)
+		{
+			error = "unified profile runtime is not initialized";
+			return false;
+		}
+		const DisplayRuleExpression::ValueLookup values = sourceValues ? sourceValues :
+			[](const std::string&, std::string&) { return false; };
+		const std::shared_ptr<const Snapshot> current = std::atomic_load(&m_snapshot);
+		const std::map<std::string, std::string> currentSelections = current ?
+			current->effectiveSelections : std::map<std::string, std::string>();
+		if (!RendererProfileConfig::SelectCycleForKey(m_model, key,
+			currentSelections, result.selections, error))
+			return false;
+		if (result.selections.empty())
+		{
+			result.snapshot = current;
+			return true;
+		}
+		std::map<std::string, std::string> manual = current ? current->manualSelections :
+			std::map<std::string, std::string>();
+		std::set<std::string> sessionOverrides = m_sessionOverrideGroups;
+		for (const RendererProfileConfig::KeySelection& selection : result.selections)
+		{
+			manual[selection.group] = selection.profile;
+			sessionOverrides.insert(selection.group);
+		}
+		std::shared_ptr<const Snapshot> candidate;
+		if (!BuildSnapshot(manual, sessionOverrides, values, m_generation + 1,
+			candidate, error))
+			return false;
+		const bool overrideStateChanged = sessionOverrides != m_sessionOverrideGroups;
+		if (current && SameEffectiveState(*current, *candidate) && !overrideStateChanged)
+		{
+			result.snapshot = current;
+			return true;
+		}
+		if (!CollectTransitionActionInvocations(current, candidate, "cycle", result.actions, error))
+			return false;
+		if (m_model.persistSelection && !PersistSelections(manual, error))
+			return false;
+		++m_generation;
+		m_sessionOverrideGroups = std::move(sessionOverrides);
+		std::atomic_store(&m_snapshot, candidate);
+		result.changed = true;
+		result.snapshot = candidate;
+		DebugLog::Log("unified profile cycle key=%s generation=%llu", key.c_str(),
 			static_cast<unsigned long long>(candidate->generation));
 		return true;
 	}
@@ -861,8 +931,22 @@ namespace UnifiedProfileRuntime
 			variables["crop_wider_content_aspect_limit"] =
 				StateVariables::Value::Aspect(
 					viewport.cropWiderContentAspectLimit);
+		if (viewport.hasFixedCropAspect)
+			variables["fixed_crop_aspect"] = StateVariables::Value::Aspect(
+				viewport.fixedCropAspect);
 		variables["subtitle_fit"] =
 			StateVariables::Value::Boolean(viewport.subtitleFit);
+		variables["hdr_peak_analysis_picture_only"] =
+			StateVariables::Value::Boolean(
+				viewport.hdrPeakAnalysisPictureOnly);
+		variables["hdr_peak_analysis_motion_compensation"] =
+			StateVariables::Value::Boolean(
+				viewport.hdrPeakAnalysisMotionCompensation);
+		variables["hdr_peak_analysis_height_percent"] =
+			StateVariables::Value::Number(
+				static_cast<double>(viewport.hdrPeakAnalysisHeightPercent));
+		variables["hdr_peak_analysis_position"] =
+			StateVariables::Value::Text(viewport.hdrPeakAnalysisPosition);
 		variables["subtitle_hold_seconds"] =
 			StateVariables::Value::Number(
 				viewport.subtitleHoldMilliseconds / 1000.0);

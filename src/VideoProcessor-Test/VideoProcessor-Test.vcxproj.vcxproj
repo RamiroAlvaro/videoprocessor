@@ -179,6 +179,9 @@
     <ClCompile Include="AlphaSourceCropPolicyTests.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="HdrPeakAnalysisCropTests.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="LibplaceboOutputPolicyTests.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
     </ClCompile>
@@ -210,6 +213,7 @@
 	<ClCompile Include="DisplayRefreshRateEstimatorTests.cpp" />
 	<ClCompile Include="DisplayRefreshRateWindowTests.cpp" />
     <ClCompile Include="AlphaQueuePolicyTests.cpp" />
+    <ClCompile Include="RendererPostStallResetAdvisorTests.cpp" />
     <ClCompile Include="MadVRShaderRuntimeStateTests.cpp" />
     <ClCompile Include="ActivePictureDecisionTimelineTests.cpp" />
     <ClCompile Include="LibplaceboPluginProxyTests.cpp" />

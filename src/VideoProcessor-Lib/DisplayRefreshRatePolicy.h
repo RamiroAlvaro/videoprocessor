@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 enum class DisplayRefreshRateDecision
 {
@@ -70,6 +71,40 @@ struct DisplayRefreshRational
 	uint32_t denominator = 0;
 };
 
+enum class DisplayRefreshModeSelectionPath
+{
+	None,
+	ExactOrClose,
+	ClosestInRange
+};
+
+struct DisplayRefreshModeSelection
+{
+	DisplayRefreshModeSelectionPath path =
+		DisplayRefreshModeSelectionPath::None;
+	DisplayRefreshRational selected{};
+	double requestedRateHz = 0.0;
+	double selectedRateHz = 0.0;
+	double differenceHz = 0.0;
+};
+
+enum class RefreshRateSwitchMode
+{
+	Never,
+	FullscreenOnly,
+	Always
+};
+
+double DisplayRefreshRateHz(const DisplayRefreshRational& rate);
+
+// Select a display mode in two intentional passes. The first pass accepts an
+// exactly equivalent rational or tight driver rounding. Only if that fails is
+// the closest cadence-family candidate accepted within the bounded fallback
+// window; this must not turn a 24 Hz source into an unrelated 50/60 Hz mode.
+DisplayRefreshModeSelection SelectDisplayRefreshMode(
+	const DisplayRefreshRational& requested,
+	const std::vector<DisplayRefreshRational>& candidates);
+
 bool DisplayRefreshRatesExactlyEqual(
 	const DisplayRefreshRational& first,
 	const DisplayRefreshRational& second);
@@ -81,6 +116,16 @@ bool DisplayRefreshRatesExactlyEqual(
 bool DisplayRefreshRatesEquivalentForRestore(
 	const DisplayRefreshRational& first,
 	const DisplayRefreshRational& second);
+
+// Refresh switching is display-global. Only a top-level presentation surface
+// may own that transition; an embedded preview must not change desktop timing
+// while a fullscreen renderer is being retired or replaced.
+bool ShouldSwitchRefreshRateForPresentationTarget(bool isChildWindow,
+	RefreshRateSwitchMode mode);
+
+// Compatibility overload for existing callers/tests: the former checked
+// setting maps to the new Fullscreen Only policy.
+bool ShouldSwitchRefreshRateForPresentationTarget(bool isChildWindow);
 
 class DisplayRefreshRestoreVerifier
 {

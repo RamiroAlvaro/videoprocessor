@@ -122,6 +122,15 @@ namespace VideoProcessorTest
 			}
 		}
 
+		TEST_METHOD(AnalysisCadenceRejectsRepeatedOrOutOfOrderSourceSequence)
+		{
+			ActivePictureTransitionModel model;
+			Assert::IsTrue(model.ShouldAnalyze(100, 60.0));
+			Assert::IsFalse(model.ShouldAnalyze(100, 60.0));
+			Assert::IsFalse(model.ShouldAnalyze(99, 60.0));
+			Assert::IsTrue(model.ShouldAnalyze(105, 60.0));
+		}
+
 		TEST_METHOD(InitialGeometryRequiresFourConsistentObservations)
 		{
 			ActivePictureTransitionModel model;
@@ -439,6 +448,10 @@ namespace VideoProcessorTest
 				ActivePictureClassification::PROVISIONAL);
 			Assert::IsTrue(reacquired.publish);
 			Assert::IsTrue(reacquired.stable);
+			Assert::IsTrue(reacquired.knownTrustedGeometryReacquired);
+			Assert::AreEqual(static_cast<int>(
+				ActivePictureClassification::BAR_CROP_TRUSTED),
+				static_cast<int>(reacquired.authoritativeClassification));
 			Assert::AreEqual(
 				static_cast<unsigned long long>(1),
 				static_cast<unsigned long long>(
@@ -473,6 +486,10 @@ namespace VideoProcessorTest
 			const auto confirmed = Observe(model, ScopeBounds(), frame + 1,
 				ActivePictureClassification::PROVISIONAL);
 			Assert::IsTrue(confirmed.publish);
+			Assert::IsTrue(confirmed.knownTrustedGeometryReacquired);
+			Assert::AreEqual(static_cast<int>(
+				ActivePictureClassification::BAR_CROP_TRUSTED),
+				static_cast<int>(confirmed.authoritativeClassification));
 			Assert::AreEqual(ScopeBounds().top, confirmed.bounds.top);
 			Assert::AreEqual(ScopeBounds().bottom, confirmed.bounds.bottom);
 		}
@@ -619,6 +636,12 @@ namespace VideoProcessorTest
 			Assert::IsTrue(probing.stable);
 			Assert::IsFalse(probing.clearTransition);
 			Assert::AreEqual(ScopeBounds().top, probing.stableBounds.top);
+
+			const auto repeated = Observe(model, full, frame,
+				ActivePictureClassification::FULL_RASTER_TRUSTED);
+			Assert::IsFalse(repeated.publish);
+			Assert::AreEqual(1U,
+				static_cast<unsigned int>(repeated.matchingCandidates));
 
 			const auto confirmed = Observe(model, full, frame + 1,
 				ActivePictureClassification::FULL_RASTER_TRUSTED);
@@ -799,6 +822,11 @@ namespace VideoProcessorTest
 				ActivePictureClassification::FULL_RASTER_TRUSTED);
 			Assert::IsFalse(beforeCut.publish);
 			model.ResetCandidateEvidence();
+			const auto repeatedCutFrame = Observe(model, full, frame - 1,
+				ActivePictureClassification::FULL_RASTER_TRUSTED);
+			Assert::IsFalse(repeatedCutFrame.publish);
+			Assert::AreEqual(0U, static_cast<unsigned int>(
+				repeatedCutFrame.matchingCandidates));
 
 			const auto firstAfterCut = Observe(model, full, frame++,
 				ActivePictureClassification::FULL_RASTER_TRUSTED);
@@ -809,6 +837,37 @@ namespace VideoProcessorTest
 			const auto secondAfterCut = Observe(model, full, frame,
 				ActivePictureClassification::FULL_RASTER_TRUSTED);
 			Assert::IsTrue(secondAfterCut.publish);
+			const auto repeatedPublication = Observe(model, full, frame,
+				ActivePictureClassification::FULL_RASTER_TRUSTED);
+			Assert::IsFalse(repeatedPublication.publish);
+			Assert::IsTrue(repeatedPublication.stable);
+		}
+
+		TEST_METHOD(BootstrapResetCannotAcquireFromPausedFrameDuplicates)
+		{
+			ActivePictureTransitionModel model;
+			const uint64_t pausedFrame = 5000;
+			const auto blocked = Observe(model, ScopeBounds(), pausedFrame,
+				ActivePictureClassification::PROVISIONAL);
+			Assert::IsFalse(blocked.publish);
+
+			model.ResetCandidateEvidence();
+			const auto duplicate = Observe(model, ScopeBounds(), pausedFrame,
+				ActivePictureClassification::BAR_CROP_TRUSTED);
+			Assert::IsFalse(duplicate.publish);
+			Assert::AreEqual(0U, static_cast<unsigned int>(
+				duplicate.matchingCandidates));
+
+			ActivePictureTransitionDecision acquired;
+			for (uint8_t count = 0;
+				count < ActivePictureTransitionModel::INITIAL_CONFIRMATIONS;
+				++count)
+			{
+				acquired = Observe(model, ScopeBounds(),
+					pausedFrame + 1 + count);
+			}
+			Assert::IsTrue(acquired.publish);
+			Assert::IsTrue(acquired.stable);
 		}
 	};
 }

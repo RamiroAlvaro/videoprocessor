@@ -58,20 +58,22 @@ namespace VideoProcessorTest
 				TEXT("NOT_A_CONVERSION"), parsed));
 		}
 
-		TEST_METHOD(ModernOperatorBuildIdentityUsesBranchAndCommit)
+		TEST_METHOD(ModernOperatorBuildIdentityUsesBranchForCleanBuildsAndCommitForDirtyBuilds)
 		{
-			Assert::AreEqual(std::wstring(
-				L"codex/vp-0103-live-configuration @ 5be29d3"),
+			Assert::AreEqual(std::wstring(L"v1.3.003-beta"),
 				BuildIdentityPolicy::Format(
-					L" codex/vp-0103-live-configuration ",
-					L"5be29d3", L"v1.1.016-beta-60-g5be29d3"));
+					L" v1.3.003-beta ", L"9a5dd0b",
+					L"v1.1.016-beta-326-g9a5dd0b", false));
 			Assert::AreEqual(std::wstring(L"ci/merge @ abc1234"),
-				BuildIdentityPolicy::Format(L"ci/merge", L"abc1234", L"tag"));
+				BuildIdentityPolicy::Format(L"ci/merge", L"abc1234", L"tag", true));
+			Assert::AreEqual(std::wstring(L"v1.2.3-gabc1234"),
+				BuildIdentityPolicy::Format(L"", L"abc1234",
+					L"v1.2.3-gabc1234", false));
 			Assert::AreEqual(std::wstring(L"v1.2.3-gabc1234 @ abc1234"),
 				BuildIdentityPolicy::Format(L"", L"abc1234",
-					L"v1.2.3-gabc1234"));
+					L"v1.2.3-gabc1234", true));
 			Assert::AreEqual(std::wstring(L"detached"),
-				BuildIdentityPolicy::Format(L"", L"", L""));
+				BuildIdentityPolicy::Format(L"", L"", L"", false));
 		}
 
 		TEST_METHOD(FullscreenActivationNeverStealsAnotherProcessForeground)
@@ -2492,6 +2494,21 @@ namespace VideoProcessorTest
 			const uint64_t newColor = coalescer.Schedule(colorIdentity);
 			Assert::IsFalse(coalescer.Claim(colorIdentity, oldColor));
 			Assert::IsTrue(coalescer.Claim(colorIdentity, newColor));
+		}
+
+		TEST_METHOD(ProfileActionCircuitBreakerBoundsRecursiveLaunches)
+		{
+			using Decision = EventActionLauncher::ProfileActionCircuitBreaker::Decision;
+			EventActionLauncher::ProfileActionCircuitBreaker breaker;
+			for (uint64_t now : { 1000ull, 2000ull, 3000ull, 4000ull })
+				Assert::AreEqual(static_cast<int>(Decision::Allow),
+					static_cast<int>(breaker.BeginLaunch(now)));
+			Assert::AreEqual(static_cast<int>(Decision::Tripped),
+				static_cast<int>(breaker.BeginLaunch(5000)));
+			Assert::AreEqual(static_cast<int>(Decision::Suppressed),
+				static_cast<int>(breaker.BeginLaunch(12000)));
+			Assert::AreEqual(static_cast<int>(Decision::Allow),
+				static_cast<int>(breaker.BeginLaunch(15001)));
 		}
 
 		TEST_METHOD(ProfileChangeOverlayUsesFriendlyOrderedLabels)

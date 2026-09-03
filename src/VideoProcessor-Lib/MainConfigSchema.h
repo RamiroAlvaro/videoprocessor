@@ -98,7 +98,8 @@ namespace MainConfigSchema
 			ConfigSchema::Boolean("startminimized"),
 			ConfigSchema::Boolean("start_minimized"),
 			ConfigSchema::Any("capture_input"),
-			ConfigSchema::Boolean("switch_refresh_rate"),
+			ConfigSchema::Choice("switch_refresh_rate",
+				{ "true", "false", "never", "fullscreen_only", "full_screen_only", "always" }),
 			ConfigSchema::Boolean("persist_profile_selection"),
 			ConfigSchema::Integer("profile_change_display_seconds", 0, 60)
 		};
@@ -127,6 +128,7 @@ namespace MainConfigSchema
 		const std::vector<ConfigSchema::KeyRule> queueRules = {
 			ConfigSchema::Any("when"),
 			ConfigSchema::Any("shortcut"),
+			ConfigSchema::Any("cycle_shortcut"),
 			ConfigSchema::Integer("queue_size", 1, INT_MAX),
 			ConfigSchema::Integer("lead_frames", 0, 16),
 			ConfigSchema::Integer("target_frames", 0, 16),
@@ -289,6 +291,7 @@ namespace MainConfigSchema
 		const std::vector<ConfigSchema::KeyRule> lldvRules = {
 			ConfigSchema::Any("when"),
 			ConfigSchema::Any("shortcut"),
+			ConfigSchema::Any("cycle_shortcut"),
 			ConfigSchema::NumberAtLeast("max_cll", 0.0),
 			ConfigSchema::NumberAtLeast("max_fall", 0.0),
 			ConfigSchema::NumberAtLeast("mastering_min_luminance", 0.0),

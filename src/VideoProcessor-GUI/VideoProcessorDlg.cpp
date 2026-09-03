@@ -72,6 +72,18 @@ using Microsoft::WRL::ComPtr;
 constexpr wchar_t ConfigurationEditorRelativePath[] =
 	L"config\\VideoProcessorConfig.exe";
 
+CString FormatHdrLuminance(double value)
+{
+	// Keep the customary one decimal place, but retain meaningful precision
+	// for metadata such as a 0.001-nit mastering minimum.
+	CString text;
+	text.Format(_T("%.05f"), value);
+	text.TrimRight(_T('0'));
+	if (text[text.GetLength() - 1] == _T('.'))
+		text += _T('0');
+	return text;
+}
+
 void LogRendererResourceCensus(uint32_t generation, const CString& renderer,
 	uint64_t token)
 {
@@ -175,12 +187,25 @@ struct CaptureVideoStateNotification
 using ConfigurationSnapshot =
 	std::map<std::string, std::map<std::string, std::string>>;
 
+constexpr const char* kSnapshotSectionOrderKey = "\x1eprofile_section_order";
+
 ConfigurationSnapshot CaptureConfigurationSnapshot(const ConfigFile& config)
 {
 	ConfigurationSnapshot snapshot;
+	std::map<std::string, size_t> profileOrder;
 	for (const std::string& section : config.GetSectionNames())
 		if (const auto* values = config.GetSectionValues(section))
+		{
 			snapshot[section] = *values;
+			const std::string profileGroup =
+				ConfigurationApplyPolicy::OrderedProfileGroup(section);
+			if (!profileGroup.empty())
+			{
+				// Preserve executable profile precedence for live-apply comparison.
+				snapshot[section][kSnapshotSectionOrderKey] =
+					std::to_string(profileOrder[profileGroup]++);
+			}
+		}
 	return snapshot;
 }
 
@@ -450,6 +475,8 @@ const TCHAR* ToString(RendererResetReason reason)
 	case RendererResetReason::Manual: return TEXT("manual");
 	case RendererResetReason::PostRendererStart:
 		return TEXT("post-renderer-start");
+	case RendererResetReason::RendererSwitch:
+		return TEXT("renderer-switch");
 	case RendererResetReason::RefreshTransition:
 		return TEXT("refresh-transition");
 	case RendererResetReason::HostTransition:
@@ -855,6 +882,54 @@ HACCEL CreateConfiguredAccelerators(
 	// Shader-rule shortcuts live with their rule rather than in the fixed
 	// shortcut table. This permits any external shader chain to be selected at
 	// runtime without adding a new command or rebuilding the application.
+	// NLS modes are an ordered single-selection group. A cycle binding is
+	// represented as one selector carrying the participating sections; the
+	// command handler resolves the next section from the current selection.
+	if (hasMainConfig)
+	{
+		std::map<std::string, std::vector<std::string>> nlsCycles;
+		for (const std::string& section : mainConfig.GetSectionNames())
+		{
+			if (section != "shader.nls" && section.rfind("shader.nls.", 0) != 0)
+				continue;
+			std::string chord;
+			if (!mainConfig.TryGetString(section, "cycle_shortcut", chord) ||
+				ConfigFile::Trim(chord).empty()) continue;
+			std::string canonical;
+			if (!RendererProfileConfig::CanonicalizeKeyChord(chord, canonical))
+			{
+				if (rejectInvalidBindings) { failBinding("invalid NLS cycle shortcut in [" + section + "]"); return nullptr; }
+				continue;
+			}
+			nlsCycles[canonical].push_back(section);
+		}
+		WORD nextCommand = ID_COMMAND_SHADER_RULE_FIRST;
+		for (const auto& cycle : nlsCycles)
+		{
+			while (shaderShortcutRules.find(nextCommand) != shaderShortcutRules.end()) ++nextCommand;
+			if (nextCommand > ID_COMMAND_SHADER_RULE_LAST) break;
+			ACCEL accelerator = {};
+			if (!TryParseShortcut(cycle.first, accelerator)) continue;
+			const unsigned int binding = (static_cast<unsigned int>(accelerator.fVirt) << 16) | accelerator.key;
+			if (!bindings.insert(binding).second)
+			{
+				if (rejectInvalidBindings) { failBinding("duplicate NLS cycle shortcut " + cycle.first); return nullptr; }
+				continue;
+			}
+			accelerator.cmd = nextCommand;
+			accelerators.push_back(accelerator);
+			CString selector(TEXT("@shader-cycle:"));
+			for (size_t i = 0; i < cycle.second.size(); ++i)
+			{
+				if (i) selector += TEXT("|");
+				selector += CString(CStringA(cycle.second[i].c_str()));
+			}
+			shaderShortcutRules[nextCommand] = selector;
+			shaderShortcutKeys.insert(accelerator.key);
+			++nextCommand;
+		}
+	}
+
 	std::string ruleList;
 	if (hasMainConfig && mainConfig.TryGetString("shaders", "rules", ruleList))
 	{
@@ -863,6 +938,7 @@ HACCEL CreateConfiguredAccelerators(
 		WORD nextCommand = ID_COMMAND_SHADER_RULE_FIRST;
 		for (const std::string& configuredRule : SplitConfiguredList(ruleList))
 		{
+			while (shaderShortcutRules.find(nextCommand) != shaderShortcutRules.end()) ++nextCommand;
 			if (nextCommand > ID_COMMAND_SHADER_RULE_LAST)
 				break;
 			const std::string rule = ConfigFile::NormalizeName(configuredRule);
@@ -972,6 +1048,7 @@ HACCEL CreateConfiguredAccelerators(
 			}
 			for (const std::string& chord : expression.KeyChords())
 			{
+				while (shaderShortcutRules.find(nextCommand) != shaderShortcutRules.end()) ++nextCommand;
 				if (nextCommand > ID_COMMAND_SHADER_RULE_LAST)
 					break;
 				ACCEL accelerator = {};
@@ -5445,6 +5522,19 @@ void CVideoProcessorDlg::OnRendererDirectShowPrimariesSelected()
 void CVideoProcessorDlg::OnBnClickedRendererFullScreenCheck()
 {
 	DbgLog((LOG_TRACE, 1, TEXT("CVideoProcessorDlg::OnBnClickedRendererFullScreenCheck()")));
+	if (m_rendererFullscreenCheck.GetCheck())
+	{
+		m_fullscreenEntryTransitionPending = true;
+		DebugLog::Log(
+			"Transition reset detected: trigger=fullscreen-entry "
+			"state=awaiting-renderer-boundary delay=%d seconds "
+			"action=existing-auto-reset-before-post-stall-telemetry",
+			m_queueResetDelaySeconds);
+	}
+	else
+	{
+		m_fullscreenEntryTransitionPending = false;
+	}
 
 	if (m_fullscreenRetargetPending)
 	{
@@ -6185,24 +6275,79 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 		const bool postStartRequiresGraph =
 			m_postRendererStartRequiresGraph;
 		m_postRendererStartRequiresGraph = true;
+		const bool fullscreenEntryTransition =
+			m_fullscreenEntryTransitionPending;
+		const bool rendererSwitchTransition =
+			m_rendererSwitchTransitionPending;
+		m_fullscreenEntryTransitionPending = false;
+		m_rendererSwitchTransitionPending = false;
+		if (RendererGenerationGate::ConsumePostSwapRuleReapply(
+			m_rendererSwitchProfileReapplyGeneration,
+			messageGeneration, currentGeneration,
+			m_videoRenderer != nullptr,
+			m_rendererState == RendererState::RENDERSTATE_RENDERING))
+		{
+			DebugLog::Log(
+				"Post-swap profile rules reapply: renderer=%S generation=%u "
+				"state=running action=reapply-rules",
+				m_activeRendererName.GetString(), messageGeneration);
+			OnCommandReapplyRules();
+			if (m_rendererState != RendererState::RENDERSTATE_RENDERING ||
+				m_wantToRestartRenderer)
+			{
+				DebugLog::Log(
+					"Post-swap profile rules reapply: renderer=%S generation=%u "
+					"outcome=successor-restart-requested",
+					m_activeRendererName.GetString(), messageGeneration);
+				break;
+			}
+		}
 		if (m_activeRendererIsDirectShow)
 		{
-			// DirectShow now starts provisionally, then uses validated DXGI vblank
-			// evidence to make one serialized LiveQueue reset and exact VP prefill.
-			// Do not stack the legacy configured-delay reset behind it: that was the
-			// source of display-handshake-dependent queue depth.
-			DebugLog::Log(
-				"Post-start reset deferred: renderer=%S backend=DirectShow "
-				"legacy_requires_graph=%d display_settle=%u; "
-				"awaiting output-readiness evidence",
-				static_cast<LPCTSTR>(m_activeRendererName),
-				postStartRequiresGraph ? 1 : 0, windowSettleDelayMs);
+			if (fullscreenEntryTransition || rendererSwitchTransition)
+			{
+				const RendererResetReason transitionReason =
+					fullscreenEntryTransition ?
+						RendererResetReason::HostTransition :
+						RendererResetReason::RendererSwitch;
+				const UINT delayMs = static_cast<UINT>(
+					m_queueResetDelaySeconds * 1000);
+				const RendererResetCoordinator::SubmissionReceipt resetReceipt =
+					RequestRendererReset(transitionReason, true, delayMs);
+				const bool resetAccepted = resetReceipt.accepted;
+				if (resetAccepted)
+				{
+					m_videoRenderer->SetPostStallResetTelemetrySuppressedUntil(
+						GetTickCount64() + delayMs +
+							PostStallResetAdvisor::QUIET_WINDOW_MS);
+				}
+				DebugLog::Log(
+					"Transition reset armed: renderer=%S backend=DirectShow "
+					"trigger=%s delay=%ums scope=graph request=%s "
+					"action=existing-auto-reset-before-post-stall-telemetry",
+					static_cast<LPCTSTR>(m_activeRendererName),
+					fullscreenEntryTransition ? "fullscreen-entry" :
+						"renderer-switch",
+					delayMs, resetAccepted ? "accepted" : "covered-or-rejected");
+			}
+			else
+			{
+				// DirectShow starts provisionally, then uses validated DXGI vblank
+				// evidence to make one serialized graph reset and exact VP prefill.
+				DebugLog::Log(
+					"Post-start reset deferred: renderer=%S backend=DirectShow "
+					"legacy_requires_graph=%d display_settle=%u; "
+					"awaiting output-readiness evidence",
+					static_cast<LPCTSTR>(m_activeRendererName),
+					postStartRequiresGraph ? 1 : 0, windowSettleDelayMs);
+			}
 		}
 		else
 		{
 			const bool refreshTransition = m_alphaRefreshTransitionPending;
 			const bool hostTransition = m_alphaHostTransitionPending;
-			const bool backendHandoff = m_alphaBackendHandoffPending;
+			const bool backendHandoff = m_alphaBackendHandoffPending ||
+				rendererSwitchTransition;
 			const double previousRate = m_alphaRefreshTransitionPreviousRateHz;
 			const double currentRate = m_alphaRefreshTransitionCurrentRateHz;
 			m_alphaRefreshTransitionPending = false;
@@ -6216,22 +6361,45 @@ LRESULT CVideoProcessorDlg::OnMessageRendererStateChange(WPARAM wParam, LPARAM l
 
 			if (AlphaFreshStartRequiresDelayedReprime(freshStartTransition))
 			{
-				// A real cross-family refresh change is asynchronous outside Alpha.
-				// Preserve its one delayed queue-only cleanup so transition-era
-				// frames cannot survive the Windows/DXGI settling boundary.
-				RequestRendererReset(
-					RendererResetReason::RefreshTransition,
+				const RendererResetReason transitionReason =
+					freshStartTransition ==
+						AlphaFreshStartTransition::HostTransition ?
+						RendererResetReason::HostTransition :
+					freshStartTransition ==
+						AlphaFreshStartTransition::BackendHandoff ?
+						RendererResetReason::RendererSwitch :
+						RendererResetReason::RefreshTransition;
+				// Refresh, host, and renderer boundaries all wait for the queue's
+				// configured settle delay before the lightweight VP re-prime.
+				const UINT delayMs = static_cast<UINT>(
+					m_queueResetDelaySeconds * 1000);
+				const RendererResetCoordinator::SubmissionReceipt resetReceipt =
+					RequestRendererReset(
+					transitionReason,
 					false,
-					static_cast<UINT>(m_queueResetDelaySeconds * 1000));
+					delayMs);
+				const bool resetAccepted = resetReceipt.accepted;
+				if (resetAccepted)
+				{
+					m_videoRenderer->SetPostStallResetTelemetrySuppressedUntil(
+						GetTickCount64() + delayMs +
+							PostStallResetAdvisor::QUIET_WINDOW_MS);
+				}
 				DebugLog::Log(
-					"Alpha refresh transition re-prime armed: previous=%.6fHz "
-					"configured=%.6fHz delay=%d seconds action=queue-only "
-					"coalesced_host=%d coalesced_backend_handoff=%d",
+					"Transition reset armed: renderer=%S backend=VP trigger=%s "
+					"previous=%.6fHz configured=%.6fHz delay=%d seconds request=%s "
+					"scope=live-queue action=existing-auto-reset-before-post-stall-telemetry",
+					static_cast<LPCTSTR>(m_activeRendererName),
+					freshStartTransition ==
+						AlphaFreshStartTransition::HostTransition ?
+						"fullscreen-entry" :
+					freshStartTransition ==
+						AlphaFreshStartTransition::BackendHandoff ?
+						"renderer-switch" : "refresh-transition",
 					previousRate,
 					currentRate,
 					m_queueResetDelaySeconds,
-					hostTransition ? 1 : 0,
-					backendHandoff ? 1 : 0);
+					resetAccepted ? "accepted" : "covered-or-rejected");
 			}
 			else if (windowSettleDelayMs != 0)
 			{
@@ -7054,18 +7222,40 @@ void CVideoProcessorDlg::ApplyShaderRuleCommand(UINT commandId)
 	const auto rule = m_shaderShortcutRules.find(static_cast<WORD>(commandId));
 	if (rule == m_shaderShortcutRules.end() || !m_videoRenderer)
 		return;
+	CString selector = rule->second;
+	const std::string requested = CStringA(selector).GetString();
+	constexpr const char* cyclePrefix = "@shader-cycle:";
+	if (requested.rfind(cyclePrefix, 0) == 0)
+	{
+		std::vector<std::string> candidates;
+		std::stringstream values(requested.substr(std::strlen(cyclePrefix)));
+		std::string candidate;
+		while (std::getline(values, candidate, '|'))
+			if (!candidate.empty()) candidates.push_back(candidate);
+		if (candidates.empty()) return;
+		const std::string current = CStringA(m_requestedShaderSelector).GetString();
+		auto active = std::find(candidates.begin(), candidates.end(), current);
+		const size_t next = active == candidates.end() ? 0 :
+			(static_cast<size_t>(active - candidates.begin()) + 1) % candidates.size();
+		selector = CString(CStringA(candidates[next].c_str()));
+		DEBUGLOG("NLS cycle shortcut selected '%S'", static_cast<LPCTSTR>(selector));
+	}
 
 	CString activeRule;
 	bool rendererRestartRequired = false;
-	if (!m_videoRenderer->SelectShaderRule(rule->second, activeRule,
+	if (!m_videoRenderer->SelectShaderRule(selector, activeRule,
 		rendererRestartRequired))
 	{
 		DEBUGLOG("Shader rule '%S' ignored: selected renderer does not support it or the rule is invalid",
 			static_cast<LPCTSTR>(rule->second));
 		return;
 	}
-	m_requestedShaderSelector = rule->second;
+	m_requestedShaderSelector = selector;
 	PublishActiveProfileStatus();
+	// Explicit shader shortcuts update the resolved section selection before the
+	// render thread consumes it. Publish that selection now so terminal choices
+	// such as NLS Off receive the same transient feedback as active NLS modes.
+	PublishProfileChangeOverlay(m_profileRuntime.GetSnapshot());
 	DEBUGLOG("Shader rule changed to '%S'", static_cast<LPCTSTR>(activeRule));
 	if (rendererRestartRequired)
 	{
@@ -7133,13 +7323,23 @@ void CVideoProcessorDlg::OnCommandDisplayRule(UINT commandId)
 		m_lastUnifiedProfileCommandTime = commandTime;
 		UnifiedProfileRuntime::SelectionResult result;
 		std::string error;
-		if (!m_profileRuntime.SelectKey(
+		if (!m_profileRuntime.SelectCycleKey(
 			CStringA(unifiedKey->second).GetString(),
 			GetUnifiedProfileSourceLookup(), result, error))
 		{
 			DebugLog::Log("Unified profile key '%s' is unavailable: %s",
 				CStringA(unifiedKey->second).GetString(),
 				error.c_str());
+			return;
+		}
+		// Existing per-profile shortcuts keep their current behavior. A chord
+		// becomes a normal selector only when it did not match any cycle group.
+		if (result.selections.empty() && !m_profileRuntime.SelectKey(
+			CStringA(unifiedKey->second).GetString(),
+			GetUnifiedProfileSourceLookup(), result, error))
+		{
+			DebugLog::Log("Unified profile key '%s' is unavailable: %s",
+				CStringA(unifiedKey->second).GetString(), error.c_str());
 			return;
 		}
 		std::ostringstream activeProfiles;
@@ -8666,6 +8866,18 @@ void CVideoProcessorDlg::RenderStart()
 	m_activeRendererIsDirectShow =
 		selectedRenderer->backend == RendererBackend::DIRECTSHOW;
 	m_activeRendererSelectorIndex = i + 1;
+	m_rendererSwitchTransitionPending = !previousRendererName.IsEmpty() &&
+		previousRendererName.CompareNoCase(m_activeRendererName) != 0;
+	if (m_rendererSwitchTransitionPending)
+	{
+		DebugLog::Log(
+			"Transition reset detected: trigger=renderer-switch previous=%S "
+			"next=%S state=awaiting-renderer-boundary delay=%d seconds "
+			"action=existing-auto-reset-before-post-stall-telemetry",
+			static_cast<LPCTSTR>(previousRendererName),
+			static_cast<LPCTSTR>(m_activeRendererName),
+			m_queueResetDelaySeconds);
+	}
 	m_alphaBackendHandoffPending = IsDirectShowToAlphaBackendHandoff(
 		previousRendererWasDirectShow, m_activeRendererIsDirectShow);
 	if (m_alphaBackendHandoffPending)
@@ -8678,6 +8890,19 @@ void CVideoProcessorDlg::RenderStart()
 	}
 	const uint32_t rendererGeneration =
 		m_rendererGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+	const bool acceptedRendererDiffers = !m_acceptedRendererName.IsEmpty() &&
+		m_acceptedRendererName.CompareNoCase(m_activeRendererName) != 0;
+	m_rendererSwitchProfileReapplyGeneration =
+		RendererGenerationGate::ArmPostSwapRuleReapply(
+			acceptedRendererDiffers, rendererGeneration);
+	if (m_rendererSwitchProfileReapplyGeneration != 0)
+	{
+		DebugLog::Log(
+			"Post-swap profile rules reapply armed: accepted=%S successor=%S "
+			"generation=%u state=awaiting-running",
+			m_acceptedRendererName.GetString(), m_activeRendererName.GetString(),
+			rendererGeneration);
+	}
 	const bool recoveryRecreation = m_nextRendererIsRecoveryRecreation;
 	m_nextRendererIsRecoveryRecreation = false;
 	m_directShowRecoveryRecreatedGeneration =
@@ -9543,6 +9768,29 @@ void CVideoProcessorDlg::PumpRendererResetMailbox()
 			ResetScopeName(completion.request.scope),
 			completion.failure.empty() ? "" : " failure=",
 			completion.failure.empty() ? "" : completion.failure.c_str());
+		if (completion.request.reason == RendererResetReason::HostTransition ||
+			completion.request.reason == RendererResetReason::RendererSwitch)
+		{
+			if (currentSuccess && m_videoRenderer)
+			{
+				// The request-time estimate covers the configured delay.  Extend it
+				// from the actual completion too, so advisory telemetry cannot race
+				// a late existing reset.
+				m_videoRenderer->SetPostStallResetTelemetrySuppressedUntil(
+					now + PostStallResetAdvisor::QUIET_WINDOW_MS);
+			}
+			DebugLog::Log(
+				"Transition reset %s: trigger=%s generation=%u request=%llu "
+				"scope=%s result=%s action=post-stall-telemetry-settling",
+				currentSuccess ? "resolved" : "failed",
+				completion.request.reason == RendererResetReason::HostTransition ?
+					"fullscreen-entry" : "renderer-switch",
+				completion.rendererGeneration,
+				static_cast<unsigned long long>(completion.request.sequence),
+				ResetScopeName(completion.request.scope),
+				currentSuccess ? "existing-auto-reset-completed" :
+					"existing-auto-reset-failed");
+		}
 		const bool outputReadinessGraphReprime =
 			RendererResetPreservesReadinessDisplayMeasurement(
 				completion.request.scope,
@@ -9708,9 +9956,14 @@ void CVideoProcessorDlg::PumpRendererResetMailbox()
 			// modes exhibit the same downstream transition race.
 			const UINT delayMs = static_cast<UINT>(
 				m_queueResetDelaySeconds * 1000);
+			const bool fullscreenEntry = !m_fullscreenRetargetExiting &&
+				m_fullscreenEntryTransitionPending;
+			m_fullscreenEntryTransitionPending = false;
 			const RendererResetCoordinator::SubmissionReceipt receipt =
 				RequestRendererReset(
-					RendererResetReason::DisplayTransition, false, delayMs,
+					fullscreenEntry ? RendererResetReason::HostTransition :
+						RendererResetReason::DisplayTransition,
+					false, delayMs,
 					RendererResetOrigin::AutomaticRetargetSettle,
 					m_outputReadinessRetargetSettleLineageGeneration);
 			const bool settleCovered = receipt.accepted &&
@@ -9718,12 +9971,21 @@ void CVideoProcessorDlg::PumpRendererResetMailbox()
 					RendererResetOrigin::AutomaticRetargetSettle);
 			if (!settleCovered)
 				m_outputReadinessRetargetSettleLineageGeneration = 0;
+			if (settleCovered && m_videoRenderer)
+			{
+				m_videoRenderer->SetPostStallResetTelemetrySuppressedUntil(
+					GetTickCount64() + delayMs +
+						PostStallResetAdvisor::QUIET_WINDOW_MS);
+			}
 			DebugLog::Log(
-				"Post-retarget queue re-prime armed: generation=%u "
-				"origin=automatic-retarget-settle delay=%ums "
+				"Transition reset armed: renderer=%S backend=DirectShow "
+				"trigger=%s generation=%u origin=automatic-retarget-settle "
+				"delay=%ums scope=live-queue "
 				"source=reset_after_render_restart_seconds accepted=%d "
 				"request=%llu disposition=%s selected_request=%llu "
-				"contributors=0x%x",
+				"contributors=0x%x action=existing-auto-reset-before-post-stall-telemetry",
+				static_cast<LPCTSTR>(m_activeRendererName),
+				fullscreenEntry ? "fullscreen-entry" : "display-transition",
 				currentGeneration, delayMs, settleCovered ? 1 : 0,
 				static_cast<unsigned long long>(receipt.requestSequence),
 				ResetSubmissionDispositionName(receipt.disposition),
@@ -9927,7 +10189,11 @@ void CVideoProcessorDlg::TryRevealRendererTransition(uint32_t generation)
 			m_rendererResetCoordinator->GetDiagnostics();
 		const bool delayedPostStart =
 			diagnostics.pendingReason ==
-				RendererResetReason::PostRendererStart;
+				RendererResetReason::PostRendererStart ||
+			diagnostics.pendingReason ==
+				RendererResetReason::HostTransition ||
+			diagnostics.pendingReason ==
+				RendererResetReason::RendererSwitch;
 		const bool delayedPostRetarget =
 			diagnostics.pendingReason ==
 				RendererResetReason::DisplayTransition &&
@@ -10892,6 +11158,67 @@ bool CVideoProcessorDlg::BuildPushVideoState()
 		? (m_newLldvCandidateConfirmed &&
 			IsNewLldvModeSelected())
 		: isLegacyHDFuryLLDV;
+	const std::string rawEotf =
+		CStringA(ToString(m_captureDeviceVideoState->eotf)).GetString();
+	const std::string rawColorspace =
+		CStringA(ToString(m_captureDeviceVideoState->colorspace)).GetString();
+	std::string lldvDecisionReason;
+	if (!m_captureDeviceVideoState->valid)
+	{
+		lldvDecisionReason = "rejected: capture state is invalid";
+	}
+	else if (m_useNewLldvHeuristic)
+	{
+		if (!IsNewLldvModeSelected())
+			lldvDecisionReason =
+				"rejected: newlldv requires both Follow input (LLDV) modes";
+		else if (isHDFuryLLDV)
+			lldvDecisionReason = "new-match: stabilized BT.2020 + SDR candidate";
+		else if (m_captureDeviceVideoState->colorspace == ColorSpace::BT_2020 &&
+			m_captureDeviceVideoState->eotf == EOTF::SDR && !rawHdrData)
+			lldvDecisionReason = "new-candidate-waiting: stabilization not complete";
+		else
+			lldvDecisionReason =
+				"rejected: newlldv expects BT.2020 + SDR without static HDR metadata";
+	}
+	else if (isLegacyHDFuryLLDV)
+	{
+		lldvDecisionReason = hasVertex2CustomHdrSignature
+			? "classic-match: Vertex2 custom HDR signature"
+			: "classic-match: BT.2020 + PQ without static HDR metadata";
+	}
+	else if (m_captureDeviceVideoState->colorspace != ColorSpace::BT_2020)
+	{
+		lldvDecisionReason = "rejected: colorspace is not BT.2020";
+	}
+	else if (m_captureDeviceVideoState->eotf != EOTF::PQ)
+	{
+		lldvDecisionReason = "rejected: EOTF is not PQ";
+	}
+	else
+	{
+		lldvDecisionReason =
+			"rejected: static HDR metadata is not the Vertex2 LLDV signature";
+	}
+
+	const std::string lldvDecisionDiagnostic =
+		"LLDV decision: " + lldvDecisionReason +
+		" raw_eotf=" + rawEotf +
+		" raw_colorspace=" + rawColorspace +
+		" raw_hdr=" + (rawHdrData ? "1" : "0") +
+		" newlldv=" + (m_useNewLldvHeuristic ? "1" : "0") +
+		" lldv_modes_selected=" + (IsNewLldvModeSelected() ? "1" : "0");
+	if (lldvDecisionDiagnostic != m_lastLldvDecisionDiagnostic)
+	{
+		DebugLog::Log("%s", lldvDecisionDiagnostic.c_str());
+		m_lastLldvDecisionDiagnostic = lldvDecisionDiagnostic;
+	}
+	if (!isHDFuryLLDV && m_lldvDiagnosticWasApplied)
+	{
+		DebugLog::Log("LLDV ended: reason=%s raw_eotf=%s raw_colorspace=%s",
+			lldvDecisionReason.c_str(), rawEotf.c_str(), rawColorspace.c_str());
+	}
+	m_lldvDiagnosticWasApplied = isHDFuryLLDV;
 
 	if (m_useNewLldvHeuristic && isHDFuryLLDV)
 		videoState->eotf = EOTF::PQ;
@@ -11058,6 +11385,34 @@ bool CVideoProcessorDlg::BuildPushVideoState()
 
 	m_builtVideoState = videoState;
 	m_lastEffectiveEotf = m_builtVideoState->eotf;
+	const auto logLldvEffectiveState = [this, &rawEotf, &rawColorspace,
+		isHDFuryLLDV](const char* rendererResult)
+	{
+		if (!isHDFuryLLDV)
+			return;
+
+		const HDRData* effectiveHdrData = m_builtVideoState->hdrData.get();
+		const std::string diagnostic =
+			std::string("LLDV applied: path=") +
+			(m_useNewLldvHeuristic ? "new" : "classic") +
+			" raw=" + rawColorspace + "/" + rawEotf +
+			" effective=" +
+			std::string(CStringA(ToString(m_builtVideoState->colorspace)).GetString()) +
+			"/" +
+			std::string(CStringA(ToString(m_builtVideoState->eotf)).GetString()) +
+			" effective_hdr=" + (effectiveHdrData ? "1" : "0") +
+			" effective_values=" +
+			std::to_string(effectiveHdrData ? effectiveHdrData->maxCll : -1.0) + "/" +
+			std::to_string(effectiveHdrData ? effectiveHdrData->maxFall : -1.0) + "/" +
+			std::to_string(effectiveHdrData ? effectiveHdrData->masteringDisplayMinLuminance : -1.0) + "/" +
+			std::to_string(effectiveHdrData ? effectiveHdrData->masteringDisplayMaxLuminance : -1.0) +
+			" renderer=" + rendererResult;
+		if (diagnostic != m_lastLldvEffectiveDiagnostic)
+		{
+			DebugLog::Log("%s", diagnostic.c_str());
+			m_lastLldvEffectiveDiagnostic = diagnostic;
+		}
+	};
 
 	UnifiedProfileRuntime::RefreshResult profileRefresh;
 	std::string profileError;
@@ -11118,18 +11473,14 @@ bool CVideoProcessorDlg::BuildPushVideoState()
 	{
 		const HDRData hdrData = *(videoState->hdrData);
 
-		CString cstring;
-		cstring.Format(_T("%.01f"), hdrData.maxCll);
-		m_hdrLuminanceMaxCll.SetWindowText(cstring);
-
-		cstring.Format(_T("%.01f"), hdrData.maxFall);
-		m_hdrLuminanceMaxFall.SetWindowText(cstring);
-
-		cstring.Format(_T("%.05f"), hdrData.masteringDisplayMinLuminance);
-		m_hdrLuminanceMasterMin.SetWindowText(cstring);
-
-		cstring.Format(_T("%.01f"), hdrData.masteringDisplayMaxLuminance);
-		m_hdrLuminanceMasterMax.SetWindowText(cstring);
+		m_hdrLuminanceMaxCll.SetWindowText(
+			FormatHdrLuminance(hdrData.maxCll));
+		m_hdrLuminanceMaxFall.SetWindowText(
+			FormatHdrLuminance(hdrData.maxFall));
+		m_hdrLuminanceMasterMin.SetWindowText(
+			FormatHdrLuminance(hdrData.masteringDisplayMinLuminance));
+		m_hdrLuminanceMasterMax.SetWindowText(
+			FormatHdrLuminance(hdrData.masteringDisplayMaxLuminance));
 
 		m_hdrColorspaceREdit.SetWindowTextW(
 			CieXYToString(hdrData.displayPrimaryRedX, hdrData.displayPrimaryRedY));
@@ -11167,6 +11518,7 @@ bool CVideoProcessorDlg::BuildPushVideoState()
 	{
 		DbgLog((LOG_TRACE, 1,
 			TEXT("CVideoProcessorDlg::BuildPushVideoState(): Renderer stopping; state retained for next graph")));
+		logLldvEffectiveState("state-retained-while-stopping");
 		return true;
 	}
 
@@ -11192,6 +11544,7 @@ bool CVideoProcessorDlg::BuildPushVideoState()
 				CStringA(ToString(m_builtVideoState->eotf)).GetString(),
 				CStringA(ToString(m_builtVideoState->colorspace)).GetString());
 		}
+		logLldvEffectiveState(rendererAcceptedState ? "accepted" : "rejected");
 
 		return rendererAcceptedState;
 	}
@@ -11199,6 +11552,7 @@ bool CVideoProcessorDlg::BuildPushVideoState()
 	{
 		DbgLog((LOG_TRACE, 1,
 			TEXT("CVideoProcessorDlg::BuildPushVideoState(): Renderer unavailable; state retained for next graph")));
+		logLldvEffectiveState("state-retained-renderer-unavailable");
 		return true;
 	}
 }
@@ -11323,6 +11677,17 @@ CVideoProcessorDlg::GetProfileOverlaySelections(
 			optionCounts[group.name] = group.profiles.size();
 		selections = ProfileChangeOverlay::FilterSingleOptionGroups(
 			selections, optionCounts);
+		// The persisted identifier may be technical (for example
+		// viewport_16x9). The overlay must show the configured profile label,
+		// not a prettified section suffix.
+		for (auto& selection : selections)
+		{
+			const auto profile = profileModel.profiles.find(
+				selection.first + "." + selection.second);
+			if (profile != profileModel.profiles.end() &&
+				!ConfigFile::Trim(profile->second.label).empty())
+				selection.second = ConfigFile::Trim(profile->second.label);
+		}
 	}
 
 	size_t nlsOptionCount = 0;
@@ -12072,6 +12437,44 @@ void CVideoProcessorDlg::ScheduleUnifiedProfileActionsForRenderer(
 	if (!m_unifiedActionCancelEvent || actions.empty())
 		return;
 	const std::string configPath = m_profileRuntime.ConfigPath();
+	const bool hasProfileTransition = std::any_of(actions.begin(), actions.end(),
+		[](const UnifiedProfileRuntime::ActionInvocation& invocation)
+		{
+			return invocation.event.rfind("profile.", 0) == 0 &&
+				invocation.event.size() > strlen("profile..changed") &&
+				invocation.event.compare(invocation.event.size() - strlen(".changed"),
+				strlen(".changed"), ".changed") == 0;
+		});
+	// Scripts such as set_hdr.bat can inject a regular profile shortcut while
+	// they are still running. That change is an effect of the action already
+	// being processed, not a new user request; scheduling it would recreate the
+	// action loop. A cycle request remains eligible so rapid cycling can replace
+	// the queued selection even while the previous script is active.
+	const bool actionFeedback = hasProfileTransition &&
+		m_profileActionProcessActive.load() &&
+		std::any_of(actions.begin(), actions.end(),
+			[](const UnifiedProfileRuntime::ActionInvocation& invocation)
+			{
+				return invocation.event.rfind("profile.", 0) == 0 &&
+					invocation.reason == "manual";
+			});
+	if (actionFeedback)
+	{
+		for (const UnifiedProfileRuntime::ActionInvocation& invocation : actions)
+		{
+			DebugLog::Log(
+				"event action feedback ignored while profile action is running: "
+				"action='%s' event=%s reason=%s",
+				invocation.action.name.c_str(), invocation.event.c_str(),
+				invocation.reason.c_str());
+		}
+		return;
+	}
+	// A profile selection is a transaction. Rapid cycling must replace the
+	// entire pending profile-action batch, not merely actions with the same
+	// coalesce role, so only the final settled profile state is allowed to run.
+	const uint64_t profileDebounceGeneration = hasProfileTransition ?
+		m_profileActionDebounceGeneration.fetch_add(1) + 1 : 0;
 	std::map<std::string, const UnifiedProfileRuntime::ActionInvocation*> latest;
 	for (const UnifiedProfileRuntime::ActionInvocation& invocation : actions)
 	{
@@ -12103,6 +12506,11 @@ void CVideoProcessorDlg::ScheduleUnifiedProfileActionsForRenderer(
 	{
 		const std::string identity = pending.first;
 		const UnifiedProfileRuntime::ActionInvocation invocation = *pending.second;
+		const bool profileTransition =
+			invocation.event.rfind("profile.", 0) == 0 &&
+			invocation.event.size() > strlen("profile..changed") &&
+			invocation.event.compare(invocation.event.size() - strlen(".changed"),
+				strlen(".changed"), ".changed") == 0;
 		const uint64_t generation = m_unifiedActionCoalescer.Schedule(identity);
 		if (generation > 1)
 		{
@@ -12120,13 +12528,43 @@ void CVideoProcessorDlg::ScheduleUnifiedProfileActionsForRenderer(
 			invocation.reason.c_str(), delayMs,
 			identity.c_str(), static_cast<unsigned long long>(generation), this);
 		m_unifiedActionWorkers.emplace_back([this, invocation, configPath,
-			delayMs, identity, generation]()
+			delayMs, identity, generation, profileTransition,
+			profileDebounceGeneration]()
 			{
 				if (m_unifiedActionCancelEvent &&
 					WaitForSingleObject(m_unifiedActionCancelEvent, delayMs) ==
-						WAIT_TIMEOUT)
+					WAIT_TIMEOUT)
 				{
-					if (m_unifiedActionCoalescer.Claim(identity, generation))
+					if (profileTransition)
+					{
+						std::unique_lock<std::mutex> launchLock(
+							m_profileActionLaunchMutex);
+						if (profileDebounceGeneration !=
+							m_profileActionDebounceGeneration.load())
+						{
+							DebugLog::Log(
+								"event action debounce replaced profile batch: action='%s' role=%s",
+								invocation.action.name.c_str(), identity.c_str());
+							return;
+						}
+						if (!m_unifiedActionCoalescer.Claim(identity, generation))
+						{
+							DebugLog::Log(
+								"event action debounce skipped: action='%s' role=%s generation=%llu reason=newer-role-owner",
+								invocation.action.name.c_str(), identity.c_str(),
+								static_cast<unsigned long long>(generation));
+							return;
+						}
+						DebugLog::Log(
+							"event action debounce claimed: action='%s' role=%s generation=%llu result=serialized-profile-launch",
+							invocation.action.name.c_str(), identity.c_str(),
+							static_cast<unsigned long long>(generation));
+						m_profileActionProcessActive.store(true);
+						EventActionLauncher::Launch(invocation.action, configPath, true,
+							reinterpret_cast<uintptr_t>(m_unifiedActionCancelEvent));
+						m_profileActionProcessActive.store(false);
+					}
+					else if (m_unifiedActionCoalescer.Claim(identity, generation))
 					{
 						DebugLog::Log(
 							"event action debounce claimed: action='%s' role=%s "
@@ -12372,7 +12810,7 @@ BOOL CVideoProcessorDlg::OnInitDialog()
 
 	CString title;
 	const std::wstring buildIdentity = BuildIdentityPolicy::Format(
-		VERSION_BRANCH, VERSION_COMMIT_SHORT, VERSION_DESCRIBE);
+		VERSION_BRANCH, VERSION_COMMIT_SHORT, VERSION_DESCRIBE, VERSION_DIRTY);
 	title.Format(_T("VideoProcessor (%s)"), buildIdentity.c_str());
 	SetWindowText(title.GetBuffer());
 
@@ -15352,6 +15790,9 @@ void CVideoProcessorDlg::UpdateStatsOverlay()
 		stats.ppmDeviation = hasMeasuredCaptureRate ? measuredCapturePpm : 0;
 	}
 
+	LogMadVRPostStallResetDiagnostics(stats,
+		measuredCaptureRate > 0.0 ? measuredCaptureRate :
+			theoreticalCaptureRate);
 	LogDroppedCounterChanges(stats);
 
 	// Update overlay
@@ -15395,6 +15836,118 @@ void CVideoProcessorDlg::UpdateStatsOverlay()
 	*m_lastStatsData = stats;
 	m_lastStatsTelemetryRenderer = statsRenderer;
 	m_lastStatsTelemetryGeneration = m_transitionGeneration;
+}
+
+
+void CVideoProcessorDlg::LogMadVRPostStallResetDiagnostics(
+	const StatsData& stats, double measuredCaptureRateHz)
+{
+	const bool activeMadVR = m_rendererState ==
+		RendererState::RENDERSTATE_RENDERING && m_videoRenderer &&
+		m_activeRendererIsDirectShow &&
+		m_activeRendererName.Find(TEXT("madVR")) >= 0;
+	if (!activeMadVR)
+	{
+		m_madVRPostStallResetAdvisor.Reset();
+		m_madVRLastObservedDeliveryEpoch = 0;
+		m_madVRLastMaximumSuccessfulDeliveryUs = 0;
+		return;
+	}
+
+	RendererLivenessSnapshot liveness;
+	if (!m_videoRenderer->GetLivenessSnapshot(liveness) ||
+		!liveness.supported)
+	{
+		m_madVRPostStallResetAdvisor.Reset();
+		m_madVRLastObservedDeliveryEpoch = 0;
+		m_madVRLastMaximumSuccessfulDeliveryUs = 0;
+		return;
+	}
+
+	if (liveness.queueEpoch != m_madVRLastObservedDeliveryEpoch)
+	{
+		m_madVRLastObservedDeliveryEpoch = liveness.queueEpoch;
+		m_madVRLastMaximumSuccessfulDeliveryUs = 0;
+	}
+	const bool materialStall =
+		liveness.maximumSuccessfulDeliveryDurationUs >=
+			PostStallResetAdvisor::MATERIAL_STALL_MS * 1000ULL &&
+		liveness.maximumSuccessfulDeliveryDurationUs >
+			m_madVRLastMaximumSuccessfulDeliveryUs;
+	m_madVRLastMaximumSuccessfulDeliveryUs = std::max(
+		m_madVRLastMaximumSuccessfulDeliveryUs,
+		liveness.maximumSuccessfulDeliveryDurationUs);
+
+	const uint64_t nowTick = GetTickCount64();
+	const RendererResetCoordinator::Diagnostics resetDiagnostics =
+		m_rendererResetCoordinator ?
+			m_rendererResetCoordinator->GetDiagnostics() :
+			RendererResetCoordinator::Diagnostics{};
+	const bool existingAutoResetPending = resetDiagnostics.hasPending ||
+		resetDiagnostics.selectionPrepared || resetDiagnostics.operationActive ||
+		resetDiagnostics.completionPending;
+	PostStallResetObservation observation;
+	observation.renderer = PostStallRendererKind::MadVR;
+	observation.nowTick = nowTick;
+	observation.generation = m_transitionGeneration;
+	observation.outputReady = liveness.active &&
+		liveness.currentEpochDeliverySuccessCount > 0;
+	observation.rendererQuiet = !m_rendererConstructionActive &&
+		!m_rendererRetirementPending && !m_rendererResetTransitionActive &&
+		!m_outputReadinessGraphReprimeActive && !liveness.resetInProgress &&
+		!existingAutoResetPending;
+	observation.materialStall = materialStall;
+	observation.queueDepth = stats.currentQueueSize;
+	observation.healthyQueueDepth = liveness.deliveryReserveFrames;
+	observation.framePeriodMs = measuredCaptureRateHz >= 10.0 ?
+		1000.0 / measuredCaptureRateHz : 0.0;
+	observation.oldestQueuedAgeMs = static_cast<double>(
+		liveness.oldestRetainedSourceBufferAgeMs);
+	observation.scheduledLatencyKnown = stats.scheduledLatencyKnown;
+	observation.scheduledLatencyMs = stats.scheduledLatencyMs;
+	const PostStallResetDecision decision =
+		m_madVRPostStallResetAdvisor.Observe(observation);
+	if (!decision.shouldLog)
+		return;
+
+	const uint64_t lastSuccessAgeMs = liveness.lastDeliverySuccessTick != 0 &&
+		nowTick >= liveness.lastDeliverySuccessTick ?
+		nowTick - liveness.lastDeliverySuccessTick : 0;
+	const char* const logPrefix = decision.resetShouldOccur ?
+		"Post-stall reset should occur" : "Post-stall reset telemetry";
+	DebugLog::Log(
+		"%s: renderer=madVR action=diagnostic-only state=%s reason=%s transition_generation=%u queue_epoch=%llu output_ready=%d quiet=%d auto_reset_pending=%d pending_reason=%s material_stall=%d since_stall_ms=%llu observations=%u raw_queue=%zu converted_queue=%zu queue_total=%zu/%zu reserve=%zu oldest_ms=%.2f delivery_in_progress=%d last_delivery_success_age_ms=%llu max_delivery_ms=%.3f scheduled_known=%d vp_internal_ms=%.2f pts_lead_ms=%.2f scheduled_latency_ms=%.2f frame_period_ms=%.3f scheduled_frames=%.3f baseline_frames=%.3f delta_frames=%.3f madvr_queue=unobservable",
+		logPrefix,
+		PostStallResetDiagnosticStateText(decision.state),
+		decision.reason,
+		m_transitionGeneration,
+		static_cast<unsigned long long>(liveness.queueEpoch),
+		observation.outputReady ? 1 : 0,
+		observation.rendererQuiet ? 1 : 0,
+		existingAutoResetPending ? 1 : 0,
+		CStringA(ToString(resetDiagnostics.pendingReason)).GetString(),
+		materialStall ? 1 : 0,
+		static_cast<unsigned long long>(
+			decision.millisecondsSinceMaterialStall),
+		decision.persistentBadObservations,
+		liveness.rawQueueDepth,
+		liveness.convertedQueueDepth,
+		stats.currentQueueSize,
+		liveness.queueCapacity,
+		liveness.deliveryReserveFrames,
+		observation.oldestQueuedAgeMs,
+		liveness.deliveryInProgress ? 1 : 0,
+		static_cast<unsigned long long>(lastSuccessAgeMs),
+		static_cast<double>(liveness.maximumSuccessfulDeliveryDurationUs) /
+			1000.0,
+		observation.scheduledLatencyKnown ? 1 : 0,
+		stats.vpInternalLatencyMs,
+		stats.dsScheduleLeadMs,
+		stats.scheduledLatencyMs,
+		observation.framePeriodMs,
+		decision.normalizedScheduledLatencyFrames,
+		decision.baselineScheduledLatencyFrames,
+		decision.scheduledLatencyDeltaFrames);
 }
 
 
@@ -15505,7 +16058,7 @@ CVideoProcessorDlg::RequestRendererReset(RendererResetReason reason,
 		delayMs);
 	if (receipt.accepted && m_activeOutputSweepSummaryVisible &&
 		!m_activeOutputSweepRunning)
-		ClearActiveOutputSweepSummary("renderer-reset");
+	ClearActiveOutputSweepSummary("renderer-reset");
 	return receipt;
 }
 

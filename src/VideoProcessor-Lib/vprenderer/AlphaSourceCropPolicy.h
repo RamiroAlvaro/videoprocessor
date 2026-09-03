@@ -16,6 +16,7 @@ namespace AlphaSourceCrop
 		ActivePictureBounds candidate;
 		uint32_t confirmations = 0;
 		uint64_t sourceGeneration = 0;
+		uint64_t lastObservedSourceSequence = 0;
 	};
 
 	struct OutwardPictureConfirmationDecision
@@ -35,7 +36,8 @@ namespace AlphaSourceCrop
 		const ActivePictureBounds& trustedGeometry,
 		const ActivePictureBounds& candidate,
 		const ActivePicturePresentationRetentionEvidence& evidence,
-		uint64_t sourceGeneration);
+		uint64_t sourceGeneration,
+		uint64_t sourceSequence = 0);
 
 	enum class BarContentEdge
 	{
@@ -103,6 +105,7 @@ namespace AlphaSourceCrop
 	{
 		float candidateTranslationPixels = 0.0f;
 		uint32_t confirmations = 0;
+		uint64_t lastObservedSourceSequence = 0;
 	};
 
 	struct VerticalTranslationConfirmationInput
@@ -118,6 +121,9 @@ namespace AlphaSourceCrop
 		// Positive values cap the buffered magnitude at the source raster edge.
 		// Zero leaves the policy uncapped for callers without geometry context.
 		float maximumTranslationMagnitudePixels = 0.0f;
+		// A cadence repeat may render one decoded source frame more than once.
+		// One source sequence can contribute at most one confirmation.
+		uint64_t sourceSequence = 0;
 	};
 
 	struct VerticalTranslationConfirmationDecision
@@ -141,6 +147,7 @@ namespace AlphaSourceCrop
 	struct VerticalFitConfirmationState
 	{
 		uint32_t confirmations = 0;
+		uint64_t lastObservedSourceSequence = 0;
 	};
 
 	struct VerticalFitConfirmationDecision
@@ -153,7 +160,8 @@ namespace AlphaSourceCrop
 
 	VerticalFitConfirmationDecision ConfirmVerticalFit(
 		const VerticalFitConfirmationState& previous,
-		const VerticalBarContentDecision& observed);
+		const VerticalBarContentDecision& observed,
+		uint64_t sourceSequence = 0);
 
 	// A current provisional envelope which expands one or both vertical edges is
 	// eligible for trusted-base retention until the first dense sample. This
@@ -168,6 +176,84 @@ namespace AlphaSourceCrop
 		bool topExpansion,
 		bool rightExpansion,
 		bool bottomExpansion);
+
+	// Dynamic detector geometry may reposition a presentation only when the
+	// operator explicitly enabled automatic crop or subtitle containment.
+	// Merely configuring a fixed aspect must not opt into either behavior.
+	bool ShouldTrackDynamicPresentationGeometry(
+		bool automaticCropEnabled, bool subtitleFitEnabled);
+
+	struct VerticalInspectionBridgeState
+	{
+		bool active = false;
+		bool retentionConsumed = false;
+		bool denseAnalysisCompleted = false;
+		bool failOpenLatched = false;
+		uint64_t sourceGeneration = 0;
+		uint64_t presentationEpoch = 0;
+		ActivePictureBounds trustedBase;
+		uint64_t firstCandidateSourceSequence = 0;
+		uint64_t retainedSourceSequence = 0;
+	};
+
+	// A spent vertical-inspection bridge may be resolved by an already accepted
+	// dense Fit only when the same source sample supplies a valid, full-width,
+	// vertical-only outward envelope. This deliberately excludes provisional,
+	// horizontal, and held-fit evidence.
+	struct VerticalInspectionFitResolutionInput
+	{
+		bool confirmedDenseFit = false;
+		bool denseAnalysisCurrent = false;
+		bool outwardExpansionAvailable = false;
+		bool currentHorizontalExpansion = false;
+		ActivePictureBounds trustedBase;
+		ActivePictureBounds outwardExpansion;
+		uint64_t outwardExpansionSourceGeneration = 0;
+		uint64_t frameSourceGeneration = 0;
+	};
+
+	bool CanResolveVerticalInspectionWithConfirmedFit(
+		const VerticalInspectionFitResolutionInput& input);
+
+	struct VerticalInspectionBridgeInput
+	{
+		VerticalInspectionBridgeState previous;
+		bool candidate = false;
+		bool retentionRequested = false;
+		bool denseAnalysisCompleted = false;
+		// A current dense result has handed presentation to the bounded
+		// translation/Fit confirmation path. That path owns the remaining
+		// confirmation frames, so the inspection bridge must not fail open first.
+		bool verticalPresentationOwnerAvailable = false;
+		// Positive crop/full-raster authority, or a verified current vertical Fit,
+		// closes the unresolved episode.
+		// A mere coarse-candidate dropout does not, because sparse dark pixels
+		// must not rearm alternating scope/full/scope decisions.
+		bool cropAuthorityResolved = false;
+		bool fullRasterAuthorityResolved = false;
+		bool confirmedVerticalFitResolved = false;
+		uint64_t sourceGeneration = 0;
+		uint64_t presentationEpoch = 0;
+		ActivePictureBounds trustedBase;
+		uint64_t sourceSequence = 0;
+	};
+
+	struct VerticalInspectionBridgeDecision
+	{
+		VerticalInspectionBridgeState state;
+		bool retain = false;
+		bool started = false;
+		bool expired = false;
+	};
+
+	// Blind retention is limited to the short, bounded dense-analysis handoff of
+	// one unresolved authority episode. Repeated presentation is idempotent, and
+	// the bridge cannot outlive three decoded source sequences. Candidate dropouts
+	// do not rearm it; only resolved authority, a new trusted base/profile epoch,
+	// or a new source generation can do that. Once dense classification completes,
+	// later frames need an explicit translation/Fit owner.
+	VerticalInspectionBridgeDecision UpdateVerticalInspectionBridge(
+		const VerticalInspectionBridgeInput& input);
 
 	struct VerticalBarPresentationState
 	{
@@ -519,6 +605,19 @@ namespace AlphaSourceCrop
 	AspectLimitFillDecision EvaluateAspectLimitFill(
 		const AspectLimitFillInput& input);
 
+	struct FixedAspectCropInput
+	{
+		double fixedAspect = 0.0;
+		ActivePictureBounds sourceBounds;
+	};
+
+	// Center-crop the current presentation bounds to an operator-selected source
+	// aspect. This is unconditional while configured: automatic crop authority
+	// may refine the input bounds, but its expiry must not disable the fixed crop.
+	// The regular physical-screen fit happens after this source decision.
+	AspectLimitFillDecision EvaluateFixedAspectCrop(
+		const FixedAspectCropInput& input);
+
 	struct ProfileTransitionRetentionInput
 	{
 		bool geometryAvailable = false;
@@ -565,9 +664,111 @@ namespace AlphaSourceCrop
 		bool eligibleAfterTrustedCrop = false;
 	};
 
+	enum class NearBlackPresentationMode
+	{
+		INACTIVE,
+		RETAIN_CROP,
+		FULL_RASTER,
+	};
+
+	struct NearBlackPresentationEpisodeState
+	{
+		NearBlackPresentationMode mode = NearBlackPresentationMode::INACTIVE;
+		uint64_t sourceGeneration = 0;
+		uint64_t startedSourceSequence = 0;
+		uint64_t presentationEpoch = 0;
+		bool entryTrustedCropAvailable = false;
+		ActivePictureBounds entryTrustedCrop;
+		uint64_t fullRasterStartedSourceSequence = 0;
+		bool confirmedNonNearBlackContent = false;
+		uint64_t outwardConfirmationLastSourceSequence = 0;
+		uint32_t outwardConfirmationSamples = 0;
+		uint64_t revalidationStartedSourceSequence = 0;
+		uint64_t revalidationLastSourceSequence = 0;
+		uint32_t revalidationSamples = 0;
+		bool bootstrapCandidateAvailable = false;
+		ActivePictureBounds bootstrapCandidate;
+		uint64_t bootstrapCandidateStartedTick = 0;
+		uint64_t bootstrapLastQualifiedTick = 0;
+		uint64_t bootstrapLastSourceSequence = 0;
+		uint32_t bootstrapSamples = 0;
+	};
+
+	struct NearBlackPresentationEpisodeInput
+	{
+		NearBlackPresentationEpisodeState previous;
+		bool measurementCurrent = false;
+		bool nearBlackEvaluated = false;
+		bool globalNearBlack = false;
+		bool sceneBoundary = false;
+		bool trustedCropAvailable = false;
+		ActivePictureBounds trustedCrop;
+		bool boundedVisibleContentOutsideCrop = false;
+		bool fullRasterAuthorityAvailable = false;
+		bool cadenceRepeat = false;
+		bool currentObservationAvailable = false;
+		ActivePictureBounds currentObservation;
+		bool retentionEvaluated = false;
+		bool retentionSafe = false;
+		ActivePictureBounds retentionBounds;
+		uint64_t retentionSourceGeneration = 0;
+		uint64_t retentionSourceSequence = 0;
+		bool knownTrustedGeometryReacquired = false;
+		ActivePictureBounds reacquiredTrustedGeometry;
+		ActivePictureClassification reacquiredTrustedClassification =
+			ActivePictureClassification::UNAVAILABLE;
+		uint64_t reacquiredSourceGeneration = 0;
+		uint64_t reacquiredSourceSequence = 0;
+		uint64_t reacquiredPresentationEpoch = 0;
+		bool reacquisitionIsCurrentAssociation = false;
+		bool nativeBootstrapContractAvailable = false;
+		ActivePictureBounds nativeBootstrapContract;
+		bool nativeBootstrapRetentionEvaluated = false;
+		bool nativeBootstrapRetentionSafe = false;
+		bool nativeBootstrapOutwardVisible = false;
+		uint64_t nativeBootstrapSourceGeneration = 0;
+		uint64_t nativeBootstrapSourceSequence = 0;
+		uint64_t nativeBootstrapPresentationEpoch = 0;
+		double framesPerSecond = 60.0;
+		uint64_t currentTick = 0;
+		uint64_t presentationEpoch = 0;
+		uint64_t sourceGeneration = 0;
+		uint64_t sourceSequence = 0;
+	};
+
+	struct NearBlackPresentationEpisodeDecision
+	{
+		NearBlackPresentationEpisodeState state;
+		bool started = false;
+		bool changedToFullRaster = false;
+		bool releasedToTrustedCrop = false;
+		bool bootstrapReleased = false;
+		bool resetTransitionEvidence = false;
+		bool revalidationChanged = false;
+		uint32_t revalidationSamples = 0;
+		uint32_t revalidationSamplesRequired = 0;
+		uint32_t bootstrapSamples = 0;
+		uint32_t bootstrapSamplesRequired = 0;
+		bool ended = false;
+		std::string reason;
+	};
+
+	// A sparse near-black episode chooses one safe presentation on entry. It can
+	// move from retained crop to full raster immediately for visibility. A
+	// full-raster episode may restore only its exact entry crop after a bounded,
+	// current-frame pixel-safe revalidation dwell; it never grants authority to
+	// startup or unrelated recent geometry.
+	NearBlackPresentationEpisodeDecision EvaluateNearBlackPresentationEpisode(
+		const NearBlackPresentationEpisodeInput& input);
+	const char* NearBlackPresentationModeName(NearBlackPresentationMode mode);
+	bool ShouldSuppressNearBlackBarGeometryMutation(bool acquisitionBlocked,
+		bool stable, ActivePictureClassification classification);
+
 	struct Input
 	{
 		bool automaticCropEnabled = false;
+		bool nearBlackEpisodeRetainCrop = false;
+		bool nearBlackEpisodeFullRaster = false;
 		bool fullRasterPresentationAuthoritative = false;
 		bool sharedGeometryAvailable = false;
 		bool latestObservationSupportsCrop = false;
@@ -588,11 +789,21 @@ namespace AlphaSourceCrop
 		bool frameLocalPresentationRetentionEvaluated = false;
 		bool frameLocalPresentationRetentionSafe = false;
 		bool presentationFailOpen = false;
+		// A current, bounded vertical-only envelope reached final crop arbitration
+		// without another presentation owner. Retain the generation-current trusted
+		// geometry for this one source sequence without depending on dense-analysis
+		// base state. This never grants or renews crop authority.
+		bool verticalInspectionPending = false;
+		uint64_t verticalInspectionSourceGeneration = 0;
+		uint64_t verticalInspectionSourceSequence = 0;
 		// A trusted bar observation may disagree slightly with the retained crop
 		// while the transition model is still confirming the replacement. Keep the
 		// last trusted presentation during that bounded confirmation instead of
 		// exposing full raster between old and new bar geometries.
 		bool barCropRefinementPending = false;
+		// A refinement observation which expands left or right can expose live
+		// picture pixels. It must fail open instead of retaining an older crop.
+		bool barCropRefinementHorizontalConflict = false;
 		// A first dense subtitle observation is not yet a stable motion target.
 		// Retain the current trusted base for the bounded three-sample confirmation
 		// instead of flashing to full raster. This may briefly clip the newly seen
@@ -627,9 +838,36 @@ namespace AlphaSourceCrop
 		uint64_t geometrySourceGeneration = 0;
 		uint64_t outwardExpansionSourceGeneration = 0;
 		uint64_t frameSourceGeneration = 0;
+		uint64_t frameSourceSequence = 0;
 		int rasterWidth = 0;
 		int rasterHeight = 0;
 	};
+
+	enum class DecisionOwner
+	{
+		FULL_RASTER,
+		TRUSTED_CROP,
+		PIXEL_SAFE_RETENTION,
+		SCENE_HOLD,
+		AMBIGUITY_HOLD,
+		BAR_REFINEMENT,
+		VERTICAL_INSPECTION,
+		TRANSLATION_CONFIRMATION,
+		FIT_CONFIRMATION,
+		ENGAGE_BASE,
+		RELEASE_BASE,
+		NEAR_BLACK_EPISODE,
+		OUTWARD_FIT,
+		VERTICAL_TRANSLATION,
+	};
+
+	enum class WithdrawalCause
+	{
+		NONE,
+		LATEST_OBSERVATION_UNREAFFIRMED,
+	};
+
+	const char* DecisionOwnerName(DecisionOwner owner);
 
 	struct Decision
 	{
@@ -638,6 +876,8 @@ namespace AlphaSourceCrop
 		bool outwardExpanded = false;
 		bool verticallyTranslated = false;
 		int verticalTranslationPixels = 0;
+		DecisionOwner owner = DecisionOwner::FULL_RASTER;
+		WithdrawalCause withdrawalCause = WithdrawalCause::NONE;
 		std::string reason;
 	};
 

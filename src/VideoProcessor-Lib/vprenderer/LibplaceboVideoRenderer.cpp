@@ -1,18 +1,21 @@
 #include <pch.h>
 
 #include "LibplaceboVideoRenderer.h"
+#include <vprenderer/PresentationResetEpoch.h>
+#include <vprenderer/ViewportIntentMailbox.h>
 
 #include <ConfigFile.h>
+#include <DisplayRefreshRatePolicy.h>
 #include <EventActionLauncher.h>
 #include <ActivePictureTransitionModel.h>
 #include <AspectRatio.h>
 #include <ActivePictureEvidence.h>
 #include <RendererConfigView.h>
 #include <RendererProfileConfig.h>
+#include <RendererPostStallResetAdvisor.h>
 #include <UnifiedProfileRuntime.h>
 #include <DebugLog.h>
 #include <DisplayRuleExpression.h>
-#include <DisplayRefreshRatePolicy.h>
 #include <microsoft_directshow/MadVRShaderLoader.h>
 #include <vprenderer/AlphaCadenceCorrectionPolicy.h>
 #include <vprenderer/AlphaQueuePolicy.h>
@@ -20,6 +23,7 @@
 #include <vprenderer/AlphaPresentationTelemetry.h>
 #include <vprenderer/AlphaNativeRgbIngress.h>
 #include <vprenderer/AlphaSourceCropPolicy.h>
+#include <vprenderer/HdrPeakAnalysisCrop.h>
 #include <vprenderer/NativeStatsOverlayPlacement.h>
 #include <SceneDetector.h>
 #include <vprenderer/LibplaceboOutputPolicy.h>
@@ -886,6 +890,22 @@ namespace
 		return true;
 	}
 
+	bool ParseRefreshRateSwitchMode(const std::string& raw,
+		RefreshRateSwitchMode& mode)
+	{
+		const std::string normalized = ConfigFile::NormalizeName(raw);
+		if (normalized == "never" || normalized == "false" || normalized == "off" || normalized == "0")
+			mode = RefreshRateSwitchMode::Never;
+		else if (normalized == "always")
+			mode = RefreshRateSwitchMode::Always;
+		else if (normalized == "fullscreen_only" || normalized == "full_screen_only" ||
+			normalized == "true" || normalized == "on" || normalized == "1")
+			mode = RefreshRateSwitchMode::FullscreenOnly;
+		else
+			return false;
+		return true;
+	}
+
 	struct RefreshRateCommandRule
 	{
 		int minimumRate = 0;
@@ -902,6 +922,8 @@ namespace
 		// current program instead of requesting a new variant.
 		ProfileUpdateMode profileUpdateMode = ProfileUpdateMode::REBUILD;
 		bool switchRefreshRate = true;
+		RefreshRateSwitchMode refreshRateSwitchMode =
+			RefreshRateSwitchMode::FullscreenOnly;
 		std::string quality = "high";
 		std::string toneMapping = "auto";
 		std::string gamutMapping = "auto";
@@ -913,7 +935,7 @@ namespace
 		std::string debandStrength = "auto";
 		AutoToggle deband = AutoToggle::AUTO;
 		AutoToggle sigmoid = AutoToggle::AUTO;
-		AutoToggle dithering = AutoToggle::AUTO;
+		std::string dithering = "auto";
 		std::string displayBitDepth = "auto";
 		std::string outputPresentation = "auto";
 		std::string outputRange = "auto";
@@ -947,7 +969,15 @@ namespace
 		bool cropWiderContentToFillScreen = false;
 		bool cropWiderContentAspectLimitConfigured = false;
 		double cropWiderContentAspectLimit = 0.0;
+		bool fixedCropAspectConfigured = false;
+		double fixedCropAspect = 0.0;
 		bool scopeSubtitleFit = false;
+		bool hdrPeakAnalysisPictureOnly = false;
+		bool hdrPeakAnalysisMotionCompensation = false;
+		int hdrPeakAnalysisHeightPercent =
+			RendererProfileConfig::DEFAULT_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT;
+		std::string hdrPeakAnalysisPosition =
+			RendererProfileConfig::DEFAULT_HDR_PEAK_ANALYSIS_POSITION;
 		uint64_t scopeSubtitleHoldMs = 2000;
 		uint64_t scopeSubtitleEngageDriftMs = 0;
 		uint64_t scopeSubtitleReleaseDriftMs = 0;
@@ -975,6 +1005,16 @@ namespace
 		return AlphaSourceCrop::VerticalPictureAlignment::CENTER;
 	}
 
+	HdrPeakAnalysisCrop::VerticalAnchor ResolveHdrPeakAnalysisPosition(
+		const std::string& position)
+	{
+		if (position == "center")
+			return HdrPeakAnalysisCrop::VerticalAnchor::CENTER;
+		if (position == "bottom")
+			return HdrPeakAnalysisCrop::VerticalAnchor::BOTTOM;
+		return HdrPeakAnalysisCrop::VerticalAnchor::TOP;
+	}
+
 	std::string EffectiveSettingsFingerprint(
 		const RendererSettings& settings,
 		bool includeViewportSettings = true)
@@ -986,7 +1026,7 @@ namespace
 		stream.precision(17);
 		stream
 			<< settings.sdrTargetNits << '|' << settings.sdrBlackNits << '|'
-			<< settings.switchRefreshRate << '|' << settings.quality << '|'
+			<< static_cast<int>(settings.refreshRateSwitchMode) << '|' << settings.quality << '|'
 			<< settings.toneMapping << '|' << settings.gamutMapping << '|'
 			<< static_cast<int>(settings.peakDetection) << '|'
 			<< settings.hasContrastRecovery << '|' << settings.contrastRecovery << '|'
@@ -994,7 +1034,7 @@ namespace
 			<< settings.debandStrength << '|'
 			<< static_cast<int>(settings.deband) << '|'
 			<< static_cast<int>(settings.sigmoid) << '|'
-			<< static_cast<int>(settings.dithering) << '|'
+			<< settings.dithering << '|'
 			<< settings.displayBitDepth << '|'
 			<< settings.outputPresentation << '|' << settings.outputRange << '|'
 			<< settings.outputTransportGamma << '|' << settings.outputGamma << '|'
@@ -1020,7 +1060,14 @@ namespace
 				<< settings.cropWiderContentToFillScreen << '|'
 				<< settings.cropWiderContentAspectLimitConfigured << '|'
 				<< settings.cropWiderContentAspectLimit << '|'
-				<< settings.scopeSubtitleFit << '|' << settings.scopeSubtitleHoldMs << '|'
+				<< settings.fixedCropAspectConfigured << '|'
+				<< settings.fixedCropAspect << '|'
+				<< settings.scopeSubtitleFit << '|'
+				<< settings.hdrPeakAnalysisPictureOnly << '|'
+				<< settings.hdrPeakAnalysisMotionCompensation << '|'
+				<< settings.hdrPeakAnalysisHeightPercent << '|'
+				<< settings.hdrPeakAnalysisPosition << '|'
+				<< settings.scopeSubtitleHoldMs << '|'
 				<< settings.scopeSubtitleEngageDriftMs << '|'
 				<< settings.scopeSubtitleReleaseDriftMs << '|'
 				<< settings.scopeSubtitlePaddingPixels << '|'
@@ -1512,6 +1559,28 @@ namespace
 		return defaultValue;
 	}
 
+	std::string ReadDithering(const ConfigFile& config, const char* key)
+	{
+		std::string rawValue;
+		if (!TryGetDisplayString(config, key, rawValue)) return "auto";
+		const std::string value = ConfigFile::NormalizeName(rawValue);
+		if (value == "on" || value == "true") return "blue_noise";
+		if (value == "off" || value == "false") return "off";
+		if (value == "auto" || value == "blue_noise" ||
+			value == "ordered_lut" || value == "ordered_fixed" ||
+			value == "white_noise" || value == "error_diffusion_simple" ||
+			value == "error_diffusion_false_fs" ||
+			value == "error_diffusion_sierra_lite" ||
+			value == "error_diffusion_floyd_steinberg" ||
+			value == "error_diffusion_atkinson" ||
+			value == "error_diffusion_jarvis_judice_ninke" ||
+			value == "error_diffusion_stucki" || value == "error_diffusion_burkes" ||
+			value == "error_diffusion_sierra2" || value == "error_diffusion_sierra3") return value;
+		DebugLog::Log("libplacebo: invalid %s value '%s'; using auto",
+			key, rawValue.c_str());
+		return "auto";
+	}
+
 	PeakDetection ReadPeakDetection(const ConfigFile& config, const char* key,
 		PeakDetection defaultValue = PeakDetection::Auto)
 	{
@@ -1600,6 +1669,26 @@ namespace
 			if (config.TryGetBool(rule.section, key, enabled)) { target = enabled ? AutoToggle::ON : AutoToggle::OFF; return; }
 			DebugLog::Log("display rule '%s': invalid %s value '%s'; retaining base setting", rule.name.c_str(), key, raw.c_str());
 		};
+		auto readDithering = [&config, &rule](std::string& target)
+		{
+			std::string raw;
+			if (!config.TryGetString(rule.section, "dithering", raw)) return;
+			const std::string value = ConfigFile::NormalizeName(raw);
+			if (value == "on" || value == "true") { target = "blue_noise"; return; }
+			if (value == "off" || value == "false") { target = "off"; return; }
+			if (value == "auto" || value == "blue_noise" ||
+				value == "ordered_lut" || value == "ordered_fixed" ||
+				value == "white_noise" || value == "error_diffusion_simple" ||
+				value == "error_diffusion_false_fs" ||
+				value == "error_diffusion_sierra_lite" ||
+				value == "error_diffusion_floyd_steinberg" ||
+				value == "error_diffusion_atkinson" ||
+				value == "error_diffusion_jarvis_judice_ninke" ||
+				value == "error_diffusion_stucki" || value == "error_diffusion_burkes" ||
+				value == "error_diffusion_sierra2" || value == "error_diffusion_sierra3") { target = value; return; }
+			DebugLog::Log("display rule '%s': invalid dithering value '%s'; retaining base setting",
+				rule.name.c_str(), raw.c_str());
+		};
 		auto readPeakDetection = [&config, &rule](PeakDetection& target)
 		{
 			std::string raw;
@@ -1647,10 +1736,11 @@ namespace
 					settings.sdrBlackNits = value;
 			}
 		}
-		if (config.TryGetString(rule.section, "switch_refresh_rate", raw))
+		if (config.TryGetString(rule.section, "switch_refresh_rate", raw) &&
+			ParseRefreshRateSwitchMode(raw, settings.refreshRateSwitchMode))
 		{
-			bool value = false;
-			if (config.TryGetBool(rule.section, "switch_refresh_rate", value)) settings.switchRefreshRate = value;
+			settings.switchRefreshRate =
+				settings.refreshRateSwitchMode != RefreshRateSwitchMode::Never;
 		}
 		readChoice("quality", settings.quality, { "fast", "balanced", "high" });
 		readChoice("tone_mapping", settings.toneMapping, { "auto", "spline", "bt2390", "st2094-40", "reinhard" });
@@ -1666,7 +1756,7 @@ namespace
 					rule.name.c_str(), raw.c_str());
 		}
 		readToggle("sigmoid", settings.sigmoid);
-		readToggle("dithering", settings.dithering);
+		readDithering(settings.dithering);
 		readChoice("display_bit_depth", settings.displayBitDepth,
 			{ "auto", "8", "10" });
 		readChoice("output_presentation", settings.outputPresentation,
@@ -1844,6 +1934,20 @@ namespace
 				DebugLog::Log("profile '%s': invalid crop_wider_content_aspect_limit '%s'",
 					rule.name.c_str(), raw.c_str());
 		}
+		if (readViewportString("fixed_crop_aspect", raw))
+		{
+			settings.fixedCropAspectConfigured = false;
+			double value = 0.0;
+			if (ConfigFile::NormalizeName(raw) == "none")
+				settings.fixedCropAspect = 0.0;
+			else if (ParseAspectRatio(raw, value) && value >= 1.0 && value <= 4.0)
+			{
+				settings.fixedCropAspect = value;
+				settings.fixedCropAspectConfigured = true;
+			}
+			else DebugLog::Log("profile '%s': invalid fixed_crop_aspect '%s'",
+				rule.name.c_str(), raw.c_str());
+		}
 		settings.automaticSourceCrop = settings.automaticSourceCrop ||
 			settings.cropNarrowerContentToFillScreen ||
 			settings.cropWiderContentToFillScreen;
@@ -1851,6 +1955,50 @@ namespace
 			readViewportString("subtitle_fit", raw))
 			DebugLog::Log("profile '%s': invalid subtitle_fit '%s'",
 				rule.name.c_str(), raw.c_str());
+		if (!readViewportBool("hdr_peak_analysis_picture_only",
+			settings.hdrPeakAnalysisPictureOnly) &&
+			readViewportString("hdr_peak_analysis_picture_only", raw))
+		{
+			DebugLog::Log(
+				"profile '%s': invalid hdr_peak_analysis_picture_only '%s'",
+				rule.name.c_str(), raw.c_str());
+		}
+		if (!readViewportBool("hdr_peak_analysis_motion_compensation",
+			settings.hdrPeakAnalysisMotionCompensation) &&
+			readViewportString("hdr_peak_analysis_motion_compensation", raw))
+		{
+			DebugLog::Log(
+				"profile '%s': invalid hdr_peak_analysis_motion_compensation '%s'",
+				rule.name.c_str(), raw.c_str());
+		}
+		if (readViewportString("hdr_peak_analysis_height_percent", raw))
+		{
+			int percent = 0;
+			if (ParseInteger(raw,
+				RendererProfileConfig::MIN_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+				RendererProfileConfig::MAX_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+				percent))
+			{
+				settings.hdrPeakAnalysisHeightPercent = percent;
+			}
+			else
+			{
+				DebugLog::Log(
+					"profile '%s': invalid hdr_peak_analysis_height_percent '%s'; using %d",
+					rule.name.c_str(), raw.c_str(),
+					RendererProfileConfig::DEFAULT_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT);
+			}
+		}
+		if (readViewportString("hdr_peak_analysis_position", raw))
+		{
+			const std::string position = ConfigFile::NormalizeName(raw);
+			if (position == "top" || position == "center" || position == "bottom")
+				settings.hdrPeakAnalysisPosition = position;
+			else
+				DebugLog::Log("profile '%s': invalid hdr_peak_analysis_position '%s'; using %s",
+					rule.name.c_str(), raw.c_str(),
+					RendererProfileConfig::DEFAULT_HDR_PEAK_ANALYSIS_POSITION);
+		}
 		if (readViewportString("subtitle_hold_seconds", raw))
 		{
 			double seconds = 0.0;
@@ -1951,13 +2099,17 @@ namespace
 		}
 
 		if (TryGetDisplayString(config, "switch_refresh_rate", rawValue) &&
-			!TryGetDisplayBool(config, "switch_refresh_rate", settings.switchRefreshRate))
+			!ParseRefreshRateSwitchMode(rawValue, settings.refreshRateSwitchMode))
 		{
 			DebugLog::Log(
-				"libplacebo: invalid switch_refresh_rate value '%s'; using true",
+				"libplacebo: invalid switch_refresh_rate value '%s'; using fullscreen_only",
 				rawValue.c_str());
 			settings.switchRefreshRate = true;
+			settings.refreshRateSwitchMode = RefreshRateSwitchMode::FullscreenOnly;
 		}
+		else
+			settings.switchRefreshRate =
+				settings.refreshRateSwitchMode != RefreshRateSwitchMode::Never;
 
 		settings.quality = ReadChoice(
 			config, "quality", "high", { "fast", "balanced", "high" });
@@ -1982,7 +2134,7 @@ namespace
 					"libplacebo: deband_strength must be Auto, off, light, or default; retaining the debanding setting");
 		}
 		settings.sigmoid = ReadAutoToggle(config, "sigmoid");
-		settings.dithering = ReadAutoToggle(config, "dithering");
+		settings.dithering = ReadDithering(config, "dithering");
 		settings.displayBitDepth = ReadChoice(
 			config, "display_bit_depth", "auto", { "auto", "8", "10" });
 		settings.outputPresentation = ReadChoice(
@@ -2120,6 +2272,55 @@ namespace
 				rawValue.c_str());
 			settings.scopeSubtitleFit = false;
 		}
+		if (TryGetDisplayString(config, "hdr_peak_analysis_picture_only", rawValue) &&
+			!TryGetDisplayBool(config, "hdr_peak_analysis_picture_only",
+				settings.hdrPeakAnalysisPictureOnly))
+		{
+			DebugLog::Log(
+				"libplacebo: invalid hdr_peak_analysis_picture_only value '%s'; using false",
+				rawValue.c_str());
+			settings.hdrPeakAnalysisPictureOnly = false;
+		}
+		if (TryGetDisplayString(config,
+			"hdr_peak_analysis_motion_compensation", rawValue) &&
+			!TryGetDisplayBool(config,
+				"hdr_peak_analysis_motion_compensation",
+				settings.hdrPeakAnalysisMotionCompensation))
+		{
+			DebugLog::Log(
+				"libplacebo: invalid hdr_peak_analysis_motion_compensation value '%s'; using false",
+				rawValue.c_str());
+			settings.hdrPeakAnalysisMotionCompensation = false;
+		}
+		if (TryGetDisplayString(config, "hdr_peak_analysis_height_percent", rawValue))
+		{
+			int percent = 0;
+			if (ParseInteger(rawValue,
+				RendererProfileConfig::MIN_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+				RendererProfileConfig::MAX_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+				percent))
+			{
+				settings.hdrPeakAnalysisHeightPercent = percent;
+			}
+			else
+			{
+				DebugLog::Log(
+					"libplacebo: hdr_peak_analysis_height_percent must be between %d and %d; using %d",
+					RendererProfileConfig::MIN_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+					RendererProfileConfig::MAX_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+					RendererProfileConfig::DEFAULT_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT);
+			}
+		}
+		if (TryGetDisplayString(config, "hdr_peak_analysis_position", rawValue))
+		{
+			const std::string position = ConfigFile::NormalizeName(rawValue);
+			if (position == "top" || position == "center" || position == "bottom")
+				settings.hdrPeakAnalysisPosition = position;
+			else
+				DebugLog::Log("libplacebo: invalid hdr_peak_analysis_position value '%s'; using %s",
+					rawValue.c_str(),
+					RendererProfileConfig::DEFAULT_HDR_PEAK_ANALYSIS_POSITION);
+		}
 		if (TryGetDisplayString(config, "automatic_crop", rawValue) &&
 			!TryGetDisplayBool(config, "automatic_crop",
 				settings.automaticSourceCrop))
@@ -2178,6 +2379,19 @@ namespace
 			}
 			else
 				DebugLog::Log("libplacebo: crop_wider_content_aspect_limit must be a ratio or decimal between 1.0 and 4.0; disabling the limit");
+		}
+		if (TryGetDisplayString(config, "fixed_crop_aspect", rawValue))
+		{
+			settings.fixedCropAspectConfigured = false;
+			double parsed = 0.0;
+			if (ConfigFile::NormalizeName(rawValue) == "none")
+				settings.fixedCropAspect = 0.0;
+			else if (ParseAspectRatio(rawValue, parsed) && parsed >= 1.0 && parsed <= 4.0)
+			{
+				settings.fixedCropAspect = parsed;
+				settings.fixedCropAspectConfigured = true;
+			}
+			else DebugLog::Log("libplacebo: fixed_crop_aspect must be a ratio or decimal between 1.0 and 4.0; disabling it");
 		}
 		settings.automaticSourceCrop = settings.automaticSourceCrop ||
 			settings.cropNarrowerContentToFillScreen ||
@@ -2293,11 +2507,13 @@ namespace
 				ProfileUpdateMode::LIVE : ProfileUpdateMode::REBUILD;
 		}
 		if (rendererConfig.TryGetPolicyString(
-			"switch_refresh_rate", rawValue) &&
-			!rendererConfig.TryGetPolicyBool(
-				"switch_refresh_rate", settings.switchRefreshRate))
+			"switch_refresh_rate", rawValue))
 		{
-			DebugLog::Log("libplacebo: invalid switch_refresh_rate policy '%s'; retaining display setting", rawValue.c_str());
+			if (!ParseRefreshRateSwitchMode(rawValue, settings.refreshRateSwitchMode))
+				DebugLog::Log("libplacebo: invalid switch_refresh_rate policy '%s'; retaining display setting", rawValue.c_str());
+			else
+				settings.switchRefreshRate =
+					settings.refreshRateSwitchMode != RefreshRateSwitchMode::Never;
 		}
 		if (rendererConfig.TryGetPolicyString(
 			"output_diagnostics", rawValue) &&
@@ -2652,6 +2868,130 @@ namespace
 		return false;
 	}
 
+	struct RankedDisplayRefreshRate
+	{
+		DISPLAYCONFIG_RATIONAL refreshRate{};
+		DisplayRefreshModeSelectionPath selectionPath =
+			DisplayRefreshModeSelectionPath::None;
+	};
+
+	bool QueryDxgiSupportedRefreshRates(const std::wstring& displayDeviceName,
+		std::vector<DISPLAYCONFIG_RATIONAL>& refreshRates)
+	{
+		refreshRates.clear();
+		if (displayDeviceName.empty())
+			return false;
+
+		DEVMODEW currentMode{};
+		currentMode.dmSize = sizeof(currentMode);
+		if (!EnumDisplaySettingsW(displayDeviceName.c_str(),
+			ENUM_CURRENT_SETTINGS, &currentMode))
+		{
+			return false;
+		}
+
+		CComPtr<IDXGIFactory1> factory;
+		if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || !factory)
+			return false;
+
+		const DXGI_FORMAT formats[] =
+		{
+			DXGI_FORMAT_R8G8B8A8_UNORM,
+			DXGI_FORMAT_R10G10B10A2_UNORM
+		};
+		for (UINT adapterIndex = 0;; ++adapterIndex)
+		{
+			CComPtr<IDXGIAdapter1> adapter;
+			if (factory->EnumAdapters1(adapterIndex, &adapter) == DXGI_ERROR_NOT_FOUND)
+				break;
+			if (!adapter)
+				continue;
+			for (UINT outputIndex = 0;; ++outputIndex)
+			{
+				CComPtr<IDXGIOutput> output;
+				if (adapter->EnumOutputs(outputIndex, &output) == DXGI_ERROR_NOT_FOUND)
+					break;
+				if (!output)
+					continue;
+				DXGI_OUTPUT_DESC outputDesc{};
+				if (FAILED(output->GetDesc(&outputDesc)) ||
+					_wcsicmp(outputDesc.DeviceName, displayDeviceName.c_str()) != 0)
+				{
+					continue;
+				}
+				CComQIPtr<IDXGIOutput1> output1(output);
+				if (!output1)
+					return false;
+				for (const DXGI_FORMAT format : formats)
+				{
+					UINT modeCount = 0;
+					if (FAILED(output1->GetDisplayModeList1(format, 0,
+						&modeCount, nullptr)) || modeCount == 0)
+					{
+						continue;
+					}
+					std::vector<DXGI_MODE_DESC1> modes(modeCount);
+					if (FAILED(output1->GetDisplayModeList1(format, 0,
+						&modeCount, modes.data())))
+					{
+						continue;
+					}
+					for (const DXGI_MODE_DESC1& mode : modes)
+					{
+						if (mode.Width != currentMode.dmPelsWidth ||
+							mode.Height != currentMode.dmPelsHeight ||
+							mode.RefreshRate.Numerator == 0 ||
+							mode.RefreshRate.Denominator == 0)
+						{
+							continue;
+						}
+						const DISPLAYCONFIG_RATIONAL candidate =
+							{ mode.RefreshRate.Numerator, mode.RefreshRate.Denominator };
+						const bool alreadyPresent = std::any_of(
+							refreshRates.begin(), refreshRates.end(),
+							[&candidate](const DISPLAYCONFIG_RATIONAL& existing)
+							{
+								return DisplayRefreshRatesExactlyEqual(
+									{ existing.Numerator, existing.Denominator },
+									{ candidate.Numerator, candidate.Denominator });
+							});
+						if (!alreadyPresent)
+							refreshRates.push_back(candidate);
+					}
+				}
+				return !refreshRates.empty();
+			}
+		}
+		return false;
+	}
+
+	std::vector<RankedDisplayRefreshRate> RankDisplayRefreshRates(
+		const DISPLAYCONFIG_RATIONAL& requested,
+		const std::vector<DISPLAYCONFIG_RATIONAL>& supportedRates)
+	{
+		std::vector<DisplayRefreshRational> remaining;
+		remaining.reserve(supportedRates.size());
+		for (const DISPLAYCONFIG_RATIONAL& rate : supportedRates)
+			remaining.push_back({ rate.Numerator, rate.Denominator });
+
+		std::vector<RankedDisplayRefreshRate> ranked;
+		while (!remaining.empty())
+		{
+			const DisplayRefreshModeSelection selection = SelectDisplayRefreshMode(
+				{ requested.Numerator, requested.Denominator }, remaining);
+			if (selection.path == DisplayRefreshModeSelectionPath::None)
+				break;
+			ranked.push_back({ { selection.selected.numerator,
+				selection.selected.denominator }, selection.path });
+			remaining.erase(std::remove_if(remaining.begin(), remaining.end(),
+				[&selection](const DisplayRefreshRational& candidate)
+				{
+					return DisplayRefreshRatesExactlyEqual(candidate, selection.selected);
+				}), remaining.end());
+		}
+		return ranked;
+	}
+
 	LONG ApplyDisplayRefreshRate(
 		std::vector<DISPLAYCONFIG_PATH_INFO>& paths,
 		std::vector<DISPLAYCONFIG_MODE_INFO>& modes,
@@ -2752,7 +3092,6 @@ namespace
 				(contentRate > 24.1 && contentRate < 31.0);
 			if (useDoubleRate)
 				targetRefreshRate.Numerator *= 2;
-
 			if (RefreshRatesEqual(m_originalRefreshRate, targetRefreshRate))
 			{
 				DebugLog::Log(
@@ -2767,51 +3106,99 @@ namespace
 				return;
 			}
 
-			const LONG switchResult = ApplyDisplayRefreshRate(
-				paths,
-				modes,
-				pathCount,
-				modeCount,
-				pathIndex,
-				targetRefreshRate);
-			if (switchResult != ERROR_SUCCESS)
+			std::vector<DISPLAYCONFIG_RATIONAL> supportedRates;
+			if (!QueryDxgiSupportedRefreshRates(m_displayDeviceName, supportedRates))
 			{
 				DebugLog::Log(
-					"libplacebo refresh-rate switch failed: input=%.6f Hz target=%.6f Hz error=%ld; continuing with current display mode",
-					contentRate,
-					RefreshRateHz(targetRefreshRate),
-					switchResult);
+					"libplacebo refresh-rate switch: DXGI rational mode enumeration failed; retaining %.6f Hz",
+					RefreshRateHz(m_originalRefreshRate));
+				return;
+			}
+			const std::vector<RankedDisplayRefreshRate> rankedRates =
+				RankDisplayRefreshRates(targetRefreshRate, supportedRates);
+			if (rankedRates.empty())
+			{
+				DebugLog::Log(
+					"libplacebo refresh-rate switch: no safe DXGI candidate for input=%.6f Hz target=%.6f Hz candidates=%zu; retaining %.6f Hz",
+					contentRate, RefreshRateHz(targetRefreshRate), supportedRates.size(),
+					RefreshRateHz(m_originalRefreshRate));
 				return;
 			}
 
-			m_changed = true;
-			DISPLAYCONFIG_RATIONAL actualRefreshRate{};
-			const bool actualRateAvailable = GetCurrentRefreshRate(actualRefreshRate);
-			if (actualRateAvailable)
+			for (size_t attempt = 0; attempt < rankedRates.size(); ++attempt)
 			{
+				const RankedDisplayRefreshRate& candidate = rankedRates[attempt];
 				DebugLog::Log(
-					"libplacebo refresh-rate switch applied: input=%.6f Hz target=%.6f Hz previous=%.6f Hz actual=%.6f Hz",
-					contentRate,
-					RefreshRateHz(targetRefreshRate),
-					RefreshRateHz(m_originalRefreshRate),
-					RefreshRateHz(actualRefreshRate));
-			}
-			else
-			{
+					"libplacebo refresh-rate candidate: input=%.6f Hz requested=%.6f Hz candidate=%.6f Hz path=%s attempt=%zu/%zu available=%zu",
+					contentRate, RefreshRateHz(targetRefreshRate),
+					RefreshRateHz(candidate.refreshRate),
+					candidate.selectionPath == DisplayRefreshModeSelectionPath::ExactOrClose ?
+						"exact-or-close" : "closest-in-range",
+					attempt + 1, rankedRates.size(), supportedRates.size());
+
+				std::vector<DISPLAYCONFIG_PATH_INFO> candidatePaths;
+				std::vector<DISPLAYCONFIG_MODE_INFO> candidateModes;
+				UINT32 candidatePathCount = 0;
+				UINT32 candidateModeCount = 0;
+				size_t candidatePathIndex = 0;
+				if (!QueryDisplayPath(m_displayDeviceName, candidatePaths,
+					candidateModes, candidatePathCount, candidateModeCount,
+					candidatePathIndex))
+				{
+					DebugLog::Log("libplacebo refresh-rate candidate skipped: active display path disappeared");
+					break;
+				}
+				const LONG switchResult = ApplyDisplayRefreshRate(candidatePaths,
+					candidateModes, candidatePathCount, candidateModeCount,
+					candidatePathIndex, candidate.refreshRate);
+				if (switchResult != ERROR_SUCCESS)
+				{
+					DebugLog::Log(
+						"libplacebo refresh-rate candidate rejected: candidate=%.6f Hz error=%ld attempt=%zu/%zu",
+						RefreshRateHz(candidate.refreshRate), switchResult,
+						attempt + 1, rankedRates.size());
+					continue;
+				}
+
+				DISPLAYCONFIG_RATIONAL actualRefreshRate{};
+				if (VerifyCurrentRefreshRate(candidate.refreshRate, actualRefreshRate))
+				{
+					m_changed = true;
+					DebugLog::Log(
+						"libplacebo refresh-rate switch verified: input=%.6f Hz target=%.6f Hz previous=%.6f Hz actual=%.6f Hz attempt=%zu/%zu",
+						contentRate, RefreshRateHz(candidate.refreshRate),
+						RefreshRateHz(m_originalRefreshRate),
+						RefreshRateHz(actualRefreshRate), attempt + 1, rankedRates.size());
+					RunRefreshRateCommand(settings, RefreshRateHz(actualRefreshRate));
+					PublishEvent("refresh.applied", RefreshRateHz(actualRefreshRate),
+						RefreshRateHz(candidate.refreshRate),
+						RefreshRateHz(m_originalRefreshRate));
+					return;
+				}
+
 				DebugLog::Log(
-					"libplacebo refresh-rate switch applied: input=%.6f Hz target=%.6f Hz previous=%.6f Hz",
-					contentRate,
-					RefreshRateHz(targetRefreshRate),
-					RefreshRateHz(m_originalRefreshRate));
+					"libplacebo refresh-rate candidate unverified: candidate=%.6f Hz actual=%.6f Hz; restoring before next candidate",
+					RefreshRateHz(candidate.refreshRate), RefreshRateHz(actualRefreshRate));
+				std::vector<DISPLAYCONFIG_PATH_INFO> restorePaths;
+				std::vector<DISPLAYCONFIG_MODE_INFO> restoreModes;
+				UINT32 restorePathCount = 0;
+				UINT32 restoreModeCount = 0;
+				size_t restorePathIndex = 0;
+				if (!QueryDisplayPath(m_displayDeviceName, restorePaths, restoreModes,
+					restorePathCount, restoreModeCount, restorePathIndex) ||
+					ApplyDisplayRefreshRate(restorePaths, restoreModes, restorePathCount,
+						restoreModeCount, restorePathIndex, m_originalRefreshRate) != ERROR_SUCCESS ||
+					!VerifyCurrentRefreshRate(m_originalRefreshRate, actualRefreshRate))
+				{
+					DebugLog::Log(
+						"libplacebo refresh-rate candidate rollback failed; retaining unverified display state");
+					return;
+				}
 			}
-			RunRefreshRateCommand(
-				settings,
-				actualRateAvailable
-					? RefreshRateHz(actualRefreshRate)
-					: RefreshRateHz(targetRefreshRate));
-			PublishEvent("refresh.applied",
-				actualRateAvailable ? RefreshRateHz(actualRefreshRate) : RefreshRateHz(targetRefreshRate),
-				RefreshRateHz(targetRefreshRate), RefreshRateHz(m_originalRefreshRate));
+
+			DebugLog::Log(
+				"libplacebo refresh-rate switch: all %zu ranked DXGI candidates failed verification; retaining %.6f Hz",
+				rankedRates.size(), RefreshRateHz(m_originalRefreshRate));
 		}
 
 	private:
@@ -2829,6 +3216,26 @@ namespace
 			}
 			refreshRate = paths[pathIndex].targetInfo.refreshRate;
 			return true;
+		}
+
+		bool VerifyCurrentRefreshRate(const DISPLAYCONFIG_RATIONAL& expected,
+			DISPLAYCONFIG_RATIONAL& observed) const
+		{
+			DisplayRefreshRestoreVerifier verifier(
+				{ expected.Numerator, expected.Denominator });
+			const ULONGLONG deadline = GetTickCount64() + 2000;
+			do
+			{
+				const bool querySucceeded = GetCurrentRefreshRate(observed);
+				if (verifier.Observe(querySucceeded,
+					{ observed.Numerator, observed.Denominator }))
+				{
+					return true;
+				}
+				Sleep(50);
+			}
+			while (GetTickCount64() < deadline);
+			return false;
 		}
 
 		bool Restore()
@@ -2853,11 +3260,7 @@ namespace
 			}
 
 			const LONG restoreResult = ApplyDisplayRefreshRate(
-				paths,
-				modes,
-				pathCount,
-				modeCount,
-				pathIndex,
+				paths, modes, pathCount, modeCount, pathIndex,
 				m_originalRefreshRate);
 			if (restoreResult != ERROR_SUCCESS)
 			{
@@ -3086,7 +3489,15 @@ struct LibplaceboVideoRenderer::Impl
 	bool cropWiderContentToFillScreen = false;
 	bool cropWiderContentAspectLimitConfigured = false;
 	double cropWiderContentAspectLimit = 0.0;
+	bool fixedCropAspectConfigured = false;
+	double fixedCropAspect = 0.0;
 	bool scopeSubtitleFit = false;
+	bool hdrPeakAnalysisPictureOnly = false;
+	bool hdrPeakAnalysisMotionCompensation = false;
+	int hdrPeakAnalysisHeightPercent =
+		RendererProfileConfig::DEFAULT_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT;
+	std::string hdrPeakAnalysisPosition =
+		RendererProfileConfig::DEFAULT_HDR_PEAK_ANALYSIS_POSITION;
 	uint64_t scopeSubtitleHoldMs = 2000;
 	uint64_t scopeSubtitleEngageDriftMs = 0;
 	uint64_t scopeSubtitleReleaseDriftMs = 0;
@@ -3109,6 +3520,8 @@ struct LibplaceboVideoRenderer::Impl
 		scopeSubtitleTranslationConfirmation;
 	AlphaSourceCrop::VerticalFitConfirmationState
 		scopeSubtitleFitConfirmation;
+	AlphaSourceCrop::VerticalInspectionBridgeState
+		scopeVerticalInspectionBridge;
 	AlphaSourceCrop::OutwardPictureConfirmationState
 		outwardPictureConfirmation;
 	AlphaSourceCrop::VerticalTranslationDrift scopeSubtitleDrift;
@@ -3152,12 +3565,44 @@ struct LibplaceboVideoRenderer::Impl
 	bool presentationOwnedGeometryTransitionDeferred = false;
 	bool latestActivePicturePresentationRetentionSafe = false;
 	bool latestActivePicturePresentationRetentionEvaluated = false;
+	ActivePictureBounds latestActivePicturePresentationRetentionBounds;
+	uint64_t latestActivePicturePresentationRetentionSourceGeneration = 0;
+	uint64_t latestActivePicturePresentationRetentionSourceSequence = 0;
+	bool latestActivePictureGlobalNearBlackEvaluated = false;
+	bool latestActivePictureGlobalNearBlack = false;
+	double latestActivePictureGlobalLumaP90 = 0.0;
+	bool latestActivePictureOutwardVisibleBoundsAvailable = false;
+	bool latestKnownTrustedReacquisitionAvailable = false;
+	ActivePictureBounds latestKnownTrustedReacquisitionBounds;
+	ActivePictureClassification latestKnownTrustedReacquisitionClassification =
+		ActivePictureClassification::UNAVAILABLE;
+	uint64_t latestKnownTrustedReacquisitionSourceGeneration = 0;
+	uint64_t latestKnownTrustedReacquisitionSourceSequence = 0;
+	uint64_t latestKnownTrustedReacquisitionPresentationEpoch = 0;
+	bool latestKnownTrustedReacquisitionCurrentAssociation = false;
+	bool latestNativeBootstrapContractAvailable = false;
+	ActivePictureBounds latestNativeBootstrapContract;
+	bool latestNativeBootstrapRetentionEvaluated = false;
+	bool latestNativeBootstrapRetentionSafe = false;
+	bool latestNativeBootstrapOutwardVisible = false;
+	uint64_t latestNativeBootstrapSourceGeneration = 0;
+	uint64_t latestNativeBootstrapSourceSequence = 0;
+	uint64_t latestNativeBootstrapPresentationEpoch = 0;
+	AlphaSourceCrop::NearBlackPresentationEpisodeState
+		nearBlackPresentationEpisode;
 	std::string latestActivePicturePresentationRetentionReason;
 	bool fullRasterPresentationAuthorityAvailable = false;
 	uint64_t fullRasterPresentationAuthoritySourceGeneration = 0;
 	std::string lastSourceCropPolicy;
 	std::string lastFinalPresentationPolicy;
 	std::string lastFinalLayoutPolicy;
+	std::string lastHdrPeakAnalysisPolicy;
+	uint64_t hdrPeakAnalysisIntervalStartedTick = 0;
+	uint64_t hdrPeakAnalysisNextTelemetryTick = 0;
+	uint64_t hdrPeakAnalysisFrames = 0;
+	uint64_t hdrPeakAnalysisRestrictedFrames = 0;
+	uint64_t hdrPeakAnalysisFullFrames = 0;
+	uint64_t hdrPeakAnalysisFallbackFrames = 0;
 	std::string activeDisplayRule;
 	std::string effectiveSettingsFingerprint;
 	std::string restartSettingsFingerprint;
@@ -3169,11 +3614,17 @@ struct LibplaceboVideoRenderer::Impl
 	HMONITOR negotiatedMonitor = nullptr;
 	bool hasPresentedFrame = false;
 	uint64_t nextPresentationTelemetryLogTick = 0;
+	PostStallResetAdvisor postStallResetAdvisor;
+	std::atomic<uint64_t> postStallResetTelemetrySuppressUntilTick{ 0 };
 	uint64_t lastSubmittedScreenProfileRequest = 0;
 	uint64_t activePictureScreenProfileRequestSerial = 0;
+	PresentationResetEpoch presentationResetEpoch;
+	uint64_t consumedPresentationResetEpoch = 0;
 	std::mutex renderMutex;
-	std::mutex pendingProfileMutex;
-	std::unique_ptr<RendererSettings> pendingProfileSettings;
+	ViewportIntentMailbox<RendererSettings> pendingProfileIntent;
+	bool renderConfiguredScreenActive = false;
+	uint64_t renderViewportRequestSerial = 0;
+	int64_t renderViewportRequestNs = 0;
 	std::atomic_bool resizePending{ false };
 	std::atomic_bool outputRenegotiationPending{ false };
 	EOTF lastRenderedEotf = EOTF::UNKNOWN;
@@ -4122,8 +4573,7 @@ struct LibplaceboVideoRenderer::Impl
 			static_cast<LibplaceboRenderParameters::Toggle>(settings.deband);
 		parameterSettings.sigmoid =
 			static_cast<LibplaceboRenderParameters::Toggle>(settings.sigmoid);
-		parameterSettings.dithering =
-			static_cast<LibplaceboRenderParameters::Toggle>(settings.dithering);
+		parameterSettings.dithering = settings.dithering;
 		// Output geometry is live state. Without dynamic constants libplacebo
 		// includes dimensions and related values in generated shader programs,
 		// turning every previously unseen window size into a cold compile.
@@ -4160,12 +4610,18 @@ struct LibplaceboVideoRenderer::Impl
 			projection.renderParams.dither_params ? &ditherParams : nullptr;
 
 		DebugLog::Log(
-			"libplacebo settings: quality=%s tone_mapping=%s gamut_mapping=%s peak_detection=%s contrast_recovery=%.2f upscaler=%s downscaler=%s deband=%s dithering=%s dynamic_constants=%d display_bit_depth=%s output_presentation=%s output_range=%s output_transport_gamma=%s output_gamma=%s sdr_input_transfer=%s sdr_adjust_gamma=%s target=%.1f nits black=%.3f profile_update_mode=%s output_diagnostics=%d diagnostic_disable_shader_cache=%d diagnostic_disable_compute=%d diagnostic_force_8bit_sdr_swapchain=%d diagnostic_allow_limited_g22=%d diagnostic_allow_full_g22=%d diagnostic_vp_owned_dxgi_presenter=%d refresh_switch=%d refresh_command_delay=%llus refresh_commands=%u viewport_target=%s screen_aspect=%.4f automatic_crop=%d subtitle_fit=%d subtitle_hold=%llums subtitle_engage_drift=%llums subtitle_release_drift=%llums subtitle_padding=%dpx subtitle_target_buffer=%dpx",
+			"libplacebo settings: quality=%s tone_mapping=%s gamut_mapping=%s peak_detection=%s hdr_peak_analysis_picture_only=%d hdr_peak_analysis_motion_compensation=%d hdr_peak_analysis_height_percent=%d hdr_peak_analysis_position=%s libplacebo_version=%s api=%d local_analysis_crop=vp0147-motion-v1 contrast_recovery=%.2f upscaler=%s downscaler=%s deband=%s dithering=%s dynamic_constants=%d display_bit_depth=%s output_presentation=%s output_range=%s output_transport_gamma=%s output_gamma=%s sdr_input_transfer=%s sdr_adjust_gamma=%s target=%.1f nits black=%.3f profile_update_mode=%s output_diagnostics=%d diagnostic_disable_shader_cache=%d diagnostic_disable_compute=%d diagnostic_force_8bit_sdr_swapchain=%d diagnostic_allow_limited_g22=%d diagnostic_allow_full_g22=%d diagnostic_vp_owned_dxgi_presenter=%d refresh_switch=%d refresh_command_delay=%llus refresh_commands=%u viewport_target=%s screen_aspect=%.4f automatic_crop=%d subtitle_fit=%d subtitle_hold=%llums subtitle_engage_drift=%llums subtitle_release_drift=%llums subtitle_padding=%dpx subtitle_target_buffer=%dpx",
 			settings.quality.c_str(),
 			colorMapParams.tone_mapping_function
 				? colorMapParams.tone_mapping_function->name : "none",
 			colorMapParams.gamut_mapping ? colorMapParams.gamut_mapping->name : "none",
 			renderParams.peak_detect_params ? "on" : "off",
+			settings.hdrPeakAnalysisPictureOnly ? 1 : 0,
+			settings.hdrPeakAnalysisMotionCompensation ? 1 : 0,
+			settings.hdrPeakAnalysisHeightPercent,
+			settings.hdrPeakAnalysisPosition.c_str(),
+			PL_VERSION,
+			PL_API_VER,
 			colorMapParams.contrast_recovery,
 			renderParams.upscaler && renderParams.upscaler->name
 				? renderParams.upscaler->name : "built-in",
@@ -4175,7 +4631,7 @@ struct LibplaceboVideoRenderer::Impl
 				(renderParams.deband_params ? "auto/on" : "auto/off") :
 				settings.debandStrength.c_str(),
 			renderParams.error_diffusion ? "auto/error-diffusion" :
-				(renderParams.dither_params ? "on" : "off"),
+				(renderParams.dither_params ? settings.dithering.c_str() : "off"),
 			renderParams.dynamic_constants ? 1 : 0,
 			settings.displayBitDepth.c_str(),
 			settings.outputPresentation.c_str(),
@@ -4207,6 +4663,164 @@ struct LibplaceboVideoRenderer::Impl
 			scopeSubtitlePaddingPixels,
 			scopeSubtitleTargetBufferPixels);
 		LogResolvedRenderOptions(lifecycle);
+	}
+
+	HdrPeakAnalysisCrop::Decision ApplyHdrPeakAnalysisCrop(
+		uint64_t frameGeneration, uint64_t sourceSequence,
+		const HdrPeakAnalysisCrop::TrustedPicture& trustedPicture,
+		const pl_rect2df& presentationCrop, double motionProtectionPixels)
+	{
+		const bool peakDetectionActive = renderParams.peak_detect_params != nullptr;
+		if (peakDetectionActive)
+			peakDetectParams.analysis_crop = {};
+
+		const HdrPeakAnalysisCrop::Decision decision =
+			HdrPeakAnalysisCrop::ResolvePolicy(hdrPeakAnalysisPictureOnly,
+				hdrPeakAnalysisMotionCompensation, peakDetectionActive,
+				frameGeneration, trustedPicture, presentationCrop,
+				hdrPeakAnalysisHeightPercent, motionProtectionPixels,
+				ResolveHdrPeakAnalysisPosition(hdrPeakAnalysisPosition));
+		if (peakDetectionActive && decision.AppliesRestriction())
+			peakDetectParams.analysis_crop = decision.normalizedCrop;
+
+		const bool analysisProtectionEnabled = hdrPeakAnalysisPictureOnly ||
+			hdrPeakAnalysisMotionCompensation;
+		if (analysisProtectionEnabled)
+		{
+			++hdrPeakAnalysisFrames;
+			switch (decision.outcome)
+			{
+			case HdrPeakAnalysisCrop::Outcome::RESTRICTED:
+				++hdrPeakAnalysisRestrictedFrames;
+				break;
+			case HdrPeakAnalysisCrop::Outcome::FALLBACK:
+				++hdrPeakAnalysisFallbackFrames;
+				break;
+			case HdrPeakAnalysisCrop::Outcome::FULL_PRESENTATION:
+				++hdrPeakAnalysisFullFrames;
+				break;
+			default:
+				break;
+			}
+		}
+		else
+		{
+			hdrPeakAnalysisIntervalStartedTick = 0;
+			hdrPeakAnalysisNextTelemetryTick = 0;
+			hdrPeakAnalysisFrames = 0;
+			hdrPeakAnalysisRestrictedFrames = 0;
+			hdrPeakAnalysisFullFrames = 0;
+			hdrPeakAnalysisFallbackFrames = 0;
+		}
+
+		std::ostringstream signature;
+		signature.imbue(std::locale::classic());
+		signature << hdrPeakAnalysisPictureOnly << '|'
+			<< hdrPeakAnalysisMotionCompensation << '|'
+			<< hdrPeakAnalysisHeightPercent << '|'
+			<< hdrPeakAnalysisPosition << '|'
+			<< motionProtectionPixels << '|'
+			<< peakDetectionActive << '|' << frameGeneration << '|'
+			<< trustedPicture.available << '|'
+			<< trustedPicture.sourceGeneration << '|'
+			<< trustedPicture.left << ',' << trustedPicture.top << '-'
+			<< trustedPicture.right << ',' << trustedPicture.bottom << '|'
+			<< presentationCrop.x0 << ',' << presentationCrop.y0 << '-'
+			<< presentationCrop.x1 << ',' << presentationCrop.y1 << '|'
+			<< decision.trustedIntersection.x0 << ','
+			<< decision.trustedIntersection.y0 << '-'
+			<< decision.trustedIntersection.x1 << ','
+			<< decision.trustedIntersection.y1 << '|'
+			<< decision.normalizedCrop.x0 << ','
+			<< decision.normalizedCrop.y0 << '-'
+			<< decision.normalizedCrop.x1 << ','
+			<< decision.normalizedCrop.y1 << '|'
+			<< static_cast<int>(decision.outcome) << '|' << decision.reason;
+		if (signature.str() != lastHdrPeakAnalysisPolicy)
+		{
+			lastHdrPeakAnalysisPolicy = signature.str();
+			DebugLog::Log(
+				"libplacebo HDR analysis ROI policy: enabled=%d mode=%s fixed_enabled=%d motion_enabled=%d motion_protection_pixels=%.1f peak_detection=%d fork=vp0147-motion-v1 api=%d version=%s analysis_height_percent=%.1f analysis_position=%s source_generation=%llu source_sequence=%llu trusted_available=%d trusted_generation=%llu trusted=%d,%d-%d,%d raster=%dx%d presentation=%.3f,%.3f-%.3f,%.3f analysis_intersection=%.3f,%.3f-%.3f,%.3f normalized=%.6f,%.6f-%.6f,%.6f excluded_pixels=%.0f excluded_percent=%.3f outcome=%s reason=\"%s\"",
+				analysisProtectionEnabled ? 1 : 0,
+				hdrPeakAnalysisPictureOnly ? "fixed" :
+					(hdrPeakAnalysisMotionCompensation ? "motion" : "off"),
+				hdrPeakAnalysisPictureOnly ? 1 : 0,
+				hdrPeakAnalysisMotionCompensation ? 1 : 0,
+				motionProtectionPixels,
+				peakDetectionActive ? 1 : 0,
+				PL_API_VER, PL_VERSION,
+				static_cast<double>(hdrPeakAnalysisHeightPercent),
+				hdrPeakAnalysisPosition.c_str(),
+				static_cast<unsigned long long>(frameGeneration),
+				static_cast<unsigned long long>(sourceSequence),
+				trustedPicture.available ? 1 : 0,
+				static_cast<unsigned long long>(
+					trustedPicture.sourceGeneration),
+				trustedPicture.left, trustedPicture.top,
+				trustedPicture.right, trustedPicture.bottom,
+				trustedPicture.rasterWidth, trustedPicture.rasterHeight,
+				presentationCrop.x0, presentationCrop.y0,
+				presentationCrop.x1, presentationCrop.y1,
+				decision.trustedIntersection.x0,
+				decision.trustedIntersection.y0,
+				decision.trustedIntersection.x1,
+				decision.trustedIntersection.y1,
+				decision.normalizedCrop.x0, decision.normalizedCrop.y0,
+				decision.normalizedCrop.x1, decision.normalizedCrop.y1,
+				decision.excludedSourcePixels,
+				decision.excludedFraction * 100.0,
+				HdrPeakAnalysisCrop::OutcomeName(decision.outcome),
+				decision.reason);
+		}
+		return decision;
+	}
+
+	void LogHdrPeakAnalysisMetrics(
+		const HdrPeakAnalysisCrop::Decision& decision,
+		uint64_t sourceSequence, bool rendered)
+	{
+		if (!hdrPeakAnalysisPictureOnly &&
+			!hdrPeakAnalysisMotionCompensation)
+			return;
+
+		const uint64_t now = GetTickCount64();
+		if (hdrPeakAnalysisIntervalStartedTick == 0)
+			hdrPeakAnalysisIntervalStartedTick = now;
+		if (hdrPeakAnalysisNextTelemetryTick == 0)
+			hdrPeakAnalysisNextTelemetryTick = now;
+		if (now < hdrPeakAnalysisNextTelemetryTick)
+			return;
+
+		pl_hdr_metadata metadata{};
+		const bool metadataAvailable = rendered &&
+			renderParams.peak_detect_params &&
+			pl_renderer_get_hdr_metadata(renderer, &metadata);
+		const float maxNits = metadataAvailable
+			? pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, metadata.max_pq_y)
+			: 0.0f;
+		const float averageNits = metadataAvailable
+			? pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, metadata.avg_pq_y)
+			: 0.0f;
+		DebugLog::Log(
+			"libplacebo HDR analysis ROI metrics: interval_ms=%llu source_sequence=%llu frames=%llu restricted=%llu full_presentation=%llu fallback=%llu current_outcome=%s current_excluded_percent=%.3f rendered=%d metadata_available=%d detected_max_pq=%.6f detected_avg_pq=%.6f detected_max_nits=%.2f detected_avg_nits=%.2f",
+			static_cast<unsigned long long>(
+				now - hdrPeakAnalysisIntervalStartedTick),
+			static_cast<unsigned long long>(sourceSequence),
+			static_cast<unsigned long long>(hdrPeakAnalysisFrames),
+			static_cast<unsigned long long>(
+				hdrPeakAnalysisRestrictedFrames),
+			static_cast<unsigned long long>(hdrPeakAnalysisFullFrames),
+			static_cast<unsigned long long>(hdrPeakAnalysisFallbackFrames),
+			HdrPeakAnalysisCrop::OutcomeName(decision.outcome),
+			decision.excludedFraction * 100.0,
+			rendered ? 1 : 0, metadataAvailable ? 1 : 0,
+			metadata.max_pq_y, metadata.avg_pq_y, maxNits, averageNits);
+		hdrPeakAnalysisIntervalStartedTick = now;
+		hdrPeakAnalysisNextTelemetryTick = now + 5000;
+		hdrPeakAnalysisFrames = 0;
+		hdrPeakAnalysisRestrictedFrames = 0;
+		hdrPeakAnalysisFullFrames = 0;
+		hdrPeakAnalysisFallbackFrames = 0;
 	}
 
 	void ClearScopePresentationEvidence()
@@ -4252,8 +4866,14 @@ struct LibplaceboVideoRenderer::Impl
 		const ActivePictureBounds* barAuthority,
 		uint64_t sourceSequence,
 		bool forceAnalysis = false,
-		bool heldBarAnalysisAuthority = false)
+		bool heldBarAnalysisAuthority = false,
+		bool* analysisScheduled = nullptr,
+		bool* analysisCompleted = nullptr)
 	{
+		if (analysisScheduled)
+			*analysisScheduled = false;
+		if (analysisCompleted)
+			*analysisCompleted = false;
 		const uint64_t now = GetTickCount64();
 		const bool sourceIsCurrent = source && source->IsValid() &&
 			source->width == width && source->height == height &&
@@ -4348,8 +4968,11 @@ struct LibplaceboVideoRenderer::Impl
 		// while still reacting in roughly 50-125 ms.
 		const bool subtitleAnalysisScheduled = authorityIsCurrentBars &&
 			++scopeSubtitleAnalysisFrame % 3 == 0;
-		if (authorityIsCurrentBars &&
-			(forceAnalysis || subtitleAnalysisScheduled))
+		const bool subtitleAnalysisEvaluated = authorityIsCurrentBars &&
+			(forceAnalysis || subtitleAnalysisScheduled);
+		if (analysisScheduled)
+			*analysisScheduled = subtitleAnalysisEvaluated;
+		if (subtitleAnalysisEvaluated)
 		{
 			if (forceAnalysis && !subtitleAnalysisScheduled)
 			{
@@ -4555,6 +5178,8 @@ struct LibplaceboVideoRenderer::Impl
 				verticalInput.lowerRequiredShift = lowerRequiredShift;
 				AlphaSourceCrop::VerticalBarContentDecision verticalDecision =
 					AlphaSourceCrop::EvaluateVerticalBarContent(verticalInput);
+				if (analysisCompleted)
+					*analysisCompleted = true;
 				const bool upperOverlayLike = verticalDecision.upperOverlayLike;
 				const bool lowerOverlayLike = verticalDecision.lowerOverlayLike;
 				AlphaSourceCrop::VerticalTranslationConfirmationInput
@@ -4574,13 +5199,16 @@ struct LibplaceboVideoRenderer::Impl
 					verticalDecision.translationPixels < 0.0f
 					? static_cast<float>(trustedPicture.top)
 					: static_cast<float>(height - trustedPicture.bottom);
+				confirmationInput.sourceSequence = sourceSequence;
 				const auto confirmation =
 					AlphaSourceCrop::ConfirmVerticalTranslation(confirmationInput);
 				scopeSubtitleTranslationConfirmation = confirmation.state;
 				if (confirmation.pending)
 				{
 					DebugLog::Log(
-						"Alpha vertical bar translation: candidate pending confirmation %u/%u target=%.1f px retained=%.1f px",
+						"Alpha vertical bar translation: sequence=%llu generation=%llu candidate pending confirmation %u/%u target=%.1f px retained=%.1f px",
+						static_cast<unsigned long long>(sourceSequence),
+						static_cast<unsigned long long>(source->generation),
 						confirmation.state.confirmations,
 						AlphaSourceCrop::
 							VERTICAL_TRANSLATION_CONFIRMATIONS_REQUIRED,
@@ -4591,7 +5219,9 @@ struct LibplaceboVideoRenderer::Impl
 				else if (confirmation.newlyAccepted)
 				{
 					DebugLog::Log(
-						"Alpha vertical bar translation: candidate accepted target=%.1f px buffer=%d px after %u stable samples",
+						"Alpha vertical bar translation: sequence=%llu generation=%llu candidate accepted target=%.1f px buffer=%d px after %u stable samples",
+						static_cast<unsigned long long>(sourceSequence),
+						static_cast<unsigned long long>(source->generation),
 						confirmation.effective.translationPixels,
 						scopeSubtitleTargetBufferPixels,
 						AlphaSourceCrop::
@@ -4600,12 +5230,15 @@ struct LibplaceboVideoRenderer::Impl
 				verticalDecision = confirmation.effective;
 				const auto fitConfirmation =
 					AlphaSourceCrop::ConfirmVerticalFit(
-						scopeSubtitleFitConfirmation, verticalDecision);
+						scopeSubtitleFitConfirmation, verticalDecision,
+						sourceSequence);
 				scopeSubtitleFitConfirmation = fitConfirmation.state;
 				if (fitConfirmation.pending)
 				{
 					DebugLog::Log(
-						"Alpha vertical bar fit: candidate pending confirmation %u/%u; retaining trusted presentation",
+						"Alpha vertical bar fit: sequence=%llu generation=%llu candidate pending confirmation %u/%u; retaining trusted presentation",
+						static_cast<unsigned long long>(sourceSequence),
+						static_cast<unsigned long long>(source->generation),
 						fitConfirmation.state.confirmations,
 						AlphaSourceCrop::
 							VERTICAL_FIT_CONFIRMATIONS_REQUIRED);
@@ -4613,7 +5246,9 @@ struct LibplaceboVideoRenderer::Impl
 				else if (fitConfirmation.newlyAccepted)
 				{
 					DebugLog::Log(
-						"Alpha vertical bar fit: candidate accepted after %u consecutive dense samples",
+						"Alpha vertical bar fit: sequence=%llu generation=%llu candidate accepted after %u consecutive dense samples",
+						static_cast<unsigned long long>(sourceSequence),
+						static_cast<unsigned long long>(source->generation),
 						AlphaSourceCrop::
 							VERTICAL_FIT_CONFIRMATIONS_REQUIRED);
 				}
@@ -4652,22 +5287,27 @@ struct LibplaceboVideoRenderer::Impl
 					policy << upperContent << upperOverlayLike << '|'
 						<< lowerContent << lowerOverlayLike << '|'
 						<< static_cast<int>(action) << '|'
-						<< upperContentTop << ',' << upperContentBottom << ','
-						<< upperMaximumContentSamples << '|'
-						<< lowerContentTop << ',' << lowerContentBottom << ','
-						<< lowerMaximumContentSamples;
+						<< scopeSubtitleTranslationConfirmation.confirmations << '|'
+						<< scopeSubtitleFitConfirmation.confirmations;
 					if (policy.str() != lastScopeVerticalOverlayPolicy)
 					{
 						lastScopeVerticalOverlayPolicy = policy.str();
 						DebugLog::Log(
-							"Alpha vertical bar content: top=%d overlay_top=%d top_extent=%d..%d top_peak=%d bottom=%d overlay_bottom=%d bottom_extent=%d..%d bottom_peak=%d decision=%s",
+							"Alpha vertical bar content: sequence=%llu generation=%llu top=%d overlay_top=%d top_extent=%d..%d top_peak=%d bottom=%d overlay_bottom=%d bottom_extent=%d..%d bottom_peak=%d decision=%s translation_confirm=%u/%u fit_confirm=%u/%u",
+							static_cast<unsigned long long>(sourceSequence),
+							static_cast<unsigned long long>(source->generation),
 							upperContent ? 1 : 0, upperOverlayLike ? 1 : 0,
 							upperContentTop, upperContentBottom,
 							upperMaximumContentSamples,
 							lowerContent ? 1 : 0, lowerOverlayLike ? 1 : 0,
 							lowerContentTop, lowerContentBottom,
 							lowerMaximumContentSamples,
-							actionLabel);
+							actionLabel,
+							scopeSubtitleTranslationConfirmation.confirmations,
+							AlphaSourceCrop::
+								VERTICAL_TRANSLATION_CONFIRMATIONS_REQUIRED,
+							scopeSubtitleFitConfirmation.confirmations,
+							AlphaSourceCrop::VERTICAL_FIT_CONFIRMATIONS_REQUIRED);
 					}
 				}
 			}
@@ -4753,8 +5393,6 @@ struct LibplaceboVideoRenderer::Impl
 			}
 		}
 
-		const bool subtitleAnalysisEvaluated = authorityIsCurrentBars &&
-			(forceAnalysis || subtitleAnalysisScheduled);
 		const bool verticalPresentationActive =
 			AlphaSourceCrop::IsVerticalBarPresentationActiveForFrame(
 				scopeVerticalBarPresentation, now, scopeSubtitleHoldMs,
@@ -5945,7 +6583,8 @@ struct LibplaceboVideoRenderer::Impl
 		// fullscreen direct/BT.2020 request. Keep the configured request intact
 		// for a later top-level fullscreen renderer generation.
 		const LONG_PTR targetStyle = GetWindowLongPtr(videoHwnd, GWL_STYLE);
-		if ((targetStyle & WS_CHILD) != 0)
+		const bool embeddedPreview = (targetStyle & WS_CHILD) != 0;
+		if (embeddedPreview)
 		{
 			effectiveOutputRequest.presentation =
 				LibplaceboOutput::PresentationRequest::COMPOSED;
@@ -6014,7 +6653,16 @@ struct LibplaceboVideoRenderer::Impl
 			settings.cropWiderContentAspectLimitConfigured;
 		cropWiderContentAspectLimit =
 			settings.cropWiderContentAspectLimit;
+		fixedCropAspectConfigured = settings.fixedCropAspectConfigured;
+		fixedCropAspect = settings.fixedCropAspect;
 		scopeSubtitleFit = settings.scopeSubtitleFit;
+		hdrPeakAnalysisPictureOnly =
+			settings.hdrPeakAnalysisPictureOnly;
+		hdrPeakAnalysisMotionCompensation =
+			settings.hdrPeakAnalysisMotionCompensation;
+		hdrPeakAnalysisHeightPercent =
+			settings.hdrPeakAnalysisHeightPercent;
+		hdrPeakAnalysisPosition = settings.hdrPeakAnalysisPosition;
 		scopeSubtitleHoldMs = settings.scopeSubtitleHoldMs;
 		scopeSubtitleEngageDriftMs = settings.scopeSubtitleEngageDriftMs;
 		scopeSubtitleReleaseDriftMs = settings.scopeSubtitleReleaseDriftMs;
@@ -6038,7 +6686,16 @@ struct LibplaceboVideoRenderer::Impl
 		// the desktop timing. Query and select the content rate only after that
 		// transition has completed; an earlier verified no-op could otherwise
 		// leave this newly initialized renderer running at the restored rate.
-		displayRefreshRate.Switch(videoHwnd, *state, settings);
+		if (ShouldSwitchRefreshRateForPresentationTarget(embeddedPreview,
+			settings.refreshRateSwitchMode))
+		{
+			displayRefreshRate.Switch(videoHwnd, *state, settings);
+		}
+		else if (settings.refreshRateSwitchMode == RefreshRateSwitchMode::FullscreenOnly)
+		{
+			DebugLog::Log(
+				"libplacebo refresh-rate switch skipped: presentation=embedded-child reason=display-global timing belongs to top-level presentation surfaces");
+		}
 		// Negotiate only after libplacebo has applied its hint and completed the
 		// initial ResizeBuffers operation; either may otherwise replace DXGI state.
 		ConfigureAndFallback("initialize");
@@ -6071,14 +6728,22 @@ struct LibplaceboVideoRenderer::Impl
 			sdrTargetNits);
 	}
 
-	void ApplyViewportSettings(const RendererSettings& settings)
+	void ApplyViewportSettings(const RendererSettings& settings,
+		uint64_t viewportRequestSerial, int64_t viewportRequestNs)
 	{
-		// UI-facing methods only publish immutable intent. All libplacebo and
-		// output work runs at the render-thread safe point.
-		std::lock_guard<std::mutex> pendingGuard(pendingProfileMutex);
-		pendingProfileSettings.reset(new RendererSettings(settings));
+		// Settings and their viewport generation are one immutable intent. The
+		// render thread must never pair a new target serial with old crop settings.
+		const bool supersededPendingSettings = pendingProfileIntent.Publish(
+			settings, settings.configuredScreenTarget,
+			viewportRequestSerial, viewportRequestNs);
 		DebugLog::Log(
-			"libplacebo viewport settings queued for render thread");
+			"libplacebo viewport settings queued for render thread (superseded_pending=%d)",
+			supersededPendingSettings ? 1 : 0);
+	}
+
+	bool HasPendingProfileSettings()
+	{
+		return pendingProfileIntent.HasPending();
 	}
 
 	void ApplyViewportSettingsLocked(const RendererSettings& settings)
@@ -6101,7 +6766,16 @@ struct LibplaceboVideoRenderer::Impl
 				settings.cropWiderContentAspectLimitConfigured ||
 			cropWiderContentAspectLimit !=
 				settings.cropWiderContentAspectLimit ||
+			fixedCropAspectConfigured != settings.fixedCropAspectConfigured ||
+			fixedCropAspect != settings.fixedCropAspect ||
 			scopeSubtitleFit != settings.scopeSubtitleFit ||
+			hdrPeakAnalysisPictureOnly !=
+				settings.hdrPeakAnalysisPictureOnly ||
+			hdrPeakAnalysisMotionCompensation !=
+				settings.hdrPeakAnalysisMotionCompensation ||
+			hdrPeakAnalysisHeightPercent !=
+				settings.hdrPeakAnalysisHeightPercent ||
+			hdrPeakAnalysisPosition != settings.hdrPeakAnalysisPosition ||
 			scopeSubtitleHoldMs != settings.scopeSubtitleHoldMs ||
 			scopeSubtitleEngageDriftMs != settings.scopeSubtitleEngageDriftMs ||
 			scopeSubtitleReleaseDriftMs != settings.scopeSubtitleReleaseDriftMs ||
@@ -6125,7 +6799,16 @@ struct LibplaceboVideoRenderer::Impl
 			settings.cropWiderContentAspectLimitConfigured;
 		cropWiderContentAspectLimit =
 			settings.cropWiderContentAspectLimit;
+		fixedCropAspectConfigured = settings.fixedCropAspectConfigured;
+		fixedCropAspect = settings.fixedCropAspect;
 		scopeSubtitleFit = settings.scopeSubtitleFit;
+		hdrPeakAnalysisPictureOnly =
+			settings.hdrPeakAnalysisPictureOnly;
+		hdrPeakAnalysisMotionCompensation =
+			settings.hdrPeakAnalysisMotionCompensation;
+		hdrPeakAnalysisHeightPercent =
+			settings.hdrPeakAnalysisHeightPercent;
+		hdrPeakAnalysisPosition = settings.hdrPeakAnalysisPosition;
 		scopeSubtitleHoldMs = settings.scopeSubtitleHoldMs;
 		scopeSubtitleEngageDriftMs = settings.scopeSubtitleEngageDriftMs;
 		scopeSubtitleReleaseDriftMs = settings.scopeSubtitleReleaseDriftMs;
@@ -6149,7 +6832,16 @@ struct LibplaceboVideoRenderer::Impl
 			settings.cropWiderContentAspectLimitConfigured;
 		activeSettings.cropWiderContentAspectLimit =
 			settings.cropWiderContentAspectLimit;
+		activeSettings.fixedCropAspectConfigured = settings.fixedCropAspectConfigured;
+		activeSettings.fixedCropAspect = settings.fixedCropAspect;
 		activeSettings.scopeSubtitleFit = settings.scopeSubtitleFit;
+		activeSettings.hdrPeakAnalysisPictureOnly =
+			settings.hdrPeakAnalysisPictureOnly;
+		activeSettings.hdrPeakAnalysisMotionCompensation =
+			settings.hdrPeakAnalysisMotionCompensation;
+		activeSettings.hdrPeakAnalysisHeightPercent =
+			settings.hdrPeakAnalysisHeightPercent;
+		activeSettings.hdrPeakAnalysisPosition = settings.hdrPeakAnalysisPosition;
 		activeSettings.scopeSubtitleHoldMs = settings.scopeSubtitleHoldMs;
 		activeSettings.scopeSubtitleEngageDriftMs =
 			settings.scopeSubtitleEngageDriftMs;
@@ -6184,6 +6876,7 @@ struct LibplaceboVideoRenderer::Impl
 		RendererSettings currentTransport = current;
 		RendererSettings nextTransport = next;
 		currentTransport.switchRefreshRate = next.switchRefreshRate;
+		currentTransport.refreshRateSwitchMode = next.refreshRateSwitchMode;
 		currentTransport.sdrTargetNits = next.sdrTargetNits;
 		currentTransport.sdrBlackNits = next.sdrBlackNits;
 		currentTransport.quality = next.quality;
@@ -6230,7 +6923,7 @@ struct LibplaceboVideoRenderer::Impl
 		};
 		changed(current.sdrTargetNits != next.sdrTargetNits, "sdr_target_nits");
 		changed(current.sdrBlackNits != next.sdrBlackNits, "sdr_black_nits");
-		changed(current.switchRefreshRate != next.switchRefreshRate,
+		changed(current.refreshRateSwitchMode != next.refreshRateSwitchMode,
 			"switch_refresh_rate");
 		changed(current.quality != next.quality, "quality");
 		changed(current.toneMapping != next.toneMapping, "tone_mapping");
@@ -6292,7 +6985,16 @@ struct LibplaceboVideoRenderer::Impl
 				next.cropWiderContentAspectLimitConfigured ||
 			current.cropWiderContentAspectLimit !=
 				next.cropWiderContentAspectLimit ||
+			current.fixedCropAspectConfigured != next.fixedCropAspectConfigured ||
+			current.fixedCropAspect != next.fixedCropAspect ||
 			current.scopeSubtitleFit != next.scopeSubtitleFit ||
+			current.hdrPeakAnalysisPictureOnly !=
+				next.hdrPeakAnalysisPictureOnly ||
+			current.hdrPeakAnalysisMotionCompensation !=
+				next.hdrPeakAnalysisMotionCompensation ||
+			current.hdrPeakAnalysisHeightPercent !=
+				next.hdrPeakAnalysisHeightPercent ||
+			current.hdrPeakAnalysisPosition != next.hdrPeakAnalysisPosition ||
 			current.scopeSubtitleHoldMs != next.scopeSubtitleHoldMs ||
 			current.scopeSubtitleEngageDriftMs != next.scopeSubtitleEngageDriftMs ||
 			current.scopeSubtitleReleaseDriftMs != next.scopeSubtitleReleaseDriftMs ||
@@ -6354,7 +7056,8 @@ struct LibplaceboVideoRenderer::Impl
 		return LiveProfileSettingsCompatible(publishedActiveSettings, settings);
 	}
 
-	bool ApplyProfileSettingsLive(const RendererSettings& settings)
+	bool ApplyProfileSettingsLive(const RendererSettings& settings,
+		uint64_t viewportRequestSerial, int64_t viewportRequestNs)
 	{
 		if (!CanApplyProfileSettingsLive(settings))
 		{
@@ -6362,10 +7065,12 @@ struct LibplaceboVideoRenderer::Impl
 				"libplacebo live profile update rejected before queueing: transport, device, or shader-cache policy differs");
 			return false;
 		}
-		std::lock_guard<std::mutex> pendingGuard(pendingProfileMutex);
-		pendingProfileSettings.reset(new RendererSettings(settings));
+		const bool supersededPendingSettings = pendingProfileIntent.Publish(
+			settings, settings.configuredScreenTarget,
+			viewportRequestSerial, viewportRequestNs);
 		DebugLog::Log(
-			"libplacebo live profile update queued for render thread");
+			"libplacebo live profile update queued for render thread (superseded_pending=%d)",
+			supersededPendingSettings ? 1 : 0);
 		return true;
 	}
 
@@ -6473,14 +7178,10 @@ struct LibplaceboVideoRenderer::Impl
 
 	void ApplyPendingProfileSettingsLocked()
 	{
-		std::unique_ptr<RendererSettings> pending;
-		{
-			std::lock_guard<std::mutex> pendingGuard(pendingProfileMutex);
-			pending.swap(pendingProfileSettings);
-		}
-		if (!pending)
+		ViewportIntentMailbox<RendererSettings>::Intent pending;
+		if (!pendingProfileIntent.Consume(pending))
 			return;
-		if (!ApplyProfileSettingsLiveLocked(*pending))
+		if (!ApplyProfileSettingsLiveLocked(pending.settings))
 		{
 			DebugLog::Log(
 				"libplacebo queued live profile update was rejected on render thread");
@@ -6488,9 +7189,13 @@ struct LibplaceboVideoRenderer::Impl
 		}
 		else
 		{
-			ApplyViewportSettingsLocked(*pending);
+			ApplyViewportSettingsLocked(pending.settings);
+			renderConfiguredScreenActive = pending.configuredScreenActive;
+			renderViewportRequestSerial = pending.viewportRequestSerial;
+			renderViewportRequestNs = pending.viewportRequestNs;
 			DebugLog::Log(
-				"libplacebo queued profile and viewport settings applied on render thread");
+				"libplacebo queued profile and viewport intent applied atomically on render thread: request=%llu",
+				static_cast<unsigned long long>(renderViewportRequestSerial));
 		}
 	}
 
@@ -6871,9 +7576,78 @@ struct LibplaceboVideoRenderer::Impl
 		presentationOwnedGeometryTransitionDeferred = false;
 		latestActivePicturePresentationRetentionSafe = false;
 		latestActivePicturePresentationRetentionEvaluated = false;
+		latestActivePicturePresentationRetentionBounds = {};
+		latestActivePicturePresentationRetentionSourceGeneration = 0;
+		latestActivePicturePresentationRetentionSourceSequence = 0;
+		latestActivePictureGlobalNearBlackEvaluated = false;
+		latestActivePictureGlobalNearBlack = false;
+		latestActivePictureGlobalLumaP90 = 0.0;
+		latestActivePictureOutwardVisibleBoundsAvailable = false;
+		latestKnownTrustedReacquisitionAvailable = false;
+		latestKnownTrustedReacquisitionBounds = {};
+		latestKnownTrustedReacquisitionClassification =
+			ActivePictureClassification::UNAVAILABLE;
+		latestKnownTrustedReacquisitionSourceGeneration = 0;
+		latestKnownTrustedReacquisitionSourceSequence = 0;
+		latestKnownTrustedReacquisitionPresentationEpoch = 0;
+		latestKnownTrustedReacquisitionCurrentAssociation = false;
+		latestNativeBootstrapContractAvailable = false;
+		latestNativeBootstrapContract = {};
+		latestNativeBootstrapRetentionEvaluated = false;
+		latestNativeBootstrapRetentionSafe = false;
+		latestNativeBootstrapOutwardVisible = false;
+		latestNativeBootstrapSourceGeneration = 0;
+		latestNativeBootstrapSourceSequence = 0;
+		latestNativeBootstrapPresentationEpoch = 0;
 		latestActivePicturePresentationRetentionReason.clear();
 		fullRasterPresentationAuthorityAvailable = false;
 		fullRasterPresentationAuthoritySourceGeneration = 0;
+	}
+
+	void RequestPresentationStateReset()
+	{
+		presentationResetEpoch.Request();
+	}
+
+	void ClearPresentationStateForReset(uint64_t resetEpoch)
+	{
+		// A renderer/refresh reset starts a new source generation. Never bridge
+		// source-derived crop, subtitle, NLS, or HDR-analysis authority across
+		// that boundary. This deliberately retains libplacebo's device, shader
+		// cache, colour-map configuration, and output negotiation.
+		nlsTransition.Reset();
+		outwardPictureConfirmation = {};
+		nlsGeometryAvailable = false;
+		nlsTransitionWithdrawn = true;
+		nlsGeometry = {};
+		nlsGeometryClassification =
+			ActivePictureClassification::UNAVAILABLE;
+		nlsGeometrySourceGeneration = 0;
+		nlsGeometrySourceFormatKey = 0;
+		activePictureAnalysisSourceGeneration = 0;
+		latestActivePictureObservationSupportsCrop = false;
+		activePictureAmbiguityHold.Reset();
+		nearBlackPresentationEpisode = {};
+		ClearSceneVerificationSnapshot();
+		ClearLatestActivePictureEvidence();
+		ClearScopeSubtitleEvidence();
+		ClearScopePresentationEvidence();
+		scopeVerticalInspectionBridge = {};
+		scopeSubtitleRetentionWasUnsafe = false;
+		scopeSubtitleRetentionGeneration = 0;
+		nlsDecision = {};
+		renderParams.hooks = nullptr;
+		renderParams.num_hooks = 0;
+		if (renderParams.peak_detect_params)
+			peakDetectParams.analysis_crop = {};
+		lastSourceCropPolicy.clear();
+		lastFinalPresentationPolicy.clear();
+		lastFinalLayoutPolicy.clear();
+		lastHdrPeakAnalysisPolicy.clear();
+		activePictureScreenProfileRequestSerial = 0;
+		DebugLog::Log(
+			"Alpha presentation reset boundary: epoch=%llu source_geometry=cleared subtitle_state=cleared nls_state=cleared hdr_analysis_roi=cleared shader_cache=retained output_contract=retained",
+			static_cast<unsigned long long>(resetEpoch));
 	}
 
 	void UpdateNlsForFrame(const AnalysisLumaSource& analysisSource,
@@ -6900,6 +7674,12 @@ struct LibplaceboVideoRenderer::Impl
 			nlsGeometrySourceGeneration = 0;
 			activePictureAnalysisSourceGeneration = analysisSource.generation;
 			activePictureAmbiguityHold.Reset();
+			if (nearBlackPresentationEpisode.sourceGeneration != 0 &&
+				nearBlackPresentationEpisode.sourceGeneration !=
+					analysisSource.generation)
+			{
+				nearBlackPresentationEpisode = {};
+			}
 			ClearSceneVerificationSnapshot();
 			ClearLatestActivePictureEvidence();
 			ClearScopeSubtitleEvidence();
@@ -6913,7 +7693,9 @@ struct LibplaceboVideoRenderer::Impl
 		}
 
 		const bool needsActivePictureAnalysis =
-			nlsRequested || automaticSourceCrop || scopeSubtitleFit;
+			nlsRequested || automaticSourceCrop || scopeSubtitleFit ||
+			hdrPeakAnalysisPictureOnly ||
+			hdrPeakAnalysisMotionCompensation;
 		if (!needsActivePictureAnalysis)
 			return;
 
@@ -6939,8 +7721,12 @@ struct LibplaceboVideoRenderer::Impl
 				trustedCropIsCurrentGeneration,
 				sceneSnapshotIsCurrentGeneration,
 				latestActivePicturePresentationRetentionSafe);
+		const bool forceStartupBootstrapAnalysis =
+			nearBlackPresentationEpisode.mode ==
+				AlphaSourceCrop::NearBlackPresentationMode::FULL_RASTER &&
+			!nearBlackPresentationEpisode.entryTrustedCropAvailable;
 		if (scheduledAnalysis || forceAnalysis || hasScheduledDecision ||
-			forceRetentionSafetyAnalysis)
+			forceRetentionSafetyAnalysis || forceStartupBootstrapAnalysis)
 		{
 			const bool hadCurrentTrustedCropGeometry =
 				trustedCropIsCurrentGeneration;
@@ -6960,16 +7746,101 @@ struct LibplaceboVideoRenderer::Impl
 			}
 			ActivePicturePresentationRetentionEvidence retentionEvidence;
 			ActivePictureEvidence evidence;
+			ActivePictureEvidence nativeBootstrapEvidence;
+			const ActivePictureGlobalNearBlackEvidence globalNearBlack =
+				EvaluateActivePictureGlobalNearBlack(analysisSource);
+			const bool needsNativeBootstrapEvidence =
+				nearBlackPresentationEpisode.mode ==
+					AlphaSourceCrop::NearBlackPresentationMode::FULL_RASTER &&
+				!nearBlackPresentationEpisode.entryTrustedCropAvailable;
 			if (hadCompatiblePresentation)
 			{
 				retentionEvidence =
 					EvaluateActivePicturePresentationRetention(
 						analysisSource, presentationBeforeObservation);
-				evidence = retentionEvidence.activePicture;
+				evidence = ConstrainNearBlackGeometryChange(
+					retentionEvidence, presentationBeforeObservation);
+				if (needsNativeBootstrapEvidence)
+				{
+					// A full-raster episode caused by an overlay cannot recover through
+					// the old crop's retention path: it would simply keep seeing that
+					// old geometry forever. Inspect the raw current frame separately.
+					// It is only eligible as a bootstrap contract after the episode
+					// policy verifies current, pixel-safe, non-outward evidence.
+					nativeBootstrapEvidence =
+						ExtractActivePictureEvidence(analysisSource);
+				}
 			}
 			else
 			{
 				evidence = ExtractActivePictureEvidence(analysisSource);
+				nativeBootstrapEvidence = evidence;
+			}
+			latestNativeBootstrapContractAvailable =
+				nativeBootstrapEvidence.available &&
+				nativeBootstrapEvidence.classification ==
+					ActivePictureClassification::BAR_CROP_TRUSTED &&
+				nativeBootstrapEvidence.trustedBounds.trustedBarAxes !=
+					ActivePictureBounds::BarAxes::NONE;
+			if (latestNativeBootstrapContractAvailable)
+			{
+				latestNativeBootstrapContract =
+					nativeBootstrapEvidence.trustedBounds;
+				const ActivePicturePresentationRetentionEvidence
+					bootstrapRetention =
+						EvaluateActivePicturePresentationRetention(
+							analysisSource, latestNativeBootstrapContract);
+				latestNativeBootstrapRetentionEvaluated =
+					bootstrapRetention.analysisValid &&
+					bootstrapRetention.presentationValid;
+				latestNativeBootstrapRetentionSafe =
+					latestNativeBootstrapRetentionEvaluated &&
+					bootstrapRetention.currentlyPixelSafe;
+				latestNativeBootstrapOutwardVisible =
+					bootstrapRetention.outwardVisibleBoundsAvailable;
+				latestNativeBootstrapSourceGeneration = analysisSource.generation;
+				latestNativeBootstrapSourceSequence = frameNumber;
+				latestNativeBootstrapPresentationEpoch =
+					currentIdentity.viewportGeneration;
+			}
+			else
+			{
+				latestNativeBootstrapContract = {};
+				latestNativeBootstrapRetentionEvaluated = false;
+				latestNativeBootstrapRetentionSafe = false;
+				latestNativeBootstrapOutwardVisible = false;
+				latestNativeBootstrapSourceGeneration = 0;
+				latestNativeBootstrapSourceSequence = 0;
+				latestNativeBootstrapPresentationEpoch = 0;
+			}
+			if (needsNativeBootstrapEvidence)
+			{
+				const uint64_t bootstrapProbeInterval = std::max<uint64_t>(1,
+					static_cast<uint64_t>(std::llround(std::max(1.0,
+						framesPerSecond))));
+				if (frameNumber % bootstrapProbeInterval == 0)
+				{
+					DebugLog::Log(
+						"Alpha near-black bootstrap probe: sequence=%llu generation=%llu raw_available=%d raw_classification=%d raw_rect=%d,%d-%d,%d contract=%d retention=%d/%d outward=%d global_near_black=%d global_evaluated=%d episode_epoch=%llu input_epoch=%llu",
+						static_cast<unsigned long long>(frameNumber),
+						static_cast<unsigned long long>(analysisSource.generation),
+						nativeBootstrapEvidence.available ? 1 : 0,
+						static_cast<int>(nativeBootstrapEvidence.classification),
+						nativeBootstrapEvidence.trustedBounds.left,
+						nativeBootstrapEvidence.trustedBounds.top,
+						nativeBootstrapEvidence.trustedBounds.right,
+						nativeBootstrapEvidence.trustedBounds.bottom,
+						latestNativeBootstrapContractAvailable ? 1 : 0,
+						latestNativeBootstrapRetentionEvaluated ? 1 : 0,
+						latestNativeBootstrapRetentionSafe ? 1 : 0,
+						latestNativeBootstrapOutwardVisible ? 1 : 0,
+						globalNearBlack.nearBlack ? 1 : 0,
+						globalNearBlack.evaluated ? 1 : 0,
+						static_cast<unsigned long long>(
+							nearBlackPresentationEpisode.presentationEpoch),
+						static_cast<unsigned long long>(
+							currentIdentity.viewportGeneration));
+				}
 			}
 			latestActivePictureEvidenceWasStartupHypothesis = false;
 			if (!hadCompatiblePresentation && evidence.available &&
@@ -6986,6 +7857,12 @@ struct LibplaceboVideoRenderer::Impl
 					latestActivePictureEvidenceWasStartupHypothesis = true;
 				}
 			}
+			const bool nearBlackAcquisitionBlocked =
+				(globalNearBlack.evaluated && globalNearBlack.nearBlack) ||
+				nearBlackPresentationEpisode.mode !=
+					AlphaSourceCrop::NearBlackPresentationMode::INACTIVE;
+			evidence = ConstrainNearBlackCropAcquisition(
+				evidence, nearBlackAcquisitionBlocked);
 			latestActivePictureObservationSupportsCrop = false;
 			latestActivePictureEvidenceAvailable = evidence.available;
 			latestActivePictureEvidenceClassification = evidence.available
@@ -7025,6 +7902,22 @@ struct LibplaceboVideoRenderer::Impl
 			latestActivePicturePresentationRetentionEvaluated =
 				hadCompatiblePresentation && retentionEvidence.analysisValid &&
 				retentionEvidence.presentationValid;
+			latestActivePicturePresentationRetentionBounds =
+				latestActivePicturePresentationRetentionEvaluated
+					? presentationBeforeObservation : ActivePictureBounds{};
+			latestActivePicturePresentationRetentionSourceGeneration =
+				latestActivePicturePresentationRetentionEvaluated
+					? analysisSource.generation : 0;
+			latestActivePicturePresentationRetentionSourceSequence =
+				latestActivePicturePresentationRetentionEvaluated
+					? frameNumber : 0;
+			latestActivePictureGlobalNearBlackEvaluated =
+				globalNearBlack.evaluated;
+			latestActivePictureGlobalNearBlack = globalNearBlack.nearBlack;
+			latestActivePictureGlobalLumaP90 = globalNearBlack.lumaP90;
+			latestActivePictureOutwardVisibleBoundsAvailable =
+				hadCompatiblePresentation &&
+				retentionEvidence.outwardVisibleBoundsAvailable;
 			latestActivePicturePresentationRetentionReason =
 				hadCompatiblePresentation ? retentionEvidence.reason :
 					"no compatible retained presentation";
@@ -7174,7 +8067,7 @@ struct LibplaceboVideoRenderer::Impl
 				? AlphaSourceCrop::ConfirmOutwardPictureTransition(
 					outwardPictureConfirmation, presentationBeforeObservation,
 					latestActivePictureEvidenceBounds, retentionEvidence,
-					analysisSource.generation)
+					analysisSource.generation, frameNumber)
 				: AlphaSourceCrop::OutwardPictureConfirmationDecision{};
 			outwardPictureConfirmation = outwardConfirmation.state;
 			const bool deferOutwardLogicalTransition =
@@ -7231,7 +8124,33 @@ struct LibplaceboVideoRenderer::Impl
 			}
 			const ActivePictureTransitionDecision transition =
 				applyScheduledDecision ? scheduledDecision->transition :
-				nlsTransition.Observe(observation);
+					nlsTransition.Observe(observation);
+			const bool localStableTrustedContract = !applyScheduledDecision &&
+				transition.stable &&
+				transition.authoritativeClassification ==
+					ActivePictureClassification::BAR_CROP_TRUSTED;
+			latestKnownTrustedReacquisitionAvailable =
+				localStableTrustedContract;
+			latestKnownTrustedReacquisitionBounds =
+				localStableTrustedContract
+					? transition.stableBounds : ActivePictureBounds{};
+			latestKnownTrustedReacquisitionClassification =
+				localStableTrustedContract
+					? transition.authoritativeClassification
+					: ActivePictureClassification::UNAVAILABLE;
+			latestKnownTrustedReacquisitionSourceGeneration =
+				localStableTrustedContract ? analysisSource.generation : 0;
+			latestKnownTrustedReacquisitionSourceSequence =
+				localStableTrustedContract ? frameNumber : 0;
+			latestKnownTrustedReacquisitionPresentationEpoch =
+				localStableTrustedContract
+					? currentIdentity.viewportGeneration : 0;
+			latestKnownTrustedReacquisitionCurrentAssociation =
+				localStableTrustedContract;
+			const bool suppressEpisodeBarGeometryMutation =
+				AlphaSourceCrop::ShouldSuppressNearBlackBarGeometryMutation(
+					nearBlackAcquisitionBlocked, transition.stable,
+					transition.authoritativeClassification);
 			if (hasScheduledDecision && !applyScheduledDecision)
 			{
 				DebugLog::Log(
@@ -7257,18 +8176,24 @@ struct LibplaceboVideoRenderer::Impl
 				latestActivePictureObservationSupportsCrop = false;
 				nlsGeometrySourceGeneration = 0;
 			}
-			else if (transition.publish && transition.stable)
+			else if (transition.publish && transition.stable &&
+				!suppressEpisodeBarGeometryMutation)
 			{
 				nlsGeometry = transition.bounds;
 				nlsGeometryAvailable = true;
 				nlsTransitionWithdrawn = false;
-				nlsGeometryClassification = evidence.classification;
+				nlsGeometryClassification =
+					transition.authoritativeClassification !=
+						ActivePictureClassification::UNAVAILABLE
+					? transition.authoritativeClassification
+					: evidence.classification;
 				nlsGeometrySourceGeneration = analysisSource.generation;
 				nlsGeometrySourceFormatKey =
 					currentIdentity.sourceFormatGeneration;
 				++nlsGeometryGeneration;
 			}
-			else if (transition.stable && !nlsTransitionWithdrawn)
+			else if (transition.stable && !nlsTransitionWithdrawn &&
+				!suppressEpisodeBarGeometryMutation)
 			{
 				// Retain the published geometry as temporal context for NLS. The
 				// source-crop policy independently requires the latest observation
@@ -7308,7 +8233,7 @@ struct LibplaceboVideoRenderer::Impl
 			if (applyScheduledDecision)
 			{
 				DebugLog::Log(
-					"Alpha active-picture look-ahead applied: generation=%llu observed=%llu effective=%llu frame=%llu rect=%d,%d-%d,%d classification=%d runtime-apply=1",
+					"Alpha active-picture look-ahead applied: generation=%llu observed=%llu effective=%llu frame=%llu backdated_frames=%llu association=%s inward_proof=%s proof_frames=%u rect=%d,%d-%d,%d classification=%d runtime-apply=1",
 					static_cast<unsigned long long>(
 						scheduledDecision->effectiveIdentity.transportGeneration),
 					static_cast<unsigned long long>(
@@ -7316,6 +8241,16 @@ struct LibplaceboVideoRenderer::Impl
 					static_cast<unsigned long long>(
 						scheduledDecision->effectiveIdentity.acceptedSequence),
 					static_cast<unsigned long long>(frameNumber),
+					static_cast<unsigned long long>(
+						scheduledDecision->observationIdentity.acceptedSequence >=
+							scheduledDecision->effectiveIdentity.acceptedSequence
+						? scheduledDecision->observationIdentity.acceptedSequence -
+							scheduledDecision->effectiveIdentity.acceptedSequence : 0),
+					ActivePictureDecisionAssociationName(
+						scheduledDecision->association),
+					ActivePictureInwardProofValidationName(
+						scheduledDecision->inwardProof),
+					static_cast<unsigned>(scheduledDecision->proofFrameCount),
 					transition.bounds.left, transition.bounds.top,
 					transition.bounds.right, transition.bounds.bottom,
 					static_cast<int>(evidence.classification));
@@ -7323,7 +8258,7 @@ struct LibplaceboVideoRenderer::Impl
 			if (transition.diagnostic)
 			{
 				DebugLog::Log(
-					"Alpha NLS active picture: state=%d frame=%llu rect=%d,%d-%d,%d aspect=%.4f stable=%d clear=%d classification=%d retention_safe=%d reason=\"%s; %s; %s\"",
+					"Alpha NLS active picture: state=%d frame=%llu rect=%d,%d-%d,%d aspect=%.4f stable=%d clear=%d classification=%d retention_safe=%d near_black_evaluated=%d global_near_black=%d global_luma_p90=%.1f near_black_episode=%s reason=\"%s; %s; %s\"",
 					static_cast<int>(transition.state),
 					static_cast<unsigned long long>(frameNumber),
 					transition.bounds.left, transition.bounds.top,
@@ -7333,6 +8268,11 @@ struct LibplaceboVideoRenderer::Impl
 					transition.clearTransition ? 1 : 0,
 					static_cast<int>(evidence.classification),
 					latestActivePicturePresentationRetentionSafe ? 1 : 0,
+					latestActivePictureGlobalNearBlackEvaluated ? 1 : 0,
+					latestActivePictureGlobalNearBlack ? 1 : 0,
+					latestActivePictureGlobalLumaP90,
+					AlphaSourceCrop::NearBlackPresentationModeName(
+						nearBlackPresentationEpisode.mode),
 					transition.reason.c_str(), evidence.reason.c_str(),
 					latestActivePicturePresentationRetentionReason.c_str());
 			}
@@ -7409,6 +8349,12 @@ struct LibplaceboVideoRenderer::Impl
 		if (!swapchain)
 			return false;
 		const VideoState& state = *statePtr;
+		uint64_t requestedResetEpoch = consumedPresentationResetEpoch;
+		if (presentationResetEpoch.Consume(requestedResetEpoch))
+		{
+			consumedPresentationResetEpoch = requestedResetEpoch;
+			ClearPresentationStateForReset(requestedResetEpoch);
+		}
 		bool verifyRetainedProfileGeometryThisFrame = false;
 		if (viewportRequestSerial !=
 			activePictureScreenProfileRequestSerial)
@@ -7435,7 +8381,9 @@ struct LibplaceboVideoRenderer::Impl
 				AlphaSourceCrop::EvaluateProfileTransitionRetention(retentionInput);
 			verifyRetainedProfileGeometryThisFrame =
 				retention.retainSourceGeometry &&
-				(nlsRequested || automaticSourceCrop || scopeSubtitleFit);
+				(nlsRequested || automaticSourceCrop || scopeSubtitleFit ||
+					hdrPeakAnalysisPictureOnly ||
+					hdrPeakAnalysisMotionCompensation);
 			nlsTransition.Reset();
 			outwardPictureConfirmation = {};
 			latestActivePictureObservationSupportsCrop = false;
@@ -7458,6 +8406,7 @@ struct LibplaceboVideoRenderer::Impl
 			// bridge it with the source-picture geometry retained above.
 			ClearScopeSubtitleEvidence();
 			ClearScopePresentationEvidence();
+			scopeVerticalInspectionBridge = {};
 			nlsDecision = {};
 			renderParams.hooks = nullptr;
 			renderParams.num_hooks = 0;
@@ -7703,6 +8652,12 @@ struct LibplaceboVideoRenderer::Impl
 			currentActivePictureIdentity.viewportGeneration =
 				viewportRequestSerial;
 			currentActivePictureIdentity.rendererGeneration = frameGeneration;
+			// Scene detection resets temporal candidates above, but it is not crop
+			// authority and therefore is not a blanket veto for a scheduled decision.
+			// In particular, EXACT_INWARD remains eligible when the current cut frame
+			// and every buffered frame through confirmation independently carry the
+			// same trusted, non-near-black pixel certificate. Rejecting that certificate
+			// at the cut would recreate the one-frame confirmed-geometry flash.
 			UpdateNlsForFrame(analysisSource, sourceSequence,
 				currentActivePictureIdentity,
 				state.displayMode->RefreshRateHz(),
@@ -7723,6 +8678,10 @@ struct LibplaceboVideoRenderer::Impl
 			latestActivePictureEvidenceFrame = sourceSequence;
 			latestActivePicturePresentationRetentionEvaluated = true;
 			latestActivePicturePresentationRetentionSafe = false;
+			latestActivePictureGlobalNearBlackEvaluated = false;
+			latestActivePictureGlobalNearBlack = false;
+			latestActivePictureGlobalLumaP90 = 0.0;
+			latestActivePictureOutwardVisibleBoundsAvailable = false;
 			latestActivePicturePresentationRetentionReason =
 				"analysis source is invalid";
 			fullRasterPresentationAuthorityAvailable = false;
@@ -7918,6 +8877,9 @@ struct LibplaceboVideoRenderer::Impl
 			activePictureAmbiguityHold.IsActive(
 				GetTickCount64(), frameGeneration);
 		const bool latestEvidenceAllowsBarOverlay =
+			!latestActivePictureGlobalNearBlack &&
+			nearBlackPresentationEpisode.mode ==
+				AlphaSourceCrop::NearBlackPresentationMode::INACTIVE &&
 			latestActivePictureEvidenceAvailable &&
 			(latestActivePictureEvidenceClassification ==
 				ActivePictureClassification::BAR_CROP_TRUSTED ||
@@ -7990,6 +8952,9 @@ struct LibplaceboVideoRenderer::Impl
 		heldAnalysisInput.holdMs = scopeSubtitleHoldMs;
 		heldAnalysisInput.currentSourceSequence = sourceSequence;
 		const bool heldBarAnalysisAuthority =
+			!latestActivePictureGlobalNearBlack &&
+			nearBlackPresentationEpisode.mode ==
+				AlphaSourceCrop::NearBlackPresentationMode::INACTIVE &&
 			AlphaSourceCrop::CanAnalyzeHeldVerticalBarGeometry(
 				heldAnalysisInput);
 		const ActivePictureBounds* subtitleBarAuthority =
@@ -8026,11 +8991,32 @@ struct LibplaceboVideoRenderer::Impl
 				subtitleTranslationAlreadyActive) ||
 			(latestActivePictureEvidenceWasStartupHypothesis &&
 			 subtitleBarAuthority != nullptr);
+		bool subtitleBarAnalysisScheduled = false;
+		bool subtitleBarAnalysisCompleted = false;
 		const float subtitleShiftSourcePixels =
 			UpdateScopeSubtitleShift(&analysisSource,
 				width, height, configuredScreenActive, subtitleBarAuthority,
 				sourceSequence, forceSubtitleBarAnalysis,
-				heldBarAnalysisAuthority);
+				heldBarAnalysisAuthority, &subtitleBarAnalysisScheduled,
+				&subtitleBarAnalysisCompleted);
+		float hdrPeakAnalysisMotionProtectionPixels = 0.0f;
+		if (hdrPeakAnalysisMotionCompensation &&
+			!hdrPeakAnalysisPictureOnly && subtitleBarAuthority)
+		{
+			if (std::abs(subtitleShiftSourcePixels) > 0.5f)
+				hdrPeakAnalysisMotionProtectionPixels =
+					subtitleShiftSourcePixels;
+			else if (scopeSubtitleTranslationConfirmation.confirmations != 0 &&
+				std::abs(scopeSubtitleTranslationConfirmation.
+					candidateTranslationPixels) > 0.5f)
+			{
+				const float candidate = scopeSubtitleTranslationConfirmation.
+					candidateTranslationPixels;
+				hdrPeakAnalysisMotionProtectionPixels = candidate +
+					(candidate > 0.0f ? 1.0f : -1.0f) *
+					static_cast<float>(scopeSubtitleTargetBufferPixels);
+			}
+		}
 
 		struct pl_frame image{};
 		if (nativeRgbUpload)
@@ -8307,13 +9293,16 @@ struct LibplaceboVideoRenderer::Impl
 
 		struct pl_frame baseTarget{};
 		pl_frame_from_swapchain(&baseTarget, &swapchainFrame);
+		// The selected source crop is handed to pl_render_image below, so colour
+		// mapping and peak detection operate on picture pixels only. Clear the
+		// output surface separately before that pass: any area outside target.crop
+		// is the intentional, display-referred black matte for the fitted picture.
+		// This must apply to both VP-owned and libplacebo-owned presentation paths;
+		// a smaller fixed-aspect destination must never inherit prior-frame pixels.
+		const float black[] = { 0.0f, 0.0f, 0.0f };
+		pl_frame_clear(d3d11->gpu, &baseTarget, black);
 		if (vpOwnedSwapchain)
 		{
-			// Flip-discard backbuffers contain undefined prior contents. Rendering a
-			// smaller destination rectangle must therefore begin with a full target
-			// clear, otherwise old pixels can survive around a resized viewport.
-			const float black[] = { 0.0f, 0.0f, 0.0f };
-			pl_frame_clear(d3d11->gpu, &baseTarget, black);
 			if (vpOwnedClearLoggedGeneration != vpOwnedSwapchainGeneration)
 			{
 				vpOwnedClearLoggedGeneration = vpOwnedSwapchainGeneration;
@@ -8379,18 +9368,28 @@ struct LibplaceboVideoRenderer::Impl
 			outputContractLogged = true;
 		}
 
+		const double nominalSourceRateHz = state.displayMode->RefreshRateHz();
 		auto configureViewport =
 			[this, &image, width, height, frameGeneration, sourceSequence,
-			 sceneHold, subtitleShiftSourcePixels](
+			 viewportRequestSerial, captureRateHz, nominalSourceRateHz,
+			 sceneHold, sceneResult, cadenceRepeat, subtitleShiftSourcePixels,
+			 subtitleBarAnalysisScheduled, subtitleBarAnalysisCompleted,
+			 forceSubtitleBarAnalysis,
+			 currentBarAuthority, sceneBarAuthority, heldBarAnalysisAuthority,
+			 subtitleBarAuthority,
+			 &hdrPeakAnalysisMotionProtectionPixels](
 				struct pl_frame& source,
 				struct pl_frame& target,
 				bool configuredScreenActive,
 				float /* subtitleShift */,
-				bool* trustedActivePicture = nullptr)
+				bool* trustedActivePicture = nullptr,
+				HdrPeakAnalysisCrop::TrustedPicture* hdrTrustedPicture = nullptr)
 		{
 			source = image;
 			if (trustedActivePicture)
 				*trustedActivePicture = false;
+			if (hdrTrustedPicture)
+				*hdrTrustedPicture = {};
 			const bool sceneVerificationHoldActive = sceneHold.cropActive;
 			const bool useSceneVerificationGeometry =
 				sceneVerificationHoldActive && !nlsGeometryAvailable;
@@ -8417,6 +9416,28 @@ struct LibplaceboVideoRenderer::Impl
 				useSceneVerificationGeometry
 					? sceneVerificationGeometrySourceGeneration
 					: nlsGeometrySourceGeneration;
+			if (hdrTrustedPicture && effectiveGeometryAvailable &&
+				effectiveGeometrySourceGeneration == frameGeneration)
+			{
+				// Match the subtitle path's authority gate. Retained scope geometry is
+				// useful while a bar transition is unresolved, but must never carry an
+				// HDR ROI into a frame whose current evidence is full raster.
+				const ActivePictureBounds& hdrGeometry = subtitleBarAuthority
+					? *subtitleBarAuthority : effectiveGeometry;
+				const HdrPeakAnalysisCrop::TrustedPicture candidate = {
+					hdrGeometry.left,
+					hdrGeometry.top,
+					hdrGeometry.right,
+					hdrGeometry.bottom,
+					hdrGeometry.rasterWidth,
+					hdrGeometry.rasterHeight,
+					frameGeneration,
+					true
+				};
+				*hdrTrustedPicture =
+					HdrPeakAnalysisCrop::RequireBarAuthority(candidate,
+						subtitleBarAuthority != nullptr);
+			}
 			const uint64_t overlayNow = GetTickCount64();
 			const bool ambiguityHoldActive =
 				activePictureAmbiguityHold.IsActive(
@@ -8497,11 +9518,13 @@ struct LibplaceboVideoRenderer::Impl
 			const bool currentDetectorBottomExpansion = currentDetectorEnvelope &&
 				effectiveGeometryAvailable &&
 				scopePresentationCurrentBounds.bottom > effectiveGeometry.bottom;
-			const bool verticalInspectionPending =
+			const bool verticalInspectionCandidate =
 				AlphaSourceCrop::ShouldRetainTrustedBaseForVerticalInspection(
 					scopeSubtitleFit,
 					currentDetectorEnvelope,
 					latestObservationIsProvisional ||
+						(latestObservationIsUnavailable &&
+						 latestActivePictureGlobalNearBlack) ||
 						(!effectiveLatestSupportsCrop &&
 						 latestActivePictureEvidenceClassification ==
 							ActivePictureClassification::BAR_CROP_TRUSTED),
@@ -8525,6 +9548,14 @@ struct LibplaceboVideoRenderer::Impl
 						requestedSubtitleTranslation
 							? scopeSubtitleEngageDriftMs
 							: scopeSubtitleReleaseDriftMs);
+			if (hdrPeakAnalysisMotionCompensation &&
+				!hdrPeakAnalysisPictureOnly &&
+				std::abs(resolvedSubtitleTranslation) >
+					std::abs(hdrPeakAnalysisMotionProtectionPixels))
+			{
+				hdrPeakAnalysisMotionProtectionPixels =
+					resolvedSubtitleTranslation;
+			}
 			releaseDriftBaseRetention =
 				!requestedSubtitleTranslation &&
 				scopeSubtitleDrift.ConsumeFinalBaseFrame();
@@ -8703,8 +9734,192 @@ struct LibplaceboVideoRenderer::Impl
 					outwardExpansionAvailable = expansion.expanded;
 				}
 			}
+			AlphaSourceCrop::VerticalInspectionFitResolutionInput
+				verticalFitResolutionInput;
+			verticalFitResolutionInput.confirmedDenseFit =
+				detailedVerticalFitEvidence;
+			verticalFitResolutionInput.denseAnalysisCurrent =
+				subtitleBarAnalysisCompleted;
+			verticalFitResolutionInput.outwardExpansionAvailable =
+				outwardExpansionAvailable;
+			verticalFitResolutionInput.currentHorizontalExpansion =
+				currentDetectorLeftExpansion || currentDetectorRightExpansion;
+			verticalFitResolutionInput.trustedBase = effectiveGeometry;
+			verticalFitResolutionInput.outwardExpansion = outwardExpansion;
+			verticalFitResolutionInput.outwardExpansionSourceGeneration =
+				denseFitEvidenceActive
+					? scopeSubtitleEvidenceSourceGeneration
+					: scopePresentationEvidenceSourceGeneration;
+			verticalFitResolutionInput.frameSourceGeneration = frameGeneration;
+			const bool confirmedCurrentVerticalFit =
+				AlphaSourceCrop::CanResolveVerticalInspectionWithConfirmedFit(
+					verticalFitResolutionInput);
+			AlphaSourceCrop::NearBlackPresentationEpisodeInput episodeInput;
+			episodeInput.previous = nearBlackPresentationEpisode;
+			episodeInput.measurementCurrent =
+				latestActivePictureEvidenceFrame == sourceSequence;
+			episodeInput.nearBlackEvaluated =
+				latestActivePictureGlobalNearBlackEvaluated;
+			episodeInput.globalNearBlack =
+				latestActivePictureGlobalNearBlack;
+			episodeInput.sceneBoundary =
+				!cadenceRepeat && sceneResult.safeBoundary;
+			episodeInput.trustedCropAvailable =
+				effectiveGeometryAvailable &&
+				effectiveClassification ==
+					ActivePictureClassification::BAR_CROP_TRUSTED &&
+				effectiveGeometrySourceGeneration == frameGeneration;
+			episodeInput.trustedCrop = episodeInput.trustedCropAvailable
+				? effectiveGeometry : ActivePictureBounds{};
+			episodeInput.boundedVisibleContentOutsideCrop =
+				episodeInput.measurementCurrent &&
+				latestActivePictureOutwardVisibleBoundsAvailable;
+			episodeInput.fullRasterAuthorityAvailable =
+				fullRasterPresentationAuthorityAvailable &&
+				fullRasterPresentationAuthoritySourceGeneration == frameGeneration;
+			episodeInput.cadenceRepeat = cadenceRepeat;
+			episodeInput.currentObservationAvailable =
+				episodeInput.measurementCurrent &&
+				latestActivePictureEvidenceAvailable;
+			episodeInput.currentObservation =
+				episodeInput.currentObservationAvailable
+					? latestActivePictureEvidenceBounds : ActivePictureBounds{};
+			episodeInput.retentionEvaluated =
+				latestActivePicturePresentationRetentionEvaluated &&
+				latestActivePicturePresentationRetentionSourceGeneration ==
+					frameGeneration;
+			episodeInput.retentionSafe =
+				episodeInput.retentionEvaluated &&
+				latestActivePicturePresentationRetentionSafe;
+			episodeInput.retentionBounds = episodeInput.retentionEvaluated
+				? latestActivePicturePresentationRetentionBounds
+				: ActivePictureBounds{};
+			episodeInput.retentionSourceGeneration =
+				episodeInput.retentionEvaluated
+					? latestActivePicturePresentationRetentionSourceGeneration : 0;
+			episodeInput.retentionSourceSequence =
+				episodeInput.retentionEvaluated
+					? latestActivePicturePresentationRetentionSourceSequence : 0;
+			episodeInput.knownTrustedGeometryReacquired =
+				latestKnownTrustedReacquisitionAvailable;
+			episodeInput.reacquiredTrustedGeometry =
+				latestKnownTrustedReacquisitionBounds;
+			episodeInput.reacquiredTrustedClassification =
+				latestKnownTrustedReacquisitionClassification;
+			episodeInput.reacquiredSourceGeneration =
+				latestKnownTrustedReacquisitionSourceGeneration;
+			episodeInput.reacquiredSourceSequence =
+				latestKnownTrustedReacquisitionSourceSequence;
+			episodeInput.reacquiredPresentationEpoch =
+				latestKnownTrustedReacquisitionPresentationEpoch;
+			episodeInput.reacquisitionIsCurrentAssociation =
+				latestKnownTrustedReacquisitionCurrentAssociation;
+			episodeInput.nativeBootstrapContractAvailable =
+				latestNativeBootstrapContractAvailable;
+			episodeInput.nativeBootstrapContract =
+				latestNativeBootstrapContract;
+			episodeInput.nativeBootstrapRetentionEvaluated =
+				latestNativeBootstrapRetentionEvaluated;
+			episodeInput.nativeBootstrapRetentionSafe =
+				latestNativeBootstrapRetentionSafe;
+			episodeInput.nativeBootstrapOutwardVisible =
+				latestNativeBootstrapOutwardVisible;
+			episodeInput.nativeBootstrapSourceGeneration =
+				latestNativeBootstrapSourceGeneration;
+			episodeInput.nativeBootstrapSourceSequence =
+				latestNativeBootstrapSourceSequence;
+			episodeInput.nativeBootstrapPresentationEpoch =
+				latestNativeBootstrapPresentationEpoch;
+			episodeInput.framesPerSecond =
+				std::isfinite(nominalSourceRateHz) && nominalSourceRateHz > 0.0
+					? nominalSourceRateHz : captureRateHz;
+			episodeInput.currentTick = GetTickCount64();
+			episodeInput.presentationEpoch = viewportRequestSerial;
+			episodeInput.sourceGeneration = frameGeneration;
+			episodeInput.sourceSequence = sourceSequence;
+			const AlphaSourceCrop::NearBlackPresentationEpisodeDecision
+				episodeDecision =
+					AlphaSourceCrop::EvaluateNearBlackPresentationEpisode(
+						episodeInput);
+			if (episodeDecision.started || episodeDecision.changedToFullRaster ||
+				episodeDecision.releasedToTrustedCrop || episodeDecision.ended ||
+				episodeDecision.revalidationChanged)
+			{
+				DebugLog::Log(
+					"Alpha near-black presentation episode: sequence=%llu generation=%llu mode=%s started=%d to_full=%d to_crop=%d bootstrap_exit=%d ended=%d proof=%u/%u bootstrap=%u/%u sticky=%d evaluated=%d near_black=%d luma_p90=%.1f trusted_crop=%d reacquired=%d current_assoc=%d native_bootstrap=%d native_rect=%d,%d-%d,%d native_retention=%d/%d native_outward=%d measurement_current=%d cadence_repeat=%d episode_epoch=%llu input_epoch=%llu native_epoch=%llu source_hz=%.5f measured_hz=%.5f chosen_hz=%.5f retention_safe=%d outward_visible=%d scene=%d reason=\"%s\"",
+					static_cast<unsigned long long>(sourceSequence),
+					static_cast<unsigned long long>(frameGeneration),
+					AlphaSourceCrop::NearBlackPresentationModeName(
+						episodeDecision.state.mode),
+					episodeDecision.started ? 1 : 0,
+					episodeDecision.changedToFullRaster ? 1 : 0,
+					episodeDecision.releasedToTrustedCrop ? 1 : 0,
+					episodeDecision.bootstrapReleased ? 1 : 0,
+					episodeDecision.ended ? 1 : 0,
+					static_cast<unsigned>(
+						episodeDecision.revalidationSamples),
+					static_cast<unsigned>(
+						episodeDecision.revalidationSamplesRequired),
+					static_cast<unsigned>(episodeDecision.bootstrapSamples),
+					static_cast<unsigned>(
+						episodeDecision.bootstrapSamplesRequired),
+					episodeDecision.state.confirmedNonNearBlackContent ? 1 : 0,
+					episodeInput.nearBlackEvaluated ? 1 : 0,
+					episodeInput.globalNearBlack ? 1 : 0,
+					latestActivePictureGlobalLumaP90,
+					episodeInput.trustedCropAvailable ? 1 : 0,
+					episodeInput.knownTrustedGeometryReacquired ? 1 : 0,
+					episodeInput.reacquisitionIsCurrentAssociation ? 1 : 0,
+					episodeInput.nativeBootstrapContractAvailable ? 1 : 0,
+					episodeInput.nativeBootstrapContractAvailable
+						? episodeInput.nativeBootstrapContract.left : 0,
+					episodeInput.nativeBootstrapContractAvailable
+						? episodeInput.nativeBootstrapContract.top : 0,
+					episodeInput.nativeBootstrapContractAvailable
+						? episodeInput.nativeBootstrapContract.right : 0,
+					episodeInput.nativeBootstrapContractAvailable
+						? episodeInput.nativeBootstrapContract.bottom : 0,
+					episodeInput.nativeBootstrapRetentionEvaluated ? 1 : 0,
+					episodeInput.nativeBootstrapRetentionSafe ? 1 : 0,
+					episodeInput.nativeBootstrapOutwardVisible ? 1 : 0,
+					episodeInput.measurementCurrent ? 1 : 0,
+					episodeInput.cadenceRepeat ? 1 : 0,
+					static_cast<unsigned long long>(
+						episodeDecision.state.presentationEpoch),
+					static_cast<unsigned long long>(
+						episodeInput.presentationEpoch),
+					static_cast<unsigned long long>(
+						episodeInput.nativeBootstrapPresentationEpoch),
+					nominalSourceRateHz,
+					captureRateHz,
+					episodeInput.framesPerSecond,
+					episodeInput.retentionSafe ? 1 : 0,
+					episodeInput.boundedVisibleContentOutsideCrop ? 1 : 0,
+					episodeInput.sceneBoundary ? 1 : 0,
+					episodeDecision.reason.c_str());
+			}
+			if (episodeDecision.resetTransitionEvidence)
+			{
+				nlsTransition.ResetCandidateEvidence();
+				latestKnownTrustedReacquisitionAvailable = false;
+				latestKnownTrustedReacquisitionCurrentAssociation = false;
+			}
+			nearBlackPresentationEpisode = episodeDecision.state;
+			const bool nearBlackEpisodeRetainCrop =
+				nearBlackPresentationEpisode.mode ==
+					AlphaSourceCrop::NearBlackPresentationMode::RETAIN_CROP;
+			const bool nearBlackEpisodeFullRaster =
+				nearBlackPresentationEpisode.mode ==
+					AlphaSourceCrop::NearBlackPresentationMode::FULL_RASTER;
+
 			AlphaSourceCrop::Input cropInput;
-			cropInput.automaticCropEnabled = automaticSourceCrop;
+			cropInput.automaticCropEnabled =
+				AlphaSourceCrop::ShouldTrackDynamicPresentationGeometry(
+					automaticSourceCrop, scopeSubtitleFit);
+			cropInput.nearBlackEpisodeRetainCrop =
+				nearBlackEpisodeRetainCrop;
+			cropInput.nearBlackEpisodeFullRaster =
+				nearBlackEpisodeFullRaster;
 			cropInput.fullRasterPresentationAuthoritative =
 				fullRasterPresentationAuthorityAvailable &&
 				fullRasterPresentationAuthoritySourceGeneration ==
@@ -8725,8 +9940,30 @@ struct LibplaceboVideoRenderer::Impl
 				latestActivePicturePresentationRetentionSafe;
 			cropInput.frameLocalPresentationRetentionEvaluated =
 				latestActivePicturePresentationRetentionEvaluated;
+			const bool sameInspectionEpisode =
+				scopeVerticalInspectionBridge.active &&
+				scopeVerticalInspectionBridge.sourceGeneration == frameGeneration &&
+				scopeVerticalInspectionBridge.presentationEpoch ==
+					viewportRequestSerial &&
+				effectiveGeometryAvailable &&
+				scopeVerticalInspectionBridge.trustedBase.left == effectiveGeometry.left &&
+				scopeVerticalInspectionBridge.trustedBase.top == effectiveGeometry.top &&
+				scopeVerticalInspectionBridge.trustedBase.right == effectiveGeometry.right &&
+				scopeVerticalInspectionBridge.trustedBase.bottom == effectiveGeometry.bottom;
 			cropInput.presentationFailOpen =
-				verticalFailOpen || outwardExpansionInvalid;
+				!nearBlackEpisodeRetainCrop &&
+				(verticalFailOpen || outwardExpansionInvalid ||
+				(sameInspectionEpisode &&
+				 scopeVerticalInspectionBridge.failOpenLatched &&
+				 !confirmedCurrentVerticalFit &&
+				 (latestObservationIsUnavailable ||
+				  latestObservationIsProvisional)));
+			const bool barCropRefinementHorizontalConflict =
+				currentDetectorLeftExpansion || currentDetectorRightExpansion ||
+				(latestActivePictureEvidenceAvailable &&
+				 effectiveGeometryAvailable &&
+				 (latestActivePictureEvidenceBounds.left < effectiveGeometry.left ||
+				  latestActivePictureEvidenceBounds.right > effectiveGeometry.right));
 			const bool barCropRefinementPending =
 				latestActivePictureEvidenceAvailable &&
 				latestActivePictureEvidenceClassification ==
@@ -8735,19 +9972,21 @@ struct LibplaceboVideoRenderer::Impl
 					ActivePictureClassification::BAR_CROP_TRUSTED &&
 				!effectiveLatestSupportsCrop;
 			cropInput.barCropRefinementPending = barCropRefinementPending;
+			cropInput.barCropRefinementHorizontalConflict =
+				!nearBlackEpisodeRetainCrop &&
+				barCropRefinementHorizontalConflict;
 			const bool verticalTranslationConfirmationPending =
-				scopeSubtitleTranslationConfirmation.confirmations != 0 ||
-				(verticalInspectionPending &&
-				 currentDetectorTopExpansion != currentDetectorBottomExpansion);
+				scopeSubtitleTranslationConfirmation.confirmations != 0;
 			const bool verticalFitConfirmationPending =
-				scopeSubtitleFitConfirmation.confirmations != 0 ||
-				(verticalInspectionPending && currentDetectorTopExpansion &&
-				 currentDetectorBottomExpansion);
+				scopeSubtitleFitConfirmation.confirmations != 0 &&
+				scopeSubtitleFitConfirmation.confirmations <
+					AlphaSourceCrop::VERTICAL_FIT_CONFIRMATIONS_REQUIRED;
 			cropInput.verticalTranslationConfirmationPending =
 				verticalTranslationConfirmationPending;
 			cropInput.verticalFitConfirmationPending =
 				verticalFitConfirmationPending;
-			cropInput.verticalTranslationActive = verticalTranslationActive;
+			cropInput.verticalTranslationActive =
+				!nearBlackEpisodeRetainCrop && verticalTranslationActive;
 			cropInput.verticalTranslationPixels = verticalTranslationPixels;
 			cropInput.verticalTranslationBase = {
 				scopeSubtitlePictureLeft, scopeSubtitlePictureTop,
@@ -8763,7 +10002,8 @@ struct LibplaceboVideoRenderer::Impl
 				releaseDriftBaseRetention;
 			cropInput.verticalTranslationEngageBaseRetentionActive =
 				engageDriftBaseRetention;
-			cropInput.outwardPresentationActive = barContentFitActive;
+			cropInput.outwardPresentationActive =
+				!nearBlackEpisodeRetainCrop && barContentFitActive;
 			cropInput.outwardExpansionAvailable = outwardExpansionAvailable;
 			cropInput.classification = effectiveClassification;
 			cropInput.geometry = effectiveGeometry;
@@ -8775,12 +10015,123 @@ struct LibplaceboVideoRenderer::Impl
 					? scopeSubtitleEvidenceSourceGeneration
 					: scopePresentationEvidenceSourceGeneration;
 			cropInput.frameSourceGeneration = frameGeneration;
+			cropInput.frameSourceSequence = sourceSequence;
 			cropInput.rasterWidth = width;
 			cropInput.rasterHeight = height;
-			const AlphaSourceCrop::Decision cropDecision =
+			AlphaSourceCrop::Decision cropDecision =
 				AlphaSourceCrop::Evaluate(cropInput);
+			const bool verticalInspectionFallbackRequested =
+				verticalInspectionCandidate && !cropDecision.applyCrop &&
+				cropDecision.withdrawalCause ==
+					AlphaSourceCrop::WithdrawalCause::
+						LATEST_OBSERVATION_UNREAFFIRMED;
+			AlphaSourceCrop::VerticalInspectionBridgeInput inspectionInput;
+			inspectionInput.previous = scopeVerticalInspectionBridge;
+			inspectionInput.candidate = verticalInspectionCandidate;
+			inspectionInput.retentionRequested =
+				verticalInspectionFallbackRequested;
+			inspectionInput.denseAnalysisCompleted =
+				subtitleBarAnalysisCompleted;
+			inspectionInput.verticalPresentationOwnerAvailable =
+				verticalTranslationConfirmationPending ||
+				verticalFitConfirmationPending || verticalTranslationActive ||
+				verticalFitActive;
+			inspectionInput.cropAuthorityResolved = effectiveLatestSupportsCrop;
+			inspectionInput.fullRasterAuthorityResolved =
+				latestActivePictureEvidenceClassification ==
+					ActivePictureClassification::FULL_RASTER_TRUSTED;
+			inspectionInput.confirmedVerticalFitResolved =
+				confirmedCurrentVerticalFit;
+			inspectionInput.sourceGeneration = frameGeneration;
+			inspectionInput.presentationEpoch = viewportRequestSerial;
+			inspectionInput.trustedBase = effectiveGeometryAvailable
+				? effectiveGeometry : ActivePictureBounds{};
+			inspectionInput.sourceSequence = sourceSequence;
+			const AlphaSourceCrop::VerticalInspectionBridgeDecision
+				inspectionDecision =
+					AlphaSourceCrop::UpdateVerticalInspectionBridge(inspectionInput);
+			scopeVerticalInspectionBridge = inspectionDecision.state;
+			if (scopeVerticalInspectionBridge.failOpenLatched &&
+				!cropInput.presentationFailOpen &&
+				!nearBlackEpisodeRetainCrop)
+			{
+				cropInput.presentationFailOpen = true;
+				cropDecision = AlphaSourceCrop::Evaluate(cropInput);
+			}
+			const bool verticalInspectionPending = inspectionDecision.retain;
+			if (verticalInspectionPending)
+			{
+				cropInput.verticalInspectionPending = true;
+				cropInput.verticalInspectionSourceGeneration =
+					scopeVerticalInspectionBridge.sourceGeneration;
+				cropInput.verticalInspectionSourceSequence =
+					scopeVerticalInspectionBridge.retainedSourceSequence;
+				cropDecision = AlphaSourceCrop::Evaluate(cropInput);
+			}
+			const double panelTargetAspect = pl_rect2df_aspect(&target.crop);
+			const double finalTargetAspect = ResolveNlsTargetAspect(
+				configuredScreenActive, configuredScreenAspect, panelTargetAspect);
+			const bool nlsPresentationFailOpen = nlsRequested &&
+				(cropInput.presentationFailOpen || nearBlackEpisodeFullRaster);
+			const bool nlsActivePictureAvailable = nlsRequested &&
+				!nlsPresentationFailOpen && effectiveGeometryAvailable &&
+				effectiveGeometrySourceGeneration == frameGeneration;
+			const NlsSourceGeometry nlsCandidateSourceGeometry =
+				ResolveNlsPresentationSourceGeometry(
+					nlsRequested && !nlsPresentationFailOpen,
+					nlsActivePictureAvailable,
+					effectiveGeometry.left, effectiveGeometry.top,
+					effectiveGeometry.right, effectiveGeometry.bottom,
+					cropDecision.applyCrop,
+					cropDecision.sourceBounds.left,
+					cropDecision.sourceBounds.top,
+					cropDecision.sourceBounds.right,
+					cropDecision.sourceBounds.bottom,
+					width, height);
+			NlsPresentationCropDecision nlsCandidatePresentationCrop;
+			nlsCandidatePresentationCrop.source = nlsCandidateSourceGeometry;
+			if (nlsRequested && !nlsPresentationFailOpen)
+			{
+				nlsCandidatePresentationCrop = ResolveNlsPresentationCrop(
+					nlsCandidateSourceGeometry, finalTargetAspect,
+					nlsRule.aspectTolerancePercent,
+					nlsRule.activeAspectMinimum, nlsRule.aspectDirection,
+					nlsRule.maximumStretchRatio,
+					nlsRule.vpRendererMaximumCropPercent,
+					nlsRule.vpRendererCropPreference);
+			}
+			const NlsMappingDecision nlsCandidateDecision = EvaluateNlsMapping(
+				nlsCandidatePresentationCrop.source.valid,
+				nlsCandidatePresentationCrop.source.aspect, finalTargetAspect,
+				nlsRule.aspectTolerancePercent,
+				nlsRule.activeAspectMinimum, nlsRule.aspectDirection,
+				nlsRule.maximumStretchRatio);
+			const bool nlsOwnsPresentationGeometry =
+				NlsOwnsPresentationGeometry(nlsRequested,
+					nlsPresentationFailOpen, nlsActivePictureAvailable,
+					cropDecision.applyCrop, fixedCropAspectConfigured,
+					nlsCandidateDecision.mode,
+					nlsCandidatePresentationCrop.applied);
+
 			AlphaSourceCrop::AspectLimitFillDecision aspectLimitFill;
-			if (nlsRequested)
+			if (fixedCropAspectConfigured)
+			{
+				// Fixed means fixed: detector/NLS fail-open and authority timeouts may
+				// choose the complete raster as the input bounds, but they must not
+				// bypass the operator-selected source aspect.
+				AlphaSourceCrop::FixedAspectCropInput fixedCropInput;
+				fixedCropInput.fixedAspect = fixedCropAspect;
+				fixedCropInput.sourceBounds = cropDecision.sourceBounds;
+				aspectLimitFill = AlphaSourceCrop::EvaluateFixedAspectCrop(
+					fixedCropInput);
+			}
+			else if (nlsPresentationFailOpen)
+			{
+				aspectLimitFill.sourceBounds = cropDecision.sourceBounds;
+				aspectLimitFill.reason =
+					"presentation fail-open requires the complete raster";
+			}
+			else if (nlsOwnsPresentationGeometry)
 			{
 				aspectLimitFill.sourceBounds = cropDecision.sourceBounds;
 				const int cropWidth = cropDecision.sourceBounds.right -
@@ -8837,12 +10188,29 @@ struct LibplaceboVideoRenderer::Impl
 				<< sceneVerificationHoldActive << '|'
 				<< ambiguityHoldActive << '|'
 				<< latestObservationIsProvisional << '|'
+				<< latestActivePicturePresentationRetentionEvaluated << '|'
 				<< latestActivePicturePresentationRetentionSafe << '|'
+				<< latestActivePictureGlobalNearBlackEvaluated << '|'
+				<< latestActivePictureGlobalNearBlack << '|'
+				<< static_cast<int>(nearBlackPresentationEpisode.mode) << '|'
+				<< nearBlackPresentationEpisode.startedSourceSequence << '|'
 				<< detectorEnvelopeActive << '|'
 				<< barCropRefinementPending << '|'
+				<< barCropRefinementHorizontalConflict << '|'
+				<< verticalInspectionCandidate << '|'
+				<< verticalInspectionFallbackRequested << '|'
+				<< confirmedCurrentVerticalFit << '|'
 				<< verticalInspectionPending << '|'
+				<< inspectionDecision.expired << '|'
+				<< scopeVerticalInspectionBridge.retentionConsumed << '|'
+				<< scopeVerticalInspectionBridge.denseAnalysisCompleted << '|'
 				<< verticalTranslationConfirmationPending << '|'
 				<< verticalFitConfirmationPending << '|'
+				<< storedVerticalBaseMatchesEffectiveGeometry << '|'
+				<< forceSubtitleBarAnalysis << '|'
+				<< currentBarAuthority << sceneBarAuthority
+				<< heldBarAnalysisAuthority << '|'
+				<< sceneResult.safeBoundary << '|' << sceneResult.eventId << '|'
 				<< engageDriftBaseRetention << '|'
 				<< releaseDriftBaseRetention << '|'
 				<< static_cast<int>(verticalResolution.action) << '|'
@@ -8854,6 +10222,8 @@ struct LibplaceboVideoRenderer::Impl
 				<< cropWiderContentToFillScreen << '|'
 				<< cropWiderContentAspectLimitConfigured << '|'
 				<< cropWiderContentAspectLimit << '|'
+				<< fixedCropAspectConfigured << '|'
+				<< fixedCropAspect << '|'
 				<< aspectLimitFill.contentAspect << '|'
 				<< aspectLimitFill.applied << '|'
 				<< presentationCropBounds.left << ','
@@ -8873,8 +10243,23 @@ struct LibplaceboVideoRenderer::Impl
 				const char* verticalActionLabel = verticalTranslationActive
 					? "translate" : (verticalFitActive ? "fit" :
 						(verticalFailOpen ? "fail-open" : "none"));
+			const char* denseScanLabel = subtitleBarAnalysisScheduled
+				? (forceSubtitleBarAnalysis ? "forced" : "scheduled")
+				: "skipped";
+				const char* barAuthorityLabel = currentBarAuthority
+					? "current" : (sceneBarAuthority ? "scene" :
+						(heldBarAnalysisAuthority ? "held" : "none"));
+				const char* inspectionPhaseLabel = !verticalInspectionCandidate
+					? "none" : (verticalInspectionPending ? "fallback" :
+						(inspectionDecision.expired ? "expired" :
+							(scopeVerticalInspectionBridge.denseAnalysisCompleted
+								? "dense-complete" :
+								(scopeVerticalInspectionBridge.retentionConsumed
+									? "consumed" : "candidate"))));
+			const char* presentationOwnerLabel =
+				AlphaSourceCrop::DecisionOwnerName(cropDecision.owner);
 				DebugLog::Log(
-					"Alpha source crop: sequence=%llu enabled=%d applied=%d expanded=%d translated=%d vertical_action=%s shift_request=%d shift_applied=%d latest_trusted=%d scene_hold=%d ambiguity_hold=%d retention_safe=%d latest_evidence=%d detector_envelope=%d bar_wait=%d inspection_wait=%d translation_wait=%d fit_wait=%d engage_base=%d release_settle=%d envelope_state=%s edges=%c%c%c%c evidence_rect=%d,%d-%d,%d rect=%d,%d-%d,%d fill_rect=%d,%d-%d,%d content_aspect=%.5f screen_aspect=%.5f narrower_fill=%d narrower_limit=%s%.5f wider_fill=%d wider_limit=%s%.5f fill_applied=%d classification=%d geometry_generation=%llu frame_generation=%llu reason=\"%s; %s; %s; %s\"",
+					"Alpha source crop: sequence=%llu enabled=%d applied=%d expanded=%d translated=%d vertical_action=%s shift_request=%d shift_applied=%d latest_trusted=%d scene_hold=%d ambiguity_hold=%d retention_safe=%d latest_evidence=%d detector_envelope=%d bar_wait=%d inspection_wait=%d translation_wait=%d fit_wait=%d engage_base=%d release_settle=%d envelope_state=%s selected_edges=%c%c%c%c fit_evidence_rect=%d,%d-%d,%d rect=%d,%d-%d,%d fill_rect=%d,%d-%d,%d content_aspect=%.5f screen_aspect=%.5f narrower_fill=%d narrower_limit=%s%.5f wider_fill=%d wider_limit=%s%.5f fill_applied=%d classification=%d geometry_generation=%llu frame_generation=%llu owner=%s cut=%d scene_event=%llu retention_eval=%d near_black_eval=%d near_black=%d near_black_p90=%.1f near_black_episode=%s near_black_start=%llu refinement_horizontal=%d inspection_candidate=%d inspection_request=%d inspection_fit_resolved=%d inspection_consumed=%d inspection_dense=%d inspection_phase=%s inspection_first=%llu inspection_retained=%llu coarse_edges=%c%c%c%c coarse_current=%d observation_rect=%d,%d-%d,%d coarse_rect=%d,%d-%d,%d dense_base=%d dense_generation=%llu dense_scan=%s dense_evaluated=%d authority=%s translation_confirm=%u/%u fit_confirm=%u/%u reason=\"%s; %s; %s; %s\"",
 					static_cast<unsigned long long>(sourceSequence),
 					automaticSourceCrop ? 1 : 0,
 					cropDecision.applyCrop ? 1 : 0,
@@ -8931,6 +10316,57 @@ struct LibplaceboVideoRenderer::Impl
 					static_cast<unsigned long long>(
 						effectiveGeometrySourceGeneration),
 					static_cast<unsigned long long>(frameGeneration),
+					presentationOwnerLabel,
+					sceneResult.safeBoundary ? 1 : 0,
+					static_cast<unsigned long long>(sceneResult.eventId),
+					latestActivePicturePresentationRetentionEvaluated ? 1 : 0,
+					latestActivePictureGlobalNearBlackEvaluated ? 1 : 0,
+					latestActivePictureGlobalNearBlack ? 1 : 0,
+					latestActivePictureGlobalLumaP90,
+					AlphaSourceCrop::NearBlackPresentationModeName(
+						nearBlackPresentationEpisode.mode),
+					static_cast<unsigned long long>(
+						nearBlackPresentationEpisode.startedSourceSequence),
+					barCropRefinementHorizontalConflict ? 1 : 0,
+					verticalInspectionCandidate ? 1 : 0,
+					verticalInspectionFallbackRequested ? 1 : 0,
+					confirmedCurrentVerticalFit ? 1 : 0,
+					scopeVerticalInspectionBridge.retentionConsumed ? 1 : 0,
+					scopeVerticalInspectionBridge.denseAnalysisCompleted ? 1 : 0,
+					inspectionPhaseLabel,
+					static_cast<unsigned long long>(
+						scopeVerticalInspectionBridge.
+							firstCandidateSourceSequence),
+					static_cast<unsigned long long>(
+						scopeVerticalInspectionBridge.retainedSourceSequence),
+					currentDetectorLeftExpansion ? 'L' : '-',
+					currentDetectorTopExpansion ? 'T' : '-',
+					currentDetectorRightExpansion ? 'R' : '-',
+					currentDetectorBottomExpansion ? 'B' : '-',
+					currentDetectorEnvelope ? 1 : 0,
+					latestActivePictureEvidenceBounds.left,
+					latestActivePictureEvidenceBounds.top,
+					latestActivePictureEvidenceBounds.right,
+					latestActivePictureEvidenceBounds.bottom,
+					currentDetectorEnvelope
+						? scopePresentationCurrentBounds.left : 0,
+					currentDetectorEnvelope
+						? scopePresentationCurrentBounds.top : 0,
+					currentDetectorEnvelope
+						? scopePresentationCurrentBounds.right : 0,
+					currentDetectorEnvelope
+						? scopePresentationCurrentBounds.bottom : 0,
+					storedVerticalBaseMatchesEffectiveGeometry ? 1 : 0,
+					static_cast<unsigned long long>(
+						scopeSubtitleEvidenceSourceGeneration),
+					denseScanLabel,
+					subtitleBarAnalysisCompleted ? 1 : 0,
+					barAuthorityLabel,
+					scopeSubtitleTranslationConfirmation.confirmations,
+					AlphaSourceCrop::
+						VERTICAL_TRANSLATION_CONFIRMATIONS_REQUIRED,
+					scopeSubtitleFitConfirmation.confirmations,
+					AlphaSourceCrop::VERTICAL_FIT_CONFIRMATIONS_REQUIRED,
 					cropDecision.reason.c_str(),
 					envelopeDecision.reason,
 					latestActivePicturePresentationRetentionReason.c_str(),
@@ -8971,9 +10407,6 @@ struct LibplaceboVideoRenderer::Impl
 			// hook, runtime geometry, status, and destination layout as one decision.
 			renderParams.hooks = nullptr;
 			renderParams.num_hooks = 0;
-			const double panelTargetAspect = pl_rect2df_aspect(&target.crop);
-			const double finalTargetAspect = ResolveNlsTargetAspect(
-				configuredScreenActive, configuredScreenAspect, panelTargetAspect);
 			// Crop evidence decides whether bars may be removed. It must not veto
 			// NLS geometry when the crop policy is already presenting the complete
 			// raster. In that case the source aspect is known directly from the
@@ -8982,21 +10415,20 @@ struct LibplaceboVideoRenderer::Impl
 			// This is part of the established NLS presentation contract and is
 			// independent of the viewport's ordinary automatic-crop setting. NLS-off
 			// presentation remains governed exclusively by cropDecision above.
-			const bool nlsActivePictureCropApplied = nlsRequested &&
-				effectiveGeometryAvailable &&
-				effectiveGeometrySourceGeneration == frameGeneration;
+			const bool nlsActivePictureCropApplied =
+				nlsOwnsPresentationGeometry && nlsActivePictureAvailable &&
+				!cropDecision.applyCrop;
 			const NlsSourceGeometry finalSourceGeometry =
-				ResolveNlsPresentationSourceGeometry(nlsRequested,
-					nlsActivePictureCropApplied,
-					effectiveGeometry.left, effectiveGeometry.top,
-					effectiveGeometry.right, effectiveGeometry.bottom,
-					cropDecision.applyCrop,
-					cropDecision.sourceBounds.left,
-					cropDecision.sourceBounds.top,
-					cropDecision.sourceBounds.right,
-					cropDecision.sourceBounds.bottom,
+				nlsOwnsPresentationGeometry ? nlsCandidateSourceGeometry :
+				ResolveNlsSourceGeometry(
+					cropDecision.applyCrop || aspectLimitFill.applied,
+					presentationCropBounds.left,
+					presentationCropBounds.top,
+					presentationCropBounds.right,
+					presentationCropBounds.bottom,
 					width, height);
-			if (nlsActivePictureCropApplied && finalSourceGeometry.valid)
+			if ((nlsOwnsPresentationGeometry || cropDecision.applyCrop ||
+				aspectLimitFill.applied) && finalSourceGeometry.valid)
 			{
 				source.crop.x0 = static_cast<float>(finalSourceGeometry.left);
 				source.crop.y0 = static_cast<float>(finalSourceGeometry.top);
@@ -9005,15 +10437,9 @@ struct LibplaceboVideoRenderer::Impl
 			}
 			NlsPresentationCropDecision nlsPresentationCrop;
 			nlsPresentationCrop.source = finalSourceGeometry;
-			if (nlsRequested)
+			if (nlsOwnsPresentationGeometry)
 			{
-				nlsPresentationCrop = ResolveNlsPresentationCrop(
-					finalSourceGeometry, finalTargetAspect,
-					nlsRule.aspectTolerancePercent,
-					nlsRule.activeAspectMinimum, nlsRule.aspectDirection,
-					nlsRule.maximumStretchRatio,
-					nlsRule.vpRendererMaximumCropPercent,
-					nlsRule.vpRendererCropPreference);
+				nlsPresentationCrop = nlsCandidatePresentationCrop;
 				if (nlsPresentationCrop.applied)
 				{
 					source.crop.x0 = static_cast<float>(
@@ -9030,8 +10456,8 @@ struct LibplaceboVideoRenderer::Impl
 				nlsPresentationCrop.source;
 			const double finalSourceAspect =
 				presentationSourceGeometry.aspect;
-			const bool finalBoundsAuthoritative = finalSourceGeometry.valid &&
-				presentationSourceGeometry.valid;
+			const bool finalBoundsAuthoritative = !nlsPresentationFailOpen &&
+				finalSourceGeometry.valid && presentationSourceGeometry.valid;
 			const double screenLayoutAspect = configuredScreenActive || nlsRequested
 				? finalTargetAspect : pl_rect2df_aspect(&target.crop);
 			// The configured screen is itself a fitted destination rectangle. Apply
@@ -9069,7 +10495,9 @@ struct LibplaceboVideoRenderer::Impl
 					return;
 				lastFinalLayoutPolicy = policy.str();
 				DebugLog::Log(
-					"Alpha final layout: raster=%dx%d trusted=%d,%d-%d,%d envelope=%d,%d-%d,%d presentation=%d,%d-%d,%d screen_aspect=%.5f screen=%.1f,%.1f-%.1f,%.1f picture=%.1f,%.1f-%.1f,%.1f unused_axis=%s mapping=%s vertical_alignment=%s subtitle_shift_source_pixels=%d anamorphic=%.5f",
+					"Alpha final layout: sequence=%llu generation=%llu raster=%dx%d trusted=%d,%d-%d,%d envelope=%d,%d-%d,%d presentation=%d,%d-%d,%d screen_aspect=%.5f screen=%.1f,%.1f-%.1f,%.1f picture=%.1f,%.1f-%.1f,%.1f unused_axis=%s mapping=%s vertical_alignment=%s subtitle_shift_source_pixels=%d anamorphic=%.5f crop_reason=\"%s\"",
+					static_cast<unsigned long long>(sourceSequence),
+					static_cast<unsigned long long>(frameGeneration),
 					width, height,
 					effectiveGeometry.left, effectiveGeometry.top,
 					effectiveGeometry.right, effectiveGeometry.bottom,
@@ -9089,7 +10517,8 @@ struct LibplaceboVideoRenderer::Impl
 					AlphaSourceCrop::UnusedSpaceAxisName(axis), mapping,
 					verticalAlignment.c_str(),
 					cropDecision.verticalTranslationPixels,
-					anamorphicScale);
+					anamorphicScale,
+					cropDecision.reason.c_str());
 			};
 
 			if (nlsRequested)
@@ -9101,7 +10530,10 @@ struct LibplaceboVideoRenderer::Impl
 						nlsRule.aspectTolerancePercent,
 						nlsRule.activeAspectMinimum, nlsRule.aspectDirection,
 						nlsRule.maximumStretchRatio);
-				if (!finalBoundsAuthoritative)
+				if (nlsPresentationFailOpen)
+					finalNlsDecision.reason =
+						"presentation fail-open suppresses NLS geometry";
+				else if (!finalBoundsAuthoritative)
 					finalNlsDecision.reason =
 						"final crop decision lacks current aspect authority";
 				if (finalNlsDecision.mode == NlsMappingMode::ACTIVE &&
@@ -9242,7 +10674,8 @@ struct LibplaceboVideoRenderer::Impl
 					SetShaderStatus("NLS: Active");
 					break;
 				case NlsMappingMode::LINEAR_PASSTHROUGH:
-					SetShaderStatus("NLS: Passthrough");
+					SetShaderStatus(nlsPresentationCrop.applied ?
+						"NLS: Crop only" : "NLS: Passthrough");
 					break;
 				case NlsMappingMode::SAFE_FIT:
 					SetShaderStatus("NLS: Safe fit");
@@ -9288,12 +10721,18 @@ struct LibplaceboVideoRenderer::Impl
 		struct pl_frame renderImage{};
 		struct pl_frame target = baseTarget;
 		bool trustedActivePicture = false;
+		HdrPeakAnalysisCrop::TrustedPicture hdrTrustedPicture;
 		configureViewport(
 			renderImage,
 			target,
 			configuredScreenActive,
 			subtitleShiftSourcePixels,
-			&trustedActivePicture);
+			&trustedActivePicture,
+			&hdrTrustedPicture);
+		const HdrPeakAnalysisCrop::Decision hdrPeakAnalysisDecision =
+			ApplyHdrPeakAnalysisCrop(frameGeneration, sourceSequence,
+				hdrTrustedPicture, renderImage.crop,
+				hdrPeakAnalysisMotionProtectionPixels);
 		std::vector<uint8_t> overlayPixels;
 		int overlayWidth = 0;
 		int overlayHeight = 0;
@@ -9601,7 +11040,9 @@ struct LibplaceboVideoRenderer::Impl
 						profileScale,
 					static_cast<float>(profileOverlayTexture->params.h) *
 						profileScale,
-					NativeStatsOverlayPlacement::kProfileOverlayInsetPixels,
+					NativeStatsOverlayPlacement::ProfileOverlayTopInset(
+						visiblePicture.IsValid() ? visiblePicture.Height() :
+							dstHeight),
 					NativeStatsOverlayPlacement::ProfileOverlayLeftInset(
 						visiblePicture.IsValid() ? visiblePicture.Height() :
 							dstHeight));
@@ -9663,6 +11104,8 @@ struct LibplaceboVideoRenderer::Impl
 			&target,
 			&renderParams);
 		libplaceboRenderStartedTick.store(0, std::memory_order_release);
+		LogHdrPeakAnalysisMetrics(
+			hdrPeakAnalysisDecision, sourceSequence, rendered);
 		const double renderMs = std::chrono::duration<double, std::milli>(
 			SteadyClock::now() - renderStart).count();
 		if (!rendered && targetLutApplied)
@@ -9829,9 +11272,64 @@ struct LibplaceboVideoRenderer::Impl
 			}
 
 			const uint64_t nowTick = GetTickCount64();
+			PostStallResetObservation resetObservation;
+			resetObservation.renderer = PostStallRendererKind::VpRenderer;
+			resetObservation.nowTick = nowTick;
+			resetObservation.generation = frameGeneration;
+			resetObservation.outputReady = sample.available &&
+				presentationSnapshot.evidence == AlphaPresentationEvidence::Stable;
+			resetObservation.rendererQuiet =
+				!resizePending.load(std::memory_order_acquire) &&
+				!outputRenegotiationPending.load(std::memory_order_acquire) &&
+				nowTick >= postStallResetTelemetrySuppressUntilTick.load(
+					std::memory_order_acquire);
+			resetObservation.materialStall = std::max(renderMs, swapBlockMs) >=
+				static_cast<double>(PostStallResetAdvisor::MATERIAL_STALL_MS);
+			resetObservation.queueDepth = queueDepthAfterDequeue;
+			resetObservation.healthyQueueDepth = desiredQueueDepth;
+			resetObservation.framePeriodMs =
+				presentationSnapshot.measuredDisplayHz >= 10.0 ?
+					1000.0 / presentationSnapshot.measuredDisplayHz :
+					captureRateHz >= 10.0 ? 1000.0 / captureRateHz : 0.0;
+			resetObservation.oldestQueuedAgeMs = oldestQueuedAgeMs;
+			resetObservation.renderMs = renderMs;
+			resetObservation.swapBlockMs = swapBlockMs;
+			const PostStallResetDecision resetDecision =
+				postStallResetAdvisor.Observe(resetObservation);
+			if (resetDecision.shouldLog)
+			{
+				const char* const logPrefix = resetDecision.resetShouldOccur ?
+					"Post-stall reset should occur" :
+					"Post-stall reset telemetry";
+				DebugLog::Log(
+					"%s: renderer=VP action=diagnostic-only state=%s reason=%s generation=%llu output_ready=%d quiet=%d since_stall_ms=%llu observations=%u queue_after=%zu healthy_queue=%zu oldest_ms=%.2f render_ms=%.2f swap_ms=%.2f frame_period_ms=%.3f display_hz=%.5f debt=%llu present_id=%u timing=%s",
+					logPrefix,
+					PostStallResetDiagnosticStateText(resetDecision.state),
+					resetDecision.reason,
+					static_cast<unsigned long long>(frameGeneration),
+					resetObservation.outputReady ? 1 : 0,
+					resetObservation.rendererQuiet ? 1 : 0,
+					static_cast<unsigned long long>(
+						resetDecision.millisecondsSinceMaterialStall),
+					resetDecision.persistentBadObservations,
+					queueDepthAfterDequeue,
+					desiredQueueDepth,
+					oldestQueuedAgeMs,
+					renderMs,
+					swapBlockMs,
+					resetObservation.framePeriodMs,
+					presentationSnapshot.measuredDisplayHz,
+					static_cast<unsigned long long>(
+						presentationSnapshot.sourceToPresentDebt),
+					presentationSnapshot.lastPresentId,
+					AlphaPresentationTimingStatusText(
+						presentationSnapshot.timingStatus));
+			}
 			if (nowTick >= nextPresentationTelemetryLogTick)
 			{
-				nextPresentationTelemetryLogTick = nowTick + 5000;
+				nextPresentationTelemetryLogTick = nowTick +
+					(resetDecision.state ==
+						PostStallResetDiagnosticState::Monitoring ? 5000 : 2000);
 				const AlphaPresentationSnapshot snapshot =
 					presentationTelemetry.Snapshot();
 				DebugLog::Log(
@@ -10090,13 +11588,21 @@ bool LibplaceboVideoRenderer::OnVideoState(VideoStateComPtr& videoState)
 				nextRule.empty() ? "base" : nextRule.c_str());
 			return false;
 		}
+		// The published snapshot can lag a UI profile transition by one render
+		// frame. If so, a source/refresh transition must replace that pending
+		// intent even when it happens to match the published settings; otherwise
+		// the stale queued viewport can be consumed with this newer viewport
+		// request and briefly describe the wrong picture geometry.
 		if (hasUnifiedSettings &&
-			EffectiveSettingsFingerprint(nextSettings) !=
-				currentEffectiveFingerprint)
+			(m_impl->HasPendingProfileSettings() ||
+			 EffectiveSettingsFingerprint(nextSettings) !=
+				currentEffectiveFingerprint))
 		{
-			m_impl->ApplyViewportSettings(nextSettings);
 			ApplyViewportTarget(nextSettings.configuredScreenTarget,
 				nextSettings.configuredScreenAspect, "automatic profile refresh");
+			m_impl->ApplyViewportSettings(nextSettings,
+				m_viewportRequestSerial.load(std::memory_order_acquire),
+				m_viewportRequestNs.load(std::memory_order_relaxed));
 			DebugLog::Log(
 				"profiles: applied automatic viewport settings live without renderer rebuild");
 		}
@@ -10719,9 +12225,16 @@ bool LibplaceboVideoRenderer::ApplyApplicationState(
 	rendererRestartRequired = m_impl != nullptr &&
 		(!state || EffectiveSettingsFingerprint(candidateSettings, false) !=
 			currentRestartFingerprint);
+	// A profile request is coalesced on the render thread. Compare against both
+	// the last applied snapshot and the existence of a queued one: A -> B -> A
+	// before the next render must replace B with A, rather than treating the
+	// final A as a no-op and letting B pair with A's viewport request.
+	const bool pendingProfileSettings = m_impl &&
+		m_impl->HasPendingProfileSettings();
 	const bool anyRendererSettingChanged = m_impl &&
-		EffectiveSettingsFingerprint(candidateSettings) !=
-			currentEffectiveFingerprint;
+		(pendingProfileSettings ||
+		 EffectiveSettingsFingerprint(candidateSettings) !=
+			currentEffectiveFingerprint);
 	std::string changedFields = "none";
 	bool liveProfileUpdateQueued = false;
 	const bool liveSettingsCompatible = state && m_impl &&
@@ -10734,15 +12247,6 @@ bool LibplaceboVideoRenderer::ApplyApplicationState(
 		// This preserves the renderer and its libplacebo/D3D resources when an
 		// editor changes values inside the already selected profile. The immutable
 		// intent is consumed only by the render thread's existing safe point.
-		if (!m_impl->ApplyProfileSettingsLive(candidateSettings))
-		{
-			rendererRestartRequired = false;
-			DebugLog::Log(
-				"application profile generation %llu live update rejected after compatible classification: fields=%s",
-				static_cast<unsigned long long>(snapshot.generation),
-				changedFields.c_str());
-			return false;
-		}
 		rendererRestartRequired = false;
 		liveProfileUpdateQueued = true;
 		// Compatible Screen, Zoom, Scaling, Color, and Processing changes are
@@ -10796,13 +12300,29 @@ bool LibplaceboVideoRenderer::ApplyApplicationState(
 	}
 	if (!rendererRestartRequired && m_impl)
 	{
-		// ApplyProfileSettingsLive already queues the full immutable snapshot and
-		// applies its viewport portion at the same render-thread safe point.
-		// Do not replace that intent with a second UI-thread queue operation.
-		if (!liveProfileUpdateQueued)
-			m_impl->ApplyViewportSettings(candidateSettings);
 		ApplyViewportTarget(candidateSettings.configuredScreenTarget,
 			candidateSettings.configuredScreenAspect, "application snapshot");
+		const uint64_t viewportRequestSerial =
+			m_viewportRequestSerial.load(std::memory_order_acquire);
+		const int64_t viewportRequestNs =
+			m_viewportRequestNs.load(std::memory_order_relaxed);
+		if (liveProfileUpdateQueued)
+		{
+			if (!m_impl->ApplyProfileSettingsLive(candidateSettings,
+				viewportRequestSerial, viewportRequestNs))
+			{
+				DebugLog::Log(
+					"application profile generation %llu live update rejected after compatible classification: fields=%s",
+					static_cast<unsigned long long>(snapshot.generation),
+					changedFields.c_str());
+				return false;
+			}
+		}
+		else
+		{
+			m_impl->ApplyViewportSettings(candidateSettings,
+				viewportRequestSerial, viewportRequestNs);
+		}
 		DebugLog::Log(
 			"application viewport state applied live: %s target=%s explicit=%d vertical_alignment=%s",
 			snapshot.viewport.profile.c_str(),
@@ -10984,6 +12504,15 @@ void LibplaceboVideoRenderer::Reset()
 	// Queue invalidation is CPU-side state and must never wait for an in-flight
 	// libplacebo compile. In particular, HDMI re-sync can arrive on the UI
 	// thread while pl_render_image is building a new program.
+	if (m_impl)
+	{
+		// Source-derived presentation authority belongs to the discarded queue
+		// generation. Consume this request at the next render-thread safe point;
+		// do not take the render lock or flush libplacebo here. This must precede
+		// opening the new generation, so its first admitted frame cannot present
+		// with geometry from the discarded generation.
+		m_impl->RequestPresentationStateReset();
+	}
 	BeginQueueGeneration("renderer reset");
 	if (m_impl)
 	{
@@ -11015,9 +12544,30 @@ void LibplaceboVideoRenderer::ResetLiveQueue()
 {
 	// This may be called from UI/profile application paths. It only advances
 	// queue state, so waiting for the GPU render/compile lock is unnecessary.
+	// It nevertheless discards source frames, so the next generation must not
+	// reuse source-derived crop/presentation authority from the old queue.
+	if (m_impl)
+		m_impl->RequestPresentationStateReset();
 	BeginQueueGeneration("live queue reset");
 	m_sceneDetectorGeneration.fetch_add(1, std::memory_order_acq_rel);
 }
+
+
+void LibplaceboVideoRenderer::SetPostStallResetTelemetrySuppressedUntil(
+	uint64_t tick)
+{
+	if (!m_impl)
+		return;
+	uint64_t observed = m_impl->postStallResetTelemetrySuppressUntilTick.load(
+		std::memory_order_acquire);
+	while (observed < tick &&
+		!m_impl->postStallResetTelemetrySuppressUntilTick.compare_exchange_weak(
+			observed, tick, std::memory_order_release,
+			std::memory_order_acquire))
+	{
+	}
+}
+
 
 void LibplaceboVideoRenderer::SetSceneAwareTimingCorrection(bool enabled)
 {
@@ -11288,11 +12838,29 @@ void LibplaceboVideoRenderer::SetQueueFramePolicy(
 void LibplaceboVideoRenderer::SetActivePictureLookaheadFrames(size_t frames)
 {
 	const size_t boundedFrames = (std::min)(frames, size_t{ 8 });
-	m_activePictureLookaheadFrames.store(
-		boundedFrames, std::memory_order_release);
+	size_t previousFrames = 0;
+	bool policyInvalidated = false;
+	bool candidateReset = false;
+	{
+		std::lock_guard<std::mutex> queueGuard(m_queueMutex);
+		previousFrames = m_activePictureLookaheadFrames.load(
+			std::memory_order_relaxed);
+		if (previousFrames != boundedFrames)
+		{
+			m_activePictureLookaheadFrames.store(
+				boundedFrames, std::memory_order_release);
+			candidateReset = (previousFrames == 0) != (boundedFrames == 0);
+			m_activePictureTimeline.InvalidateLookaheadPolicy(candidateReset);
+			m_activePictureLookaheadLoggedAvailable = 0xff;
+			policyInvalidated = true;
+		}
+	}
 	DebugLog::Log(
-		"Alpha active-picture look-ahead retained: configured=%zu queue-unchanged=1 runtime-active=0",
-		boundedFrames);
+		"Alpha active-picture look-ahead configured: previous=%zu configured=%zu changed=%d decision-invalidated=%d candidate-reset=%d evidence-retained=%d queue-unchanged=1 runtime-active=%d",
+		previousFrames, boundedFrames, policyInvalidated ? 1 : 0,
+		policyInvalidated ? 1 : 0, candidateReset ? 1 : 0,
+		policyInvalidated && !candidateReset ? 1 : 0,
+		boundedFrames > 0 ? 1 : 0);
 }
 
 
@@ -11820,13 +13388,16 @@ bool LibplaceboVideoRenderer::GetFrameRateAndPPM(
 
 void LibplaceboVideoRenderer::AnalyzeActivePictureLookahead(
 	std::vector<QueuedFrame>& previewFrames,
-	uint8_t availableLookahead)
+	uint8_t availableLookahead,
+	uint64_t lookaheadPolicyGeneration)
 {
 	struct PreviewEvidence
 	{
 		ActivePictureFrameIdentity identity;
 		ActivePictureObservation observation;
 		double framesPerSecond = 0.0;
+		bool nearBlackEvaluated = false;
+		bool nearBlack = false;
 	};
 	std::vector<PreviewEvidence> observations;
 	observations.reserve(previewFrames.size());
@@ -11869,6 +13440,14 @@ void LibplaceboVideoRenderer::AnalyzeActivePictureLookahead(
 				ActivePictureClassification::BAR_CROP_TRUSTED
 				? evidence.trustedBounds : evidence.proposedBounds;
 			preview.observation.classification = evidence.classification;
+			if (evidence.classification ==
+				ActivePictureClassification::BAR_CROP_TRUSTED)
+			{
+				const ActivePictureGlobalNearBlackEvidence globalNearBlack =
+					EvaluateActivePictureGlobalNearBlack(source);
+				preview.nearBlackEvaluated = globalNearBlack.evaluated;
+				preview.nearBlack = globalNearBlack.nearBlack;
+			}
 		}
 		preview.framesPerSecond = state.displayMode->RefreshRateHz();
 		observations.push_back(preview);
@@ -11879,6 +13458,17 @@ void LibplaceboVideoRenderer::AnalyzeActivePictureLookahead(
 		size_t{ ActivePictureDecisionTimeline::MAX_LOOKAHEAD_FRAMES }));
 	{
 		std::lock_guard<std::mutex> queueGuard(m_queueMutex);
+		if (lookaheadPolicyGeneration !=
+			m_activePictureTimeline.LookaheadPolicyGeneration())
+		{
+			DebugLog::Log(
+				"Alpha active-picture look-ahead preview rejected: generation=%llu policy_generation=%llu current_policy_generation=%llu reason=policy_changed",
+				static_cast<unsigned long long>(m_queueGeneration),
+				static_cast<unsigned long long>(lookaheadPolicyGeneration),
+				static_cast<unsigned long long>(
+					m_activePictureTimeline.LookaheadPolicyGeneration()));
+			return;
+		}
 		if (m_activePictureLookaheadLoggedGeneration != m_queueGeneration ||
 			m_activePictureLookaheadLoggedAvailable != availableLookahead)
 		{
@@ -11905,6 +13495,18 @@ void LibplaceboVideoRenderer::AnalyzeActivePictureLookahead(
 				queued->activePicturePreviewAnalyzed)
 				continue;
 			queued->activePicturePreviewAnalyzed = true;
+			if (!m_activePictureTimeline.TrackLookaheadEvidence(
+				preview.identity, preview.observation,
+				preview.nearBlackEvaluated, preview.nearBlack))
+			{
+				DebugLog::Log(
+					"Alpha active-picture look-ahead evidence rejected: generation=%llu source=%llu reason=stale_or_conflicting_identity",
+					static_cast<unsigned long long>(
+						preview.identity.transportGeneration),
+					static_cast<unsigned long long>(
+						preview.identity.acceptedSequence));
+				continue;
+			}
 			if (!m_activePictureTimeline.ShouldAnalyze(
 				preview.observation.frameNumber, preview.framesPerSecond))
 				continue;
@@ -11926,7 +13528,7 @@ void LibplaceboVideoRenderer::AnalyzeActivePictureLookahead(
 			target->activePicturePreviewDecision = decision;
 			target->activePicturePreviewDecisionAvailable = true;
 			DebugLog::Log(
-				"Alpha active-picture look-ahead decision: generation=%llu observed=%llu effective=%llu configured=%u available=%u effective_lead=%u late=%d rect=%d,%d-%d,%d runtime-apply=pending",
+				"Alpha active-picture look-ahead decision: generation=%llu observed=%llu effective=%llu configured=%u available=%u effective_lead=%u backdated_frames=%llu association=%s inward_proof=%s proof_frames=%u late=%d rect=%d,%d-%d,%d runtime-apply=pending",
 				static_cast<unsigned long long>(
 					decision.observationIdentity.transportGeneration),
 				static_cast<unsigned long long>(
@@ -11936,6 +13538,14 @@ void LibplaceboVideoRenderer::AnalyzeActivePictureLookahead(
 				static_cast<unsigned>(decision.configuredLookahead),
 				static_cast<unsigned>(decision.availableLookahead),
 				static_cast<unsigned>(decision.effectiveLookahead),
+				static_cast<unsigned long long>(
+					decision.observationIdentity.acceptedSequence >=
+						decision.effectiveIdentity.acceptedSequence
+					? decision.observationIdentity.acceptedSequence -
+						decision.effectiveIdentity.acceptedSequence : 0),
+				ActivePictureDecisionAssociationName(decision.association),
+				ActivePictureInwardProofValidationName(decision.inwardProof),
+				static_cast<unsigned>(decision.proofFrameCount),
 				decision.late ? 1 : 0,
 				decision.transition.bounds.left,
 				decision.transition.bounds.top,
@@ -11964,6 +13574,8 @@ void LibplaceboVideoRenderer::RenderLoop()
 					m_videoConversionOverride);
 				m_configuredScreenActive.store(
 					m_impl->configuredScreenTarget, std::memory_order_release);
+				m_impl->renderConfiguredScreenActive =
+					m_impl->configuredScreenTarget;
 				m_implInitialized.store(true, std::memory_order_release);
 			}
 			// A graph stop/run may follow an HDMI re-sync while retaining this
@@ -12006,6 +13618,10 @@ void LibplaceboVideoRenderer::RenderLoop()
 		uint64_t sourceSequence = 0;
 		ActivePictureFrameIdentity activePictureIdentity;
 		bool activePicturePreviewDecisionAvailable = false;
+		bool activePicturePreviewTimelineMatches = false;
+		bool activePicturePreviewPolicyMatches = false;
+		bool activePicturePreviewIdentityMatches = false;
+		uint64_t activePictureCurrentPolicyGeneration = 0;
 		ActivePictureFrameDecision activePicturePreviewDecision;
 		int64_t enqueueQpc = 0;
 		int64_t dequeueQpc = 0;
@@ -12014,6 +13630,7 @@ void LibplaceboVideoRenderer::RenderLoop()
 		double oldestQueuedAgeMs = 0.0;
 		std::vector<QueuedFrame> activePicturePreviewFrames;
 		uint8_t activePictureAvailableLookahead = 0;
+		uint64_t activePictureLookaheadPolicyGeneration = 0;
 		bool cadenceRepeat = false;
 		uint64_t cadenceActionId = 0;
 		uint64_t cadencePolicyGeneration = 0;
@@ -12080,6 +13697,8 @@ void LibplaceboVideoRenderer::RenderLoop()
 			const size_t requestedLookahead = (std::min)(
 				m_activePictureLookaheadFrames.load(std::memory_order_acquire),
 				size_t{ ActivePictureDecisionTimeline::MAX_LOOKAHEAD_FRAMES });
+			activePictureLookaheadPolicyGeneration =
+				m_activePictureTimeline.LookaheadPolicyGeneration();
 			if (requestedLookahead > 0)
 			{
 				size_t sourceLead = 0;
@@ -12151,13 +13770,15 @@ void LibplaceboVideoRenderer::RenderLoop()
 			}
 		}
 
-		if (m_activePictureLookaheadFrames.load(std::memory_order_acquire) > 0)
+		if (!activePicturePreviewFrames.empty() &&
+			m_activePictureLookaheadFrames.load(std::memory_order_acquire) > 0)
 		{
 			try
 			{
 				AnalyzeActivePictureLookahead(
 					activePicturePreviewFrames,
-					activePictureAvailableLookahead);
+					activePictureAvailableLookahead,
+					activePictureLookaheadPolicyGeneration);
 			}
 			catch (const std::exception& e)
 			{
@@ -12170,9 +13791,12 @@ void LibplaceboVideoRenderer::RenderLoop()
 				DebugLog::Log(
 					"Alpha active-picture look-ahead preview failed: unknown exception");
 			}
-			for (QueuedFrame& preview : activePicturePreviewFrames)
-				preview.frame.SourceBufferRelease();
 		}
+		// References are acquired while selecting preview work. A live profile
+		// change may disable analysis after selection, so release independently
+		// of the current policy and of analysis success.
+		for (QueuedFrame& preview : activePicturePreviewFrames)
+			preview.frame.SourceBufferRelease();
 
 		if (prefillReleased)
 		{
@@ -12181,23 +13805,6 @@ void LibplaceboVideoRenderer::RenderLoop()
 				static_cast<unsigned long long>(frameGeneration),
 				prefillDepth,
 				prefillTarget);
-		}
-		const ActivePictureFrameIdentity& effectiveIdentity =
-			activePicturePreviewDecision.effectiveIdentity;
-		const bool activePicturePreviewIdentityMatches =
-			activePicturePreviewDecisionAvailable &&
-			SameActivePictureFrameIdentity(
-				effectiveIdentity, activePictureIdentity);
-		if (activePicturePreviewDecisionAvailable &&
-			!activePicturePreviewIdentityMatches)
-		{
-			DebugLog::Log(
-				"Alpha active-picture look-ahead rejected: generation=%llu source=%llu observed=%llu effective=%llu reason=identity_mismatch runtime-apply=0",
-				static_cast<unsigned long long>(frameGeneration),
-				static_cast<unsigned long long>(sourceSequence),
-				static_cast<unsigned long long>(
-					activePicturePreviewDecision.observationIdentity.acceptedSequence),
-				static_cast<unsigned long long>(effectiveIdentity.acceptedSequence));
 		}
 		if (depthSummaryReady)
 		{
@@ -12244,6 +13851,41 @@ void LibplaceboVideoRenderer::RenderLoop()
 				std::lock_guard<std::mutex> queueGuard(m_queueMutex);
 				staleGeneration =
 					m_stopRequested || frameGeneration != m_queueGeneration;
+				activePicturePreviewTimelineMatches =
+					activePicturePreviewDecisionAvailable &&
+					m_activePictureTimeline.IsDecisionCurrent(
+						activePicturePreviewDecision);
+				activePictureCurrentPolicyGeneration =
+					m_activePictureTimeline.LookaheadPolicyGeneration();
+				activePicturePreviewPolicyMatches =
+					activePicturePreviewDecisionAvailable &&
+					activePicturePreviewDecision.lookaheadPolicyGeneration ==
+						activePictureCurrentPolicyGeneration;
+				activePicturePreviewIdentityMatches =
+					activePicturePreviewDecisionAvailable &&
+					activePicturePreviewTimelineMatches &&
+					SameActivePictureFrameIdentity(
+						activePicturePreviewDecision.effectiveIdentity,
+						activePictureIdentity);
+			}
+			if (activePicturePreviewDecisionAvailable &&
+				!activePicturePreviewIdentityMatches)
+			{
+				DebugLog::Log(
+					"Alpha active-picture look-ahead rejected: generation=%llu source=%llu observed=%llu effective=%llu policy_generation=%llu current_policy_generation=%llu reason=%s runtime-apply=0",
+					static_cast<unsigned long long>(frameGeneration),
+					static_cast<unsigned long long>(sourceSequence),
+					static_cast<unsigned long long>(
+						activePicturePreviewDecision.observationIdentity.acceptedSequence),
+					static_cast<unsigned long long>(
+						activePicturePreviewDecision.effectiveIdentity.acceptedSequence),
+					static_cast<unsigned long long>(
+						activePicturePreviewDecision.lookaheadPolicyGeneration),
+					static_cast<unsigned long long>(
+						activePictureCurrentPolicyGeneration),
+					!activePicturePreviewPolicyMatches ? "policy_mismatch" :
+						(activePicturePreviewTimelineMatches ?
+							"identity_mismatch" : "continuity_mismatch"));
 			}
 			if (!staleGeneration)
 			{
@@ -12262,9 +13904,9 @@ void LibplaceboVideoRenderer::RenderLoop()
 					oldestQueuedAgeMs,
 					cadenceRepeat,
 					captureRateHz,
-					m_configuredScreenActive.load(std::memory_order_acquire),
-					m_viewportRequestSerial.load(std::memory_order_acquire),
-					m_viewportRequestNs.load(std::memory_order_relaxed),
+					m_impl->renderConfiguredScreenActive,
+					m_impl->renderViewportRequestSerial,
+					m_impl->renderViewportRequestNs,
 					m_sceneDetectionEnabled.load(std::memory_order_acquire),
 					m_videoConversionOverride,
 					m_sceneDetectorGeneration.load(std::memory_order_acquire),

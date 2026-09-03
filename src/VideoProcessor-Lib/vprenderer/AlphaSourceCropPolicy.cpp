@@ -2,11 +2,18 @@
 
 #include "AlphaSourceCropPolicy.h"
 
+#include <cmath>
+
 
 namespace AlphaSourceCrop
 {
 	namespace
 	{
+		// At 24 fps this is at most 125 ms: enough for the queued dense scan to
+		// publish its first overlay result, but too short to hide a real geometry
+		// change behind a stale trusted crop.
+		constexpr uint64_t VERTICAL_INSPECTION_MAX_SOURCE_SEQUENCES = 3;
+
 		bool BroadPictureLike(const ActivePictureEdgeEvidence& edge)
 		{
 			return edge.barPixels > 0 && edge.blackFraction <= 0.80 &&
@@ -80,6 +87,60 @@ namespace AlphaSourceCrop
 				left.rasterHeight == right.rasterHeight;
 		}
 
+		bool SameTrustedCropContract(const ActivePictureBounds& left,
+			const ActivePictureBounds& right)
+		{
+			return SameBounds(left, right) &&
+				left.trustedBarAxes == right.trustedBarAxes &&
+				left.trustedBarAxes != ActivePictureBounds::BarAxes::NONE;
+		}
+
+		uint32_t NearBlackCropRevalidationSamples(double framesPerSecond)
+		{
+			if (!std::isfinite(framesPerSecond) || framesPerSecond <= 0.0)
+				framesPerSecond = 60.0;
+			return static_cast<uint32_t>(std::max(2.0,
+				std::ceil(framesPerSecond * 0.250) + 1.0));
+		}
+
+		uint32_t NearBlackBootstrapSamples(double framesPerSecond)
+		{
+			if (!std::isfinite(framesPerSecond) || framesPerSecond <= 0.0)
+				framesPerSecond = 60.0;
+			// Bootstrap only reopens the independently verified normal acquisition
+			// path. Keep enough time for the second gate while keeping their combined
+			// recovery below about 0.7 seconds for 24 Hz sources.
+			return static_cast<uint32_t>(std::max(2.0,
+				std::ceil(framesPerSecond * 0.375) + 1.0));
+		}
+
+		bool ChromaAlignedTrustedContract(const ActivePictureBounds& bounds)
+		{
+			return ValidBounds(bounds, bounds.rasterWidth, bounds.rasterHeight) &&
+				bounds.trustedBarAxes != ActivePictureBounds::BarAxes::NONE &&
+				(bounds.left & 1) == 0 && (bounds.top & 1) == 0 &&
+				(bounds.right & 1) == 0 && (bounds.bottom & 1) == 0;
+		}
+
+		void ResetNearBlackCropRevalidation(
+			NearBlackPresentationEpisodeState& state)
+		{
+			state.revalidationStartedSourceSequence = 0;
+			state.revalidationLastSourceSequence = 0;
+			state.revalidationSamples = 0;
+		}
+
+		void ResetNearBlackBootstrap(
+			NearBlackPresentationEpisodeState& state)
+		{
+			state.bootstrapCandidateAvailable = false;
+			state.bootstrapCandidate = {};
+			state.bootstrapCandidateStartedTick = 0;
+			state.bootstrapLastQualifiedTick = 0;
+			state.bootstrapLastSourceSequence = 0;
+			state.bootstrapSamples = 0;
+		}
+
 		int ChromaAlignedDisplacement(int pixels)
 		{
 			if (pixels > 0)
@@ -88,6 +149,63 @@ namespace AlphaSourceCrop
 				return -(((-pixels) + 1) & ~1);
 			return 0;
 		}
+	}
+
+	const char* DecisionOwnerName(DecisionOwner owner)
+	{
+		switch (owner)
+		{
+		case DecisionOwner::TRUSTED_CROP:
+			return "trusted";
+		case DecisionOwner::PIXEL_SAFE_RETENTION:
+			return "pixel-safe";
+		case DecisionOwner::SCENE_HOLD:
+			return "scene-hold";
+		case DecisionOwner::AMBIGUITY_HOLD:
+			return "ambiguity-hold";
+		case DecisionOwner::BAR_REFINEMENT:
+			return "bar-refinement";
+		case DecisionOwner::VERTICAL_INSPECTION:
+			return "inspection";
+		case DecisionOwner::TRANSLATION_CONFIRMATION:
+			return "translation-confirm";
+		case DecisionOwner::FIT_CONFIRMATION:
+			return "fit-confirm";
+		case DecisionOwner::ENGAGE_BASE:
+			return "engage-base";
+		case DecisionOwner::RELEASE_BASE:
+			return "release-base";
+		case DecisionOwner::NEAR_BLACK_EPISODE:
+			return "near-black-episode";
+		case DecisionOwner::OUTWARD_FIT:
+			return "fit";
+		case DecisionOwner::VERTICAL_TRANSLATION:
+			return "translation";
+		case DecisionOwner::FULL_RASTER:
+		default:
+			return "full-raster";
+		}
+	}
+
+	const char* NearBlackPresentationModeName(
+		NearBlackPresentationMode mode)
+	{
+		switch (mode)
+		{
+		case NearBlackPresentationMode::RETAIN_CROP:
+			return "retain-crop";
+		case NearBlackPresentationMode::FULL_RASTER:
+			return "full-raster";
+		default:
+			return "inactive";
+		}
+	}
+
+	bool ShouldSuppressNearBlackBarGeometryMutation(bool acquisitionBlocked,
+		bool stable, ActivePictureClassification classification)
+	{
+		return acquisitionBlocked && stable && classification ==
+			ActivePictureClassification::BAR_CROP_TRUSTED;
 	}
 
 	BarContentEdge SelectVerticalBarContentEdge(
@@ -237,6 +355,20 @@ namespace AlphaSourceCrop
 			std::abs(input.previous.candidateTranslationPixels -
 				input.observed.translationPixels) <=
 				VERTICAL_TRANSLATION_STABILITY_PIXELS;
+		const bool repeatedSourceSample = candidateMatches &&
+			input.sourceSequence != 0 &&
+			input.previous.lastObservedSourceSequence == input.sourceSequence;
+		if (repeatedSourceSample)
+		{
+			decision.state = input.previous;
+			decision.pending = true;
+			if (acceptedSameDirection)
+				decision.effective.translationPixels =
+					input.acceptedTranslationPixels;
+			else
+				decision.effective = {};
+			return decision;
+		}
 		decision.state.candidateTranslationPixels = candidateMatches
 			? (input.observed.translationPixels < 0.0f
 				? std::min(input.previous.candidateTranslationPixels,
@@ -246,6 +378,7 @@ namespace AlphaSourceCrop
 			: input.observed.translationPixels;
 		decision.state.confirmations = candidateMatches
 			? input.previous.confirmations + 1 : 1;
+		decision.state.lastObservedSourceSequence = input.sourceSequence;
 		if (decision.state.confirmations >=
 			VERTICAL_TRANSLATION_CONFIRMATIONS_REQUIRED)
 		{
@@ -286,7 +419,8 @@ namespace AlphaSourceCrop
 		const ActivePictureBounds& trustedGeometry,
 		const ActivePictureBounds& candidate,
 		const ActivePicturePresentationRetentionEvidence& evidence,
-		uint64_t sourceGeneration)
+		uint64_t sourceGeneration,
+		uint64_t sourceSequence)
 	{
 		OutwardPictureConfirmationDecision decision;
 		const bool compatible = sourceGeneration != 0 &&
@@ -321,11 +455,15 @@ namespace AlphaSourceCrop
 
 		const bool continues = previous.sourceGeneration == sourceGeneration &&
 			previous.confirmations != 0 && SameBounds(previous.candidate, candidate);
+		const bool repeatedSourceSample = continues && sourceSequence != 0 &&
+			previous.lastObservedSourceSequence == sourceSequence;
 		decision.state.candidate = candidate;
 		decision.state.sourceGeneration = sourceGeneration;
-		decision.state.confirmations = continues
+		decision.state.lastObservedSourceSequence = sourceSequence;
+		decision.state.confirmations = repeatedSourceSample
+			? previous.confirmations : (continues
 			? std::min(OUTWARD_PICTURE_CONFIRMATIONS_REQUIRED,
-				previous.confirmations + 1) : 1;
+				previous.confirmations + 1) : 1);
 		decision.authoritative = decision.state.confirmations >=
 			OUTWARD_PICTURE_CONFIRMATIONS_REQUIRED;
 		return decision;
@@ -333,16 +471,29 @@ namespace AlphaSourceCrop
 
 	VerticalFitConfirmationDecision ConfirmVerticalFit(
 		const VerticalFitConfirmationState& previous,
-		const VerticalBarContentDecision& observed)
+		const VerticalBarContentDecision& observed,
+		uint64_t sourceSequence)
 	{
 		VerticalFitConfirmationDecision decision;
 		decision.effective = observed;
 		if (observed.action != VerticalBarPresentationAction::FIT)
 			return decision;
+		if (sourceSequence != 0 &&
+			previous.lastObservedSourceSequence == sourceSequence &&
+			previous.confirmations != 0)
+		{
+			decision.state = previous;
+			decision.pending = previous.confirmations <
+				VERTICAL_FIT_CONFIRMATIONS_REQUIRED;
+			if (decision.pending)
+				decision.effective = {};
+			return decision;
+		}
 
 		decision.state.confirmations = std::min(
 			VERTICAL_FIT_CONFIRMATIONS_REQUIRED,
 			previous.confirmations + 1);
+		decision.state.lastObservedSourceSequence = sourceSequence;
 		if (decision.state.confirmations <
 			VERTICAL_FIT_CONFIRMATIONS_REQUIRED)
 		{
@@ -369,6 +520,109 @@ namespace AlphaSourceCrop
 			latestObservationCanAwaitInspection &&
 			!leftExpansion && !rightExpansion &&
 			(topExpansion || bottomExpansion);
+	}
+
+	bool ShouldTrackDynamicPresentationGeometry(
+		bool automaticCropEnabled, bool subtitleFitEnabled)
+	{
+		return automaticCropEnabled || subtitleFitEnabled;
+	}
+
+	bool CanResolveVerticalInspectionWithConfirmedFit(
+		const VerticalInspectionFitResolutionInput& input)
+	{
+		if (!input.confirmedDenseFit || !input.denseAnalysisCurrent ||
+			!input.outwardExpansionAvailable ||
+			input.currentHorizontalExpansion ||
+			input.outwardExpansionSourceGeneration == 0 ||
+			input.outwardExpansionSourceGeneration !=
+				input.frameSourceGeneration)
+		{
+			return false;
+		}
+
+		const int width = input.trustedBase.rasterWidth;
+		const int height = input.trustedBase.rasterHeight;
+		if (!ValidBounds(input.trustedBase, width, height) ||
+			!CropEdgesAreChromaAligned(input.trustedBase, width, height) ||
+			!ValidBounds(input.outwardExpansion, width, height) ||
+			!CropEdgesAreChromaAligned(input.outwardExpansion, width, height))
+		{
+			return false;
+		}
+
+		return input.outwardExpansion.left == input.trustedBase.left &&
+			input.outwardExpansion.right == input.trustedBase.right &&
+			(input.outwardExpansion.top < input.trustedBase.top ||
+			 input.outwardExpansion.bottom > input.trustedBase.bottom);
+	}
+
+	VerticalInspectionBridgeDecision UpdateVerticalInspectionBridge(
+		const VerticalInspectionBridgeInput& input)
+	{
+		VerticalInspectionBridgeDecision decision;
+		if (input.sourceGeneration == 0 || input.sourceSequence == 0 ||
+			input.cropAuthorityResolved || input.fullRasterAuthorityResolved ||
+			input.confirmedVerticalFitResolved ||
+			input.verticalPresentationOwnerAvailable)
+		{
+			return decision;
+		}
+
+		const bool sameBase = SameBounds(
+			input.previous.trustedBase, input.trustedBase) &&
+			input.previous.trustedBase.trustedBarAxes ==
+				input.trustedBase.trustedBarAxes;
+		const bool sameEpisode = input.previous.active &&
+			input.previous.sourceGeneration == input.sourceGeneration &&
+			input.previous.presentationEpoch == input.presentationEpoch &&
+			sameBase;
+		if (!sameEpisode)
+		{
+			if (!input.candidate)
+				return decision;
+			decision.state.active = true;
+			decision.state.retentionConsumed = false;
+			decision.state.denseAnalysisCompleted = false;
+			decision.state.sourceGeneration = input.sourceGeneration;
+			decision.state.presentationEpoch = input.presentationEpoch;
+			decision.state.trustedBase = input.trustedBase;
+			decision.state.firstCandidateSourceSequence = input.sourceSequence;
+			decision.state.retainedSourceSequence = 0;
+			decision.started = true;
+		}
+		else
+		{
+			decision.state = input.previous;
+		}
+		if (input.denseAnalysisCompleted)
+			decision.state.denseAnalysisCompleted = true;
+		if (!input.candidate)
+			return decision;
+
+		const bool repeatedRetainedSource =
+			decision.state.retentionConsumed &&
+			decision.state.retainedSourceSequence == input.sourceSequence;
+		const bool insideBoundedInspectionWindow =
+			input.sourceSequence >= decision.state.firstCandidateSourceSequence &&
+			input.sourceSequence - decision.state.firstCandidateSourceSequence <
+				VERTICAL_INSPECTION_MAX_SOURCE_SEQUENCES;
+		decision.retain = input.retentionRequested &&
+			(repeatedRetainedSource ||
+			 (!decision.state.denseAnalysisCompleted &&
+			  insideBoundedInspectionWindow));
+		if (decision.retain && !repeatedRetainedSource)
+		{
+			decision.state.retentionConsumed = true;
+			decision.state.retainedSourceSequence = input.sourceSequence;
+		}
+		else if (input.retentionRequested)
+		{
+			decision.state.failOpenLatched = true;
+		}
+		decision.expired =
+			input.retentionRequested && !decision.retain;
+		return decision;
 	}
 
 	bool IsVerticalBarPresentationActive(
@@ -1152,6 +1406,66 @@ namespace AlphaSourceCrop
 		return decision;
 	}
 
+	AspectLimitFillDecision EvaluateFixedAspectCrop(
+		const FixedAspectCropInput& input)
+	{
+		AspectLimitFillDecision decision;
+		decision.sourceBounds = input.sourceBounds;
+		const int width = input.sourceBounds.right - input.sourceBounds.left;
+		const int height = input.sourceBounds.bottom - input.sourceBounds.top;
+		if (width <= 0 || height <= 0)
+		{
+			decision.reason = "fixed crop bounds are invalid";
+			return decision;
+		}
+		decision.contentAspect = static_cast<double>(width) / height;
+		if (!std::isfinite(input.fixedAspect) || input.fixedAspect < 1.0 ||
+			input.fixedAspect > 4.0)
+		{
+			decision.reason = "fixed crop aspect is invalid";
+			return decision;
+		}
+		const double epsilon = 1e-6;
+		if (decision.contentAspect < input.fixedAspect - epsilon)
+		{
+			int croppedHeight = static_cast<int>(std::floor(width / input.fixedAspect));
+			croppedHeight &= ~1;
+			if (croppedHeight <= 0 || croppedHeight >= height)
+			{
+				decision.reason = "centered fixed crop would not remove source rows";
+				return decision;
+			}
+			const int topInset = ((height - croppedHeight) / 2) & ~1;
+			decision.sourceBounds.top += topInset;
+			decision.sourceBounds.bottom = decision.sourceBounds.top + croppedHeight;
+		}
+		else if (decision.contentAspect > input.fixedAspect + epsilon)
+		{
+			int croppedWidth = static_cast<int>(std::floor(height * input.fixedAspect));
+			croppedWidth &= ~1;
+			if (croppedWidth <= 0 || croppedWidth >= width)
+			{
+				decision.reason = "centered fixed crop would not remove source columns";
+				return decision;
+			}
+			const int leftInset = ((width - croppedWidth) / 2) & ~1;
+			decision.sourceBounds.left += leftInset;
+			decision.sourceBounds.right = decision.sourceBounds.left + croppedWidth;
+		}
+		else
+		{
+			decision.reason = "content already matches the fixed crop aspect";
+			return decision;
+		}
+		const int finalWidth = decision.sourceBounds.right - decision.sourceBounds.left;
+		const int finalHeight = decision.sourceBounds.bottom - decision.sourceBounds.top;
+		decision.sourceBounds.aspectRatio = static_cast<double>(finalWidth) / finalHeight;
+		decision.sourceBounds.trustedBarAxes = ActivePictureBounds::BarAxes::NONE;
+		decision.applied = true;
+		decision.reason = "current presentation center-cropped to the fixed aspect";
+		return decision;
+	}
+
 	const char* VerticalPictureAlignmentName(
 		VerticalPictureAlignment alignment)
 	{
@@ -1224,6 +1538,351 @@ namespace AlphaSourceCrop
 			ownerSourceGeneration == sourceGeneration;
 	}
 
+	NearBlackPresentationEpisodeDecision EvaluateNearBlackPresentationEpisode(
+		const NearBlackPresentationEpisodeInput& input)
+	{
+		NearBlackPresentationEpisodeDecision decision;
+		decision.state = input.previous;
+		bool presentationEpochChanged = false;
+		decision.revalidationSamplesRequired =
+			NearBlackCropRevalidationSamples(input.framesPerSecond);
+		decision.bootstrapSamplesRequired =
+			NearBlackBootstrapSamples(input.framesPerSecond);
+
+		if (decision.state.mode != NearBlackPresentationMode::INACTIVE &&
+			decision.state.sourceGeneration != input.sourceGeneration)
+		{
+			decision.state = {};
+			decision.ended = true;
+			decision.reason = "source generation ended near-black title episode";
+		}
+
+		if (decision.state.mode == NearBlackPresentationMode::FULL_RASTER &&
+			!decision.state.entryTrustedCropAvailable &&
+			decision.state.sourceGeneration == input.sourceGeneration &&
+			decision.state.presentationEpoch != input.presentationEpoch)
+		{
+			// A live profile/viewport boundary invalidates every certificate from
+			// the old presentation epoch, but it must not strand the episode there.
+			// Preserve the conservative presentation choice (and any confirmed
+			// outward-content latch), then restart only the partial proof on the
+			// current epoch. Fresh current-frame pixels are still required below.
+			decision.state.presentationEpoch = input.presentationEpoch;
+			decision.state.fullRasterStartedSourceSequence = input.sourceSequence;
+			ResetNearBlackCropRevalidation(decision.state);
+			ResetNearBlackBootstrap(decision.state);
+			decision.state.outwardConfirmationLastSourceSequence = 0;
+			decision.state.outwardConfirmationSamples = 0;
+			presentationEpochChanged = true;
+			decision.reason =
+				"presentation epoch changed; near-black proof restarted";
+		}
+
+		if (input.sceneBoundary &&
+			decision.state.mode != NearBlackPresentationMode::INACTIVE)
+		{
+			decision.state = {};
+			decision.ended = true;
+			decision.reason = "scene boundary ended near-black title episode";
+		}
+
+		if (input.fullRasterAuthorityAvailable &&
+			decision.state.mode != NearBlackPresentationMode::INACTIVE &&
+			input.nearBlackEvaluated && !input.globalNearBlack)
+		{
+			decision.state = {};
+			decision.ended = true;
+			decision.reason =
+				"non-near-black full-raster authority ended title episode";
+		}
+
+		if (input.measurementCurrent && input.nearBlackEvaluated &&
+			input.globalNearBlack &&
+			decision.state.mode == NearBlackPresentationMode::INACTIVE)
+		{
+			decision.state.mode = input.trustedCropAvailable &&
+				!input.boundedVisibleContentOutsideCrop
+				? NearBlackPresentationMode::RETAIN_CROP
+				: NearBlackPresentationMode::FULL_RASTER;
+			decision.state.sourceGeneration = input.sourceGeneration;
+			decision.state.startedSourceSequence = input.sourceSequence;
+			decision.state.presentationEpoch = input.presentationEpoch;
+			decision.state.entryTrustedCropAvailable =
+				decision.state.mode == NearBlackPresentationMode::RETAIN_CROP;
+			if (decision.state.entryTrustedCropAvailable)
+				decision.state.entryTrustedCrop = input.trustedCrop;
+			if (decision.state.mode == NearBlackPresentationMode::FULL_RASTER)
+				decision.state.fullRasterStartedSourceSequence =
+					input.sourceSequence;
+			decision.started = true;
+			decision.reason = decision.state.mode ==
+				NearBlackPresentationMode::RETAIN_CROP
+				? "near-black title episode retained current crop"
+				: "near-black title episode started at full raster";
+		}
+
+		if (decision.state.mode == NearBlackPresentationMode::RETAIN_CROP &&
+			input.measurementCurrent && input.boundedVisibleContentOutsideCrop)
+		{
+			decision.state.mode = NearBlackPresentationMode::FULL_RASTER;
+			decision.state.fullRasterStartedSourceSequence =
+				input.sourceSequence;
+			decision.changedToFullRaster = true;
+			decision.reason =
+				"bounded visible title content latched full raster for episode";
+		}
+		else if (decision.state.mode ==
+			NearBlackPresentationMode::RETAIN_CROP &&
+			!input.trustedCropAvailable)
+		{
+			decision.state.mode = NearBlackPresentationMode::FULL_RASTER;
+			decision.state.fullRasterStartedSourceSequence =
+				input.sourceSequence;
+			decision.changedToFullRaster = true;
+			decision.reason =
+				"lost retained title geometry latched full raster for episode";
+		}
+
+		if (decision.state.mode == NearBlackPresentationMode::FULL_RASTER &&
+			decision.state.entryTrustedCropAvailable &&
+			input.measurementCurrent && !input.cadenceRepeat &&
+			input.sourceSequence != 0 && input.nearBlackEvaluated)
+		{
+			const bool exactCurrentEntryRetention = input.retentionEvaluated &&
+				input.retentionSourceGeneration == input.sourceGeneration &&
+				input.retentionSourceSequence == input.sourceSequence &&
+				SameBounds(input.retentionBounds,
+					decision.state.entryTrustedCrop);
+			if (!input.globalNearBlack &&
+				input.boundedVisibleContentOutsideCrop &&
+				exactCurrentEntryRetention)
+			{
+				if (decision.state.outwardConfirmationLastSourceSequence != 0 &&
+					input.sourceSequence ==
+						decision.state.outwardConfirmationLastSourceSequence + 1)
+				{
+					++decision.state.outwardConfirmationSamples;
+				}
+				else
+				{
+					decision.state.outwardConfirmationSamples = 1;
+				}
+				decision.state.outwardConfirmationLastSourceSequence =
+					input.sourceSequence;
+				if (decision.state.outwardConfirmationSamples >=
+					decision.bootstrapSamplesRequired)
+				{
+					decision.state.confirmedNonNearBlackContent = true;
+					decision.reason =
+						"sustained non-near-black outward content kept full raster";
+				}
+			}
+			else
+			{
+				decision.state.outwardConfirmationLastSourceSequence = 0;
+				decision.state.outwardConfirmationSamples = 0;
+			}
+		}
+
+		if (decision.state.mode == NearBlackPresentationMode::FULL_RASTER &&
+			decision.state.entryTrustedCropAvailable && !input.cadenceRepeat &&
+			!decision.state.confirmedNonNearBlackContent &&
+			input.sourceSequence !=
+				decision.state.revalidationLastSourceSequence)
+		{
+			const bool exactEntryContract =
+				input.knownTrustedGeometryReacquired &&
+				input.reacquiredTrustedClassification ==
+					ActivePictureClassification::BAR_CROP_TRUSTED &&
+				input.reacquisitionIsCurrentAssociation &&
+				input.reacquiredSourceGeneration == input.sourceGeneration &&
+				input.reacquiredSourceSequence >=
+					decision.state.fullRasterStartedSourceSequence &&
+				input.reacquiredSourceSequence <= input.sourceSequence &&
+				input.reacquiredPresentationEpoch ==
+					decision.state.presentationEpoch &&
+				SameTrustedCropContract(input.reacquiredTrustedGeometry,
+					decision.state.entryTrustedCrop);
+			const bool exactCurrentObservation =
+				input.currentObservationAvailable &&
+				SameBounds(input.currentObservation,
+					decision.state.entryTrustedCrop);
+			const bool exactCurrentSafety = input.retentionEvaluated &&
+				input.retentionSafe &&
+				input.retentionSourceSequence == input.sourceSequence &&
+				SameBounds(input.retentionBounds,
+					decision.state.entryTrustedCrop);
+			const bool qualifies = input.measurementCurrent &&
+				input.nearBlackEvaluated && !input.globalNearBlack &&
+				!input.boundedVisibleContentOutsideCrop &&
+				!input.fullRasterAuthorityAvailable &&
+				input.presentationEpoch == decision.state.presentationEpoch &&
+				exactEntryContract && exactCurrentObservation &&
+				exactCurrentSafety;
+
+			if (qualifies)
+			{
+				if (decision.state.revalidationLastSourceSequence != 0 &&
+					input.sourceSequence ==
+						decision.state.revalidationLastSourceSequence + 1)
+				{
+					++decision.state.revalidationSamples;
+				}
+				else
+				{
+					decision.state.revalidationStartedSourceSequence =
+						input.sourceSequence;
+					decision.state.revalidationSamples = 1;
+				}
+				decision.state.revalidationLastSourceSequence =
+					input.sourceSequence;
+			}
+			else
+			{
+				ResetNearBlackCropRevalidation(decision.state);
+			}
+
+			if (decision.state.revalidationSamples >=
+				decision.revalidationSamplesRequired)
+			{
+				decision.revalidationSamples =
+					decision.state.revalidationSamples;
+				decision.state = {};
+				decision.releasedToTrustedCrop = true;
+				decision.ended = true;
+				decision.reason =
+					"exact entry crop revalidated after pixel-safe dwell";
+			}
+		}
+
+		if (decision.state.mode == NearBlackPresentationMode::FULL_RASTER &&
+			!decision.state.entryTrustedCropAvailable)
+		{
+			const bool bootstrapQualifies = input.measurementCurrent &&
+				input.nearBlackEvaluated && !input.globalNearBlack &&
+				!input.fullRasterAuthorityAvailable &&
+				input.nativeBootstrapContractAvailable &&
+				input.nativeBootstrapRetentionEvaluated &&
+				input.nativeBootstrapRetentionSafe &&
+				!input.nativeBootstrapOutwardVisible &&
+				input.nativeBootstrapSourceGeneration == input.sourceGeneration &&
+				input.nativeBootstrapSourceSequence == input.sourceSequence &&
+				input.nativeBootstrapPresentationEpoch ==
+					decision.state.presentationEpoch &&
+				input.presentationEpoch == decision.state.presentationEpoch &&
+				ChromaAlignedTrustedContract(
+					input.nativeBootstrapContract);
+			const bool sameCandidate = bootstrapQualifies &&
+				decision.state.bootstrapCandidateAvailable &&
+				SameTrustedCropContract(decision.state.bootstrapCandidate,
+					input.nativeBootstrapContract);
+			const bool timingContinuous = input.currentTick == 0 ||
+				decision.state.bootstrapLastQualifiedTick == 0 ||
+				(input.currentTick >=
+					decision.state.bootstrapLastQualifiedTick &&
+				 input.currentTick -
+					decision.state.bootstrapLastQualifiedTick <= 100);
+			auto seedCandidate = [&]()
+			{
+				decision.state.bootstrapCandidateAvailable = true;
+				decision.state.bootstrapCandidate = input.nativeBootstrapContract;
+				decision.state.bootstrapCandidateStartedTick = input.currentTick;
+				decision.state.bootstrapLastQualifiedTick = input.currentTick;
+				decision.state.bootstrapLastSourceSequence = input.sourceSequence;
+				decision.state.bootstrapSamples = 1;
+			};
+			if (!bootstrapQualifies)
+			{
+				ResetNearBlackBootstrap(decision.state);
+			}
+			else if (!decision.state.bootstrapCandidateAvailable)
+			{
+				// Cached cadence repeats cannot invent an acquisition candidate.
+				if (!input.cadenceRepeat)
+					seedCandidate();
+			}
+			else if (!sameCandidate || !timingContinuous)
+			{
+				ResetNearBlackBootstrap(decision.state);
+				if (!input.cadenceRepeat)
+					seedCandidate();
+			}
+			else if (input.cadenceRepeat)
+			{
+				if (input.sourceSequence ==
+					decision.state.bootstrapLastSourceSequence)
+				{
+					// Re-evaluate the identical decoded frame without counting it as
+					// a new independent sample.
+					decision.state.bootstrapLastQualifiedTick = input.currentTick;
+				}
+				else
+				{
+					ResetNearBlackBootstrap(decision.state);
+				}
+			}
+			else if (input.sourceSequence ==
+				decision.state.bootstrapLastSourceSequence + 1)
+			{
+				++decision.state.bootstrapSamples;
+				decision.state.bootstrapLastSourceSequence = input.sourceSequence;
+				decision.state.bootstrapLastQualifiedTick = input.currentTick;
+			}
+			else
+			{
+				ResetNearBlackBootstrap(decision.state);
+				seedCandidate();
+			}
+
+			const bool pausedDwellComplete = bootstrapQualifies &&
+				input.cadenceRepeat &&
+				decision.state.bootstrapCandidateAvailable &&
+				input.sourceSequence ==
+					decision.state.bootstrapLastSourceSequence &&
+				SameTrustedCropContract(decision.state.bootstrapCandidate,
+					input.nativeBootstrapContract) &&
+				decision.state.bootstrapCandidateStartedTick != 0 &&
+				input.currentTick >= decision.state.bootstrapCandidateStartedTick &&
+				input.currentTick - decision.state.bootstrapCandidateStartedTick >= 500;
+			if (decision.state.bootstrapSamples >=
+					decision.bootstrapSamplesRequired || pausedDwellComplete)
+			{
+				decision.bootstrapSamples = decision.state.bootstrapSamples;
+				decision.state = {};
+				decision.bootstrapReleased = true;
+				decision.resetTransitionEvidence = true;
+				decision.ended = true;
+				decision.reason =
+					"startup crop bootstrap verified; normal acquisition reopened";
+			}
+		}
+
+		if (!decision.releasedToTrustedCrop)
+			decision.revalidationSamples =
+				decision.state.revalidationSamples;
+		if (!decision.bootstrapReleased)
+			decision.bootstrapSamples = decision.state.bootstrapSamples;
+		decision.revalidationChanged = presentationEpochChanged ||
+			decision.releasedToTrustedCrop ||
+			decision.bootstrapReleased ||
+			decision.revalidationSamples !=
+				input.previous.revalidationSamples ||
+			decision.bootstrapSamples != input.previous.bootstrapSamples ||
+			decision.state.outwardConfirmationSamples !=
+				input.previous.outwardConfirmationSamples ||
+			decision.state.confirmedNonNearBlackContent !=
+				input.previous.confirmedNonNearBlackContent;
+
+		if (decision.reason.empty())
+		{
+			decision.reason = decision.state.mode ==
+				NearBlackPresentationMode::INACTIVE
+				? "near-black title episode inactive"
+				: "near-black title episode presentation retained";
+		}
+		return decision;
+	}
+
 	Decision Evaluate(const Input& input)
 	{
 		Decision decision;
@@ -1236,6 +1895,12 @@ namespace AlphaSourceCrop
 		if (!input.automaticCropEnabled)
 		{
 			decision.reason = "automatic crop is off; preserving full raster";
+			return decision;
+		}
+		if (input.nearBlackEpisodeFullRaster)
+		{
+			decision.reason =
+				"near-black title episode latched full-raster presentation";
 			return decision;
 		}
 		if (input.fullRasterPresentationAuthoritative)
@@ -1264,6 +1929,12 @@ namespace AlphaSourceCrop
 				: "shared geometry lacks crop authority";
 			return decision;
 		}
+		if (input.barCropRefinementHorizontalConflict)
+		{
+			decision.reason =
+				"horizontal expansion requires full-raster fail-open";
+			return decision;
+		}
 		const bool ambiguousObservation =
 			input.latestObservationIsProvisional ||
 			input.latestObservationIsUnavailable;
@@ -1284,10 +1955,23 @@ namespace AlphaSourceCrop
 			input.ambiguityHoldActive;
 		const bool pixelSafeAmbiguousRetention = ambiguousObservation &&
 			input.frameLocalPresentationRetentionSafe;
+		const bool nearBlackEpisodeRetention =
+			input.nearBlackEpisodeRetainCrop;
 		const bool boundedBarCropRefinementRetention =
 			input.barCropRefinementPending &&
+			!input.barCropRefinementHorizontalConflict &&
 			input.latestObservationClassification ==
 				ActivePictureClassification::BAR_CROP_TRUSTED;
+		const bool boundedVerticalInspectionRetention =
+			input.verticalInspectionPending &&
+			input.verticalInspectionSourceGeneration != 0 &&
+			input.verticalInspectionSourceGeneration ==
+				input.frameSourceGeneration &&
+			input.verticalInspectionSourceSequence != 0 &&
+			input.verticalInspectionSourceSequence ==
+				input.frameSourceSequence &&
+			input.latestObservationClassification !=
+				ActivePictureClassification::FULL_RASTER_TRUSTED;
 		const bool boundedOutwardExpansion =
 			input.outwardPresentationActive &&
 			input.outwardExpansionAvailable &&
@@ -1334,13 +2018,17 @@ namespace AlphaSourceCrop
 		if (!input.latestObservationSupportsCrop &&
 			!boundedSceneVerificationRetention &&
 			!boundedAmbiguousRetention && !pixelSafeAmbiguousRetention &&
+			!nearBlackEpisodeRetention &&
 			!boundedBarCropRefinementRetention &&
+			!boundedVerticalInspectionRetention &&
 			!boundedOutwardExpansion && !boundedVerticalTranslation &&
 			!boundedVerticalBaseRetention &&
 			!boundedVerticalEngageBaseRetention &&
 			!boundedVerticalConfirmationRetention &&
 			!boundedVerticalFitConfirmationRetention)
 		{
+			decision.withdrawalCause =
+				WithdrawalCause::LATEST_OBSERVATION_UNREAFFIRMED;
 			decision.reason =
 				"latest observation does not reaffirm crop authority";
 			return decision;
@@ -1448,29 +2136,85 @@ namespace AlphaSourceCrop
 
 		decision.sourceBounds = presentation;
 		decision.applyCrop = true;
-		decision.reason = decision.verticallyTranslated
-			? (decision.outwardExpanded
+		if (decision.verticallyTranslated)
+		{
+			decision.owner = DecisionOwner::VERTICAL_TRANSLATION;
+			decision.reason = decision.outwardExpanded
 				? "bounded outward fit and same-size vertical translation accepted"
-				: "same-size vertical presentation translation accepted")
-			: (boundedVerticalEngageBaseRetention
-				? "trusted crop retained at timed subtitle engage origin"
-				: (boundedVerticalBaseRetention
-				? "subtitle release settled at current trusted base"
-				: (boundedBarCropRefinementRetention
-					? "trusted crop retained while bar refinement confirms"
-				: (boundedVerticalFitConfirmationRetention
-					? "trusted crop retained while vertical fit confirms"
-				: (boundedVerticalConfirmationRetention
-					? "trusted crop retained while subtitle translation target confirms"
-				: (decision.outwardExpanded
-					? "bounded outward presentation expansion accepted"
-					: (input.latestObservationSupportsCrop
-			? "generation-current shared crop authority accepted"
-			: (pixelSafeAmbiguousRetention
-				? "frame-local pixel-safe presentation retained prior crop"
-				: (boundedSceneVerificationRetention
-					? "bounded scene verification retained current trusted crop"
-					: "bounded ambiguity hold retained current trusted crop")))))))));
+				: "same-size vertical presentation translation accepted";
+		}
+		else if (boundedVerticalEngageBaseRetention)
+		{
+			decision.owner = DecisionOwner::ENGAGE_BASE;
+			decision.reason =
+				"trusted crop retained at timed subtitle engage origin";
+		}
+		else if (boundedVerticalBaseRetention)
+		{
+			decision.owner = DecisionOwner::RELEASE_BASE;
+			decision.reason =
+				"subtitle release settled at current trusted base";
+		}
+		else if (nearBlackEpisodeRetention)
+		{
+			decision.owner = DecisionOwner::NEAR_BLACK_EPISODE;
+			decision.reason =
+				"trusted crop retained for near-black title episode";
+		}
+		else if (boundedBarCropRefinementRetention)
+		{
+			decision.owner = DecisionOwner::BAR_REFINEMENT;
+			decision.reason =
+				"trusted crop retained while bar refinement confirms";
+		}
+		else if (boundedVerticalFitConfirmationRetention)
+		{
+			decision.owner = DecisionOwner::FIT_CONFIRMATION;
+			decision.reason =
+				"trusted crop retained while vertical fit confirms";
+		}
+		else if (boundedVerticalConfirmationRetention)
+		{
+			decision.owner = DecisionOwner::TRANSLATION_CONFIRMATION;
+			decision.reason =
+				"trusted crop retained while subtitle translation target confirms";
+		}
+		else if (boundedVerticalInspectionRetention)
+		{
+			decision.owner = DecisionOwner::VERTICAL_INSPECTION;
+			decision.reason =
+				"trusted crop retained while vertical overlay inspection completes";
+		}
+		else if (decision.outwardExpanded)
+		{
+			decision.owner = DecisionOwner::OUTWARD_FIT;
+			decision.reason =
+				"bounded outward presentation expansion accepted";
+		}
+		else if (input.latestObservationSupportsCrop)
+		{
+			decision.owner = DecisionOwner::TRUSTED_CROP;
+			decision.reason =
+				"generation-current shared crop authority accepted";
+		}
+		else if (pixelSafeAmbiguousRetention)
+		{
+			decision.owner = DecisionOwner::PIXEL_SAFE_RETENTION;
+			decision.reason =
+				"frame-local pixel-safe presentation retained prior crop";
+		}
+		else if (boundedSceneVerificationRetention)
+		{
+			decision.owner = DecisionOwner::SCENE_HOLD;
+			decision.reason =
+				"bounded scene verification retained current trusted crop";
+		}
+		else
+		{
+			decision.owner = DecisionOwner::AMBIGUITY_HOLD;
+			decision.reason =
+				"bounded ambiguity hold retained current trusted crop";
+		}
 		return decision;
 	}
 

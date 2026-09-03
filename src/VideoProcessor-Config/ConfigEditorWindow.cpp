@@ -91,14 +91,27 @@ constexpr int kRendererNameRole = Qt::UserRole + 1;
 
 using DocumentSection = std::map<std::string, std::string>;
 using DocumentSnapshot = std::map<std::string, DocumentSection>;
+constexpr const char* kSnapshotSectionOrderKey = "\x1eprofile_section_order";
 
 DocumentSnapshot captureDocumentSnapshot(
     const ConfigEditorCore::ConfigDocument& document)
 {
     DocumentSnapshot snapshot;
-    for (const std::string& section : document.SectionNames())
+    const std::vector<std::string> orderedSections = document.SectionNames();
+    std::map<std::string, size_t> profileOrder;
+    for (const std::string& section : orderedSections)
     {
         snapshot[section];
+        const std::string profileGroup =
+            ConfigurationApplyPolicy::OrderedProfileGroup(section);
+        if (!profileGroup.empty())
+        {
+            // Section order is executable profile precedence. Keep it in the
+            // in-memory comparison only so an order-only Apply still tells VP
+            // to rebuild its ordered profile model.
+            snapshot[section][kSnapshotSectionOrderKey] =
+                std::to_string(profileOrder[profileGroup]++);
+        }
         for (const auto& setting : document.SectionSettings(section))
             snapshot[section][setting.first] = setting.second;
     }
@@ -549,7 +562,7 @@ bool isSharedInputSetting(const QString& key)
 bool isShaderStructuralKey(const QString& key)
 {
     static const QStringList keys = {
-        QStringLiteral("label"), QStringLiteral("shortcut"), QStringLiteral("when"),
+        QStringLiteral("label"), QStringLiteral("shortcut"), QStringLiteral("cycle_shortcut"), QStringLiteral("when"),
         QStringLiteral("type"),
         QStringLiteral("shader_type"), QStringLiteral("hlsl_file"),
         QStringLiteral("glsl_file"), QStringLiteral("stage"), QStringLiteral("order")
@@ -892,6 +905,7 @@ ConfigEditorWindow::ConfigEditorWindow(QString configPath, quintptr ownerHandle,
     loadConfiguration();
     migrateLldvSingleton();
     migrateSharedRefreshRate();
+	migrateRefreshRateSwitchMode();
     migrateSeparatedRendererProfiles();
     migrateViewportZoomProfiles();
     if (!testMode_) loadDiscoveryCache();
@@ -1078,7 +1092,12 @@ void ConfigEditorWindow::migrateViewportZoomProfiles()
         QStringLiteral("crop_narrower_content_aspect_limit"),
         QStringLiteral("crop_wider_content_to_fill_screen"),
         QStringLiteral("crop_wider_content_aspect_limit"),
+		QStringLiteral("fixed_crop_aspect"),
         QStringLiteral("subtitle_fit"),
+        QStringLiteral("hdr_peak_analysis_picture_only"),
+		QStringLiteral("hdr_peak_analysis_motion_compensation"),
+		QStringLiteral("hdr_peak_analysis_height_percent"),
+		QStringLiteral("hdr_peak_analysis_position"),
         QStringLiteral("subtitle_hold_seconds"),
         QStringLiteral("subtitle_engage_drift_ms"),
         QStringLiteral("subtitle_release_drift_ms"),
@@ -1125,7 +1144,7 @@ void ConfigEditorWindow::migrateViewportZoomProfiles()
         // owned Zoom fields. This preserves F2's matching Scope zoom profile
         // while letting Shift+2 affect Zoom alone.
         for (const QString& selector : { QStringLiteral("shortcut"),
-            QStringLiteral("when") })
+            QStringLiteral("cycle_shortcut"), QStringLiteral("when") })
         {
             const QString configured = value(legacySection, selector);
             if (!configured.isEmpty() && value(zoomSection, selector).isEmpty())
@@ -1223,7 +1242,7 @@ void ConfigEditorWindow::migrateSeparatedRendererProfiles()
             // a target family that actually received settings from this
             // profile; the old family is pruned below when it owns nothing.
             for (const QString& selector : { QStringLiteral("shortcut"),
-                QStringLiteral("when") })
+                QStringLiteral("cycle_shortcut"), QStringLiteral("when") })
             {
                 const QString configured = value(renderingSection, selector);
                 if (!configured.isEmpty() && value(targetSection, selector).isEmpty())
@@ -1373,6 +1392,28 @@ void ConfigEditorWindow::migrateSharedRefreshRate()
     }
     if (document_->SectionSettings(root.toStdString()).empty())
         document_->RemoveSection(root.toStdString());
+}
+
+void ConfigEditorWindow::migrateRefreshRateSwitchMode()
+{
+	if (!configurationLoaded_ || !document_) return;
+	const QString raw = value(QStringLiteral("general"),
+		QStringLiteral("switch_refresh_rate")).trimmed().toLower();
+	QString migrated = raw;
+	if (raw.isEmpty() || raw == QStringLiteral("true") || raw == QStringLiteral("yes") ||
+		raw == QStringLiteral("on") || raw == QStringLiteral("1"))
+		migrated = QStringLiteral("fullscreen_only");
+	else if (raw == QStringLiteral("false") || raw == QStringLiteral("no") ||
+		raw == QStringLiteral("off") || raw == QStringLiteral("0"))
+		migrated = QStringLiteral("never");
+	if (migrated != raw)
+	{
+		document_->AddSection("general");
+		document_->SetKnown("general", "switch_refresh_rate",
+			migrated.toLocal8Bit().constData());
+		dirty_ = true;
+		hasPendingMigrations_ = true;
+	}
 }
 
 void ConfigEditorWindow::refreshActiveProfileIndicators()
@@ -1701,8 +1742,8 @@ void ConfigEditorWindow::refreshRendererAutoStatus()
         }
         else if (binding.key == QStringLiteral("dithering"))
         {
-            text = qualityValue(QStringLiteral("Blue-noise dithering"),
-                QStringLiteral("Blue-noise dithering"), QStringLiteral("Off"));
+            text = qualityValue(QStringLiteral("Blue noise"),
+                QStringLiteral("Blue noise"), QStringLiteral("Off"));
         }
         else if (binding.key == QStringLiteral("display_bit_depth"))
             text = QStringLiteral("Output format");
@@ -3081,9 +3122,12 @@ QWidget* ConfigEditorWindow::createStartupPage()
     });
     applyRendererVisibilityFilter(hideLegacy);
     prepareRendererPopup();
-    sourceForm->addRow(QString(), bindCheckField(
-        QStringLiteral("Switch refresh rate"), QStringLiteral("general"),
-        QStringLiteral("switch_refresh_rate"), true));
+	sourceForm->addRow(QStringLiteral("Switch refresh rate"), bindChoiceField(
+		QStringLiteral("general"), QStringLiteral("switch_refresh_rate"),
+		{ QStringLiteral("never"), QStringLiteral("fullscreen_only"),
+		  QStringLiteral("always") },
+		{ QStringLiteral("Never"), QStringLiteral("Full Screen Only"),
+		  QStringLiteral("Always") }));
 	auto* profileChangeDisplay = new QSpinBox;
 	profileChangeDisplay->setObjectName(controlName(QStringLiteral("general"),
 		QStringLiteral("profile_change_display_seconds")));
@@ -3357,6 +3401,10 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
     shortcut->setObjectName(controlName(sectionPrefix, QStringLiteral("shortcut")));
     detailLayout->addWidget(fieldWithHelp(QStringLiteral("Shortcut key"), shortcut,
         QStringLiteral("Optional. Activates this profile in addition to its rule.")));
+    auto* cycleShortcut = new QLineEdit;
+    cycleShortcut->setObjectName(controlName(sectionPrefix, QStringLiteral("cycle_shortcut")));
+    detailLayout->addWidget(fieldWithHelp(QStringLiteral("Cycle shortcut key"), cycleShortcut,
+        QStringLiteral("Optional. Cycles through profiles that use the same key, in list order.")));
     auto* useRule = new QCheckBox(QStringLiteral("Use rule"));
     useRule->setObjectName(controlName(sectionPrefix, QStringLiteral("use_rule")));
     detailLayout->addWidget(useRule);
@@ -3441,6 +3489,17 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         form = addPlainForm();
     QCheckBox* anamorphicEnabled = nullptr;
     QLineEdit* anamorphicValue = nullptr;
+	QComboBox* hdrAnalysisMode = nullptr;
+	QCheckBox* pictureOnlyHdrAnalysis = nullptr;
+	QCheckBox* motionCompensatedHdrAnalysis = nullptr;
+	QLineEdit* hdrAnalysisHeight = nullptr;
+	QComboBox* hdrAnalysisPosition = nullptr;
+	QCheckBox* subtitleFit = nullptr;
+	QLineEdit* subtitleHold = nullptr;
+	QLineEdit* subtitleEngageDrift = nullptr;
+	QLineEdit* subtitleReleaseDrift = nullptr;
+	QLineEdit* subtitlePadding = nullptr;
+	QLineEdit* subtitleTargetBuffer = nullptr;
     const int fixedUnitFieldWidth = QLineEdit().sizeHint().width();
     const auto deprecatedViewportAlias = [sectionPrefix](const QString& key) -> QString
     {
@@ -3794,12 +3853,41 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         auto* debanding = addChoice(QStringLiteral("Debanding"), QStringLiteral("deband_strength"), { QStringLiteral("AUTO"), QStringLiteral("default"), QStringLiteral("light"), QStringLiteral("off") });
         addRendererAutoStatus(QStringLiteral("deband_strength"), debanding);
         auto* dithering = addChoice(QStringLiteral("Dithering"), QStringLiteral("dithering"),
-            { QStringLiteral("AUTO"), QStringLiteral("on"), QStringLiteral("off") });
+            { QStringLiteral("AUTO"), QStringLiteral("blue_noise"),
+                QStringLiteral("ordered_lut"), QStringLiteral("ordered_fixed"),
+                QStringLiteral("white_noise"), QStringLiteral("error_diffusion_simple"),
+                QStringLiteral("error_diffusion_false_fs"),
+                QStringLiteral("error_diffusion_sierra_lite"),
+                QStringLiteral("error_diffusion_floyd_steinberg"),
+                QStringLiteral("error_diffusion_atkinson"),
+                QStringLiteral("error_diffusion_jarvis_judice_ninke"),
+                QStringLiteral("error_diffusion_stucki"),
+                QStringLiteral("error_diffusion_burkes"),
+                QStringLiteral("error_diffusion_sierra2"),
+                QStringLiteral("error_diffusion_sierra3"), QStringLiteral("off") });
         dithering->setItemText(1, QStringLiteral("Auto"));
-        dithering->setItemText(2, QStringLiteral("On"));
-        dithering->setItemText(3, QStringLiteral("Off"));
+        dithering->setItemText(2, QStringLiteral("Blue noise"));
+        dithering->setItemText(3, QStringLiteral("Ordered (LUT)"));
+        dithering->setItemText(4, QStringLiteral("Ordered (fixed)"));
+        dithering->setItemText(5, QStringLiteral("White noise"));
+        dithering->setItemText(6, QStringLiteral("Error diffusion: Simple"));
+        dithering->setItemText(7, QStringLiteral("Error diffusion: False Floyd-Steinberg"));
+        dithering->setItemText(8, QStringLiteral("Error diffusion: Sierra Lite"));
+        dithering->setItemText(9, QStringLiteral("Error diffusion: Floyd-Steinberg"));
+        dithering->setItemText(10, QStringLiteral("Error diffusion: Atkinson"));
+        dithering->setItemText(11, QStringLiteral("Error diffusion: Jarvis-Judice-Ninke"));
+        dithering->setItemText(12, QStringLiteral("Error diffusion: Stucki"));
+        dithering->setItemText(13, QStringLiteral("Error diffusion: Burkes"));
+        dithering->setItemText(14, QStringLiteral("Error diffusion: Sierra 2"));
+        dithering->setItemText(15, QStringLiteral("Error diffusion: Sierra 3"));
+        dithering->setItemText(16, QStringLiteral("Off"));
         dithering->setToolTip(QStringLiteral(
-            "Auto uses the rendering-quality preset. On uses libplacebo's default dithering. Off disables dithering."));
+            "Auto follows the rendering-quality preset: Blue noise for Balanced "
+            "and High, or Off for Fast. Blue noise is libplacebo's default and "
+            "recommended mode. Ordered modes and White noise are alternate "
+            "libplacebo methods. Error-diffusion modes require compute shaders "
+            "and are substantially more expensive; they are unavailable while an "
+            "external 3D display LUT is active. Off disables dithering."));
         addRendererAutoStatus(QStringLiteral("dithering"), dithering);
         auto* displayBitDepth = addChoice(QStringLiteral("Display bit depth"),
             QStringLiteral("display_bit_depth"),
@@ -4252,21 +4340,111 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
 		connect(cropWider, &QCheckBox::toggled, this,
 			[cropWiderLimit](bool enabled)
 			{ cropWiderLimit->setEnabled(enabled); });
+		auto* fixedCropAspect = addText(QStringLiteral("Fixed crop aspect"),
+			QStringLiteral("fixed_crop_aspect"));
+		fixedCropAspect->setPlaceholderText(QStringLiteral("Off; e.g. 2.00:1"));
+		fixedCropAspect->setToolTip(QStringLiteral(
+			"Center-crop trusted content to this exact aspect before fitting it to the physical screen. "
+			"This overrides the fill-screen crop choices for this Zoom profile."));
 
         form = addCollapsibleSection(QStringLiteral("subtitles"),
             QStringLiteral("Subtitles"), QStringLiteral(
-                "Keep subtitle content visible and control how VP moves it into the screen."), false);
-        addBoolean(QStringLiteral("Keep subtitles inside screen bounds"), QStringLiteral("subtitle_fit"));
-        auto* subtitleHold = addText(QStringLiteral("Subtitle hold"),
+                "Keep subtitle content visible, control how VP moves it into the screen, "
+                "and keep edge overlays out of HDR peak analysis."), false);
+		subtitleFit = addBoolean(
+			QStringLiteral("Keep subtitles inside screen bounds"),
+			QStringLiteral("subtitle_fit"));
+		pictureOnlyHdrAnalysis = addBoolean(
+            QStringLiteral("Limit HDR analysis to picture center"),
+            QStringLiteral("hdr_peak_analysis_picture_only"));
+        pictureOnlyHdrAnalysis->setToolTip(QStringLiteral(
+            "When a current trusted active-picture rectangle is available, "
+			"use its configured central height and full available width for "
+			"libplacebo's HDR peak and average-luminance analysis. This inset "
+			"rejects subtitles and OSDs that cross from a black bar into the "
+			"picture. Full-raster, invalid, or stale geometry falls back to "
+			"full-frame analysis."));
+		motionCompensatedHdrAnalysis = addBoolean(
+			QStringLiteral("Protect HDR analysis during subtitle movement"),
+			QStringLiteral("hdr_peak_analysis_motion_compensation"));
+		motionCompensatedHdrAnalysis->setToolTip(QStringLiteral(
+			"Experimental. When fixed center analysis is off, use VP's pending or "
+			"active subtitle-picture movement to exclude the affected active-picture "
+			"edge from HDR analysis. This uses existing geometry and does not use OCR."));
+		// Keep the established Boolean keys as the persistence contract, but
+		// present their mutually exclusive semantics as one mode. This also
+		// preserves configurations written by earlier VP-0147 test builds.
+		pictureOnlyHdrAnalysis->hide();
+		motionCompensatedHdrAnalysis->hide();
+		if (QWidget* label = form->labelForField(pictureOnlyHdrAnalysis))
+			label->hide();
+		if (QWidget* label = form->labelForField(motionCompensatedHdrAnalysis))
+			label->hide();
+		hdrAnalysisMode = new QComboBox;
+		hdrAnalysisMode->setObjectName(controlName(sectionPrefix,
+			QStringLiteral("hdr_peak_analysis_mode")));
+		hdrAnalysisMode->setAccessibleName(
+			QStringLiteral("HDR analysis protection"));
+		hdrAnalysisMode->setSizePolicy(
+			QSizePolicy::Expanding, QSizePolicy::Fixed);
+		hdrAnalysisMode->addItem(QStringLiteral("Off"), QStringLiteral("off"));
+		hdrAnalysisMode->addItem(QStringLiteral("Smart (Experimental)"),
+			QStringLiteral("automatic"));
+		hdrAnalysisMode->addItem(QStringLiteral("Percentage (Beta)"),
+			QStringLiteral("fixed"));
+		hdrAnalysisMode->setToolTip(QStringLiteral(
+			"Off uses normal full-presentation HDR analysis. Smart protects only the "
+			"active-picture edge affected by VP's subtitle-picture movement. Percentage "
+			"uses the configured top, center, or bottom band. On bar-cropped content it "
+			"uses the visible active picture; on full-raster content it uses the final "
+			"presentation crop."));
+		form->addRow(QStringLiteral("HDR analysis protection"), hdrAnalysisMode);
+		hdrAnalysisHeight = addText(
+			QStringLiteral("HDR analysis height"),
+			QStringLiteral("hdr_peak_analysis_height_percent"),
+			QStringLiteral("%"));
+		hdrAnalysisHeight->setValidator(new QIntValidator(10, 100, hdrAnalysisHeight));
+		hdrAnalysisHeight->setToolTip(QStringLiteral(
+			"Percentage of visible picture height analyzed by libplacebo. Smaller values "
+			"exclude more subtitle and OSD area."));
+		hdrAnalysisHeight->setEnabled(false);
+		hdrAnalysisPosition = addChoice(QStringLiteral("HDR analysis position"),
+			QStringLiteral("hdr_peak_analysis_position"),
+			{ QStringLiteral("top"), QStringLiteral("center"),
+				QStringLiteral("bottom") }, false);
+		hdrAnalysisPosition->setToolTip(QStringLiteral(
+			"Anchors the percentage band within the visible picture. Top is the default "
+			"because subtitles are usually at the bottom."));
+		hdrAnalysisPosition->setProperty("requiresHdrFixedMode", true);
+		hdrAnalysisPosition->setEnabled(false);
+		connect(hdrAnalysisMode,
+			qOverload<int>(&QComboBox::currentIndexChanged), this,
+			[state, hdrAnalysisMode, pictureOnlyHdrAnalysis,
+			 motionCompensatedHdrAnalysis, hdrAnalysisHeight, hdrAnalysisPosition](int index)
+			{
+				if (index < 0) return;
+				const QString mode = hdrAnalysisMode->itemData(index).toString();
+				const bool fixed = mode == QStringLiteral("fixed");
+				const bool automatic = mode == QStringLiteral("automatic");
+				hdrAnalysisHeight->setEnabled(fixed);
+				hdrAnalysisPosition->setEnabled(fixed);
+				if (state->loading) return;
+				pictureOnlyHdrAnalysis->setChecked(fixed);
+				motionCompensatedHdrAnalysis->setChecked(automatic);
+			});
+		subtitleHold = addText(QStringLiteral("Subtitle hold"),
             QStringLiteral("subtitle_hold_seconds"), QStringLiteral("ms"), 1000.0);
         subtitleHold->setValidator(new QIntValidator(250, 30000, subtitleHold));
         subtitleHold->setToolTip(QStringLiteral(
             "Must be between 250 and 30000 ms. The minimum spans the "
             "renderer's scheduled subtitle-analysis cadence."));
-        addText(QStringLiteral("Subtitle engage drift"), QStringLiteral("subtitle_engage_drift_ms"), QStringLiteral("ms"));
-        addText(QStringLiteral("Subtitle release drift"), QStringLiteral("subtitle_release_drift_ms"), QStringLiteral("ms"));
-        addText(QStringLiteral("Subtitle padding"), QStringLiteral("subtitle_padding_pixels"), QStringLiteral("pixels"));
-        auto* subtitleTargetBuffer = addText(
+		subtitleEngageDrift = addText(QStringLiteral("Subtitle engage drift"),
+			QStringLiteral("subtitle_engage_drift_ms"), QStringLiteral("ms"));
+		subtitleReleaseDrift = addText(QStringLiteral("Subtitle release drift"),
+			QStringLiteral("subtitle_release_drift_ms"), QStringLiteral("ms"));
+		subtitlePadding = addText(QStringLiteral("Subtitle padding"),
+			QStringLiteral("subtitle_padding_pixels"), QStringLiteral("pixels"));
+		subtitleTargetBuffer = addText(
             QStringLiteral("Subtitle target buffer"),
             QStringLiteral("subtitle_target_buffer_pixels"),
             QStringLiteral("pixels"));
@@ -4274,6 +4452,19 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
             "Must be between 0 and 50 pixels. Adds outward reserve to an "
             "accepted subtitle target so small later extent changes do not "
             "start another movement."));
+		const auto updateSubtitleFitControls = [subtitleHold,
+			subtitleEngageDrift, subtitleReleaseDrift, subtitlePadding,
+			subtitleTargetBuffer](bool enabled)
+		{
+			subtitleHold->setEnabled(enabled);
+			subtitleEngageDrift->setEnabled(enabled);
+			subtitleReleaseDrift->setEnabled(enabled);
+			subtitlePadding->setEnabled(enabled);
+			subtitleTargetBuffer->setEnabled(enabled);
+		};
+		updateSubtitleFitControls(subtitleFit->isChecked());
+		connect(subtitleFit, &QCheckBox::toggled, this,
+			updateSubtitleFitControls);
 		}
     }
     else
@@ -4339,8 +4530,10 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         updateQueuePolicyPresentation();
     };
 
-    auto loadDetails = [this, state, fields, selectedTitle, name, shortcut, rule, ruleField, useRule, remove, up, down, list,
-        profileFields, sectionPrefix, anamorphicEnabled, anamorphicValue,
+    auto loadDetails = [this, state, fields, selectedTitle, name, shortcut, cycleShortcut, rule, ruleField, useRule, remove, up, down, list,
+		profileFields, sectionPrefix, anamorphicEnabled, anamorphicValue,
+		hdrAnalysisMode, pictureOnlyHdrAnalysis,
+		motionCompensatedHdrAnalysis, hdrAnalysisHeight, hdrAnalysisPosition,
         deprecatedViewportAlias, queuePolicy, updateQueuePolicyFromValues](QListWidgetItem* current)
     {
         state->loading = true;
@@ -4348,6 +4541,7 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         const bool available = !state->section.isEmpty();
         name->setEnabled(available);
         shortcut->setEnabled(available);
+        cycleShortcut->setEnabled(available);
         useRule->setEnabled(available);
         rule->setEnabled(available && useRule->isChecked());
         profileFields->setEnabled(available);
@@ -4359,6 +4553,7 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
             selectedTitle->setText(QStringLiteral("Add a profile to configure it"));
             name->clear();
             shortcut->clear();
+            cycleShortcut->clear();
             useRule->setChecked(false);
             ruleField->setVisible(false);
             state->loading = false;
@@ -4372,6 +4567,8 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         name->setText(display);
         shortcut->setText(canonicalShortcutText(
             value(section, QStringLiteral("shortcut"))));
+        cycleShortcut->setText(canonicalShortcutText(
+            value(section, QStringLiteral("cycle_shortcut"))));
         const QString expression = value(section, QStringLiteral("when"));
         rule->setPlainText(expression);
         useRule->setChecked(!expression.isEmpty());
@@ -4397,6 +4594,8 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
             if (sectionPrefix == QStringLiteral("vprenderer.zoom"))
             {
                 if (key == QStringLiteral("subtitle_hold_seconds")) return QStringLiteral("2");
+				if (key == QStringLiteral("hdr_peak_analysis_height_percent")) return QStringLiteral("75");
+				if (key == QStringLiteral("hdr_peak_analysis_position")) return QStringLiteral("top");
                 if (key == QStringLiteral("subtitle_engage_drift_ms")) return QStringLiteral("0");
                 if (key == QStringLiteral("subtitle_release_drift_ms")) return QStringLiteral("0");
                 if (key == QStringLiteral("subtitle_padding_pixels")) return QStringLiteral("20");
@@ -4492,7 +4691,8 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
 			const bool viewportAspectLimit =
 				sectionPrefix == QStringLiteral("vprenderer.zoom") &&
 				(field.key == QStringLiteral("crop_narrower_content_aspect_limit") ||
-				 field.key == QStringLiteral("crop_wider_content_aspect_limit"));
+				 field.key == QStringLiteral("crop_wider_content_aspect_limit") ||
+				 field.key == QStringLiteral("fixed_crop_aspect"));
 			if (viewportAspectLimit && !raw.isEmpty())
 			{
 				AspectRatio ignored;
@@ -4519,6 +4719,13 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
             if (defaultOnlyField && !defaultProfile && list->count() > 0)
                 configured = value(list->item(0)->data(Qt::UserRole).toString(), field.key, fallback(field.key));
             field.widget->setEnabled(!defaultOnlyField || defaultProfile);
+			if (field.widget->property("requiresHdrFixedMode").toBool())
+			{
+				auto* mode = findChild<QComboBox*>(controlName(sectionPrefix,
+					QStringLiteral("hdr_peak_analysis_mode")));
+				field.widget->setEnabled(mode &&
+					mode->currentData().toString() == QStringLiteral("fixed"));
+			}
 			field.widget->setProperty("inherited", raw.isEmpty() && !defaultProfile);
 			field.widget->setToolTip(raw.isEmpty() ?
                 (defaultProfile ?
@@ -4620,6 +4827,19 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
             anamorphicValue->setEnabled(!configured.isEmpty());
             if (configured.isEmpty()) anamorphicValue->setText(QStringLiteral("1:1"));
         }
+		if (hdrAnalysisMode && pictureOnlyHdrAnalysis &&
+			motionCompensatedHdrAnalysis && hdrAnalysisHeight &&
+			hdrAnalysisPosition)
+		{
+			const QString mode = pictureOnlyHdrAnalysis->isChecked()
+				? QStringLiteral("fixed")
+				: (motionCompensatedHdrAnalysis->isChecked()
+					? QStringLiteral("automatic") : QStringLiteral("off"));
+			const QSignalBlocker blocker(hdrAnalysisMode);
+			hdrAnalysisMode->setCurrentIndex(hdrAnalysisMode->findData(mode));
+			hdrAnalysisHeight->setEnabled(mode == QStringLiteral("fixed"));
+			hdrAnalysisPosition->setEnabled(mode == QStringLiteral("fixed"));
+		}
         if (queuePolicy)
             updateQueuePolicyFromValues();
         state->loading = false;
@@ -4734,6 +4954,29 @@ QWidget* ConfigEditorWindow::createProfilePage(const QString& title, const QStri
         if (normalized == shortcut->text()) return;
         shortcut->setText(normalized);
         document_->SetKnown(state->section.toStdString(), "shortcut", canonical);
+        markDirty();
+    });
+    connect(cycleShortcut, &QLineEdit::textChanged, this, [this, state](const QString& text)
+    {
+        if (state->loading || state->section.isEmpty()) return;
+        if (text.trimmed().isEmpty()) document_->RemoveKnown(state->section.toStdString(), "cycle_shortcut");
+        else document_->SetKnown(state->section.toStdString(), "cycle_shortcut", text.toLocal8Bit().constData());
+        markDirty();
+    });
+    connect(cycleShortcut, &QLineEdit::editingFinished, this, [this, state, cycleShortcut]
+    {
+        if (state->loading || state->section.isEmpty() || cycleShortcut->text().trimmed().isEmpty()) return;
+        std::string canonical;
+        if (!RendererProfileConfig::CanonicalizeKeyChord(cycleShortcut->text().toStdString(), canonical))
+        {
+            QMessageBox::warning(this, QStringLiteral("Cycle shortcut key"),
+                QStringLiteral("Use one key with optional Ctrl, Alt, or Shift modifiers (for example Ctrl+F2)."));
+            return;
+        }
+        const QString normalized = QString::fromStdString(canonical);
+        if (normalized == cycleShortcut->text()) return;
+        cycleShortcut->setText(normalized);
+        document_->SetKnown(state->section.toStdString(), "cycle_shortcut", canonical);
         markDirty();
     });
     connect(useRule, &QCheckBox::toggled, this, [this, state, rule, ruleField](bool enabled)
@@ -5306,6 +5549,11 @@ QWidget* ConfigEditorWindow::createNlsShadersPage()
     shortcut->setMaximumWidth(280);
     detailsLayout->addWidget(fieldWithHelp(QStringLiteral("Shortcut key"), shortcut,
         QStringLiteral("Optional. Selects this NLS mode; Off disables NLS.")));
+    auto* cycleShortcut = new QLineEdit;
+    cycleShortcut->setObjectName(QStringLiteral("config.shader.nls.cycle_shortcut"));
+    cycleShortcut->setMaximumWidth(280);
+    detailsLayout->addWidget(fieldWithHelp(QStringLiteral("Cycle shortcut key"), cycleShortcut,
+        QStringLiteral("Optional. Cycles through NLS modes that use the same key, in list order.")));
     auto* useRule = new QCheckBox(QStringLiteral("Select automatically with a rule"));
     useRule->setObjectName(QStringLiteral("config.shader.nls.use_rule"));
     detailsLayout->addWidget(useRule);
@@ -5398,6 +5646,21 @@ QWidget* ConfigEditorWindow::createNlsShadersPage()
         const QString normalized = QString::fromStdString(canonical);
         if (normalized != shortcut->text()) shortcut->setText(normalized);
     });
+    connect(cycleShortcut, &QLineEdit::textChanged, this,
+        [setText](const QString& text) { setText("cycle_shortcut", text); });
+    connect(cycleShortcut, &QLineEdit::editingFinished, this, [this, state, cycleShortcut]
+    {
+        if (state->loading || state->section.isEmpty() || cycleShortcut->text().trimmed().isEmpty()) return;
+        std::string canonical;
+        if (!RendererProfileConfig::CanonicalizeKeyChord(cycleShortcut->text().toStdString(), canonical))
+        {
+            QMessageBox::warning(this, QStringLiteral("Cycle shortcut key"),
+                QStringLiteral("Use one key with optional Ctrl, Alt, or Shift modifiers."));
+            return;
+        }
+        const QString normalized = QString::fromStdString(canonical);
+        if (normalized != cycleShortcut->text()) cycleShortcut->setText(normalized);
+    });
     auto setChoice = [this, state](const char* key, QComboBox* combo)
     {
         if (state->loading || state->section.isEmpty() || !document_) return;
@@ -5431,7 +5694,7 @@ QWidget* ConfigEditorWindow::createNlsShadersPage()
         markDirty();
     });
 
-    auto load = [this, state, root, title, shortcut, useRule, rule, ruleField,
+    auto load = [this, state, root, title, shortcut, cycleShortcut, useRule, rule, ruleField,
         normalFields, parameterEditor, advanced, offExplanation, label,
         stage, hlsl, glsl]
         (QListWidgetItem* item)
@@ -5442,6 +5705,7 @@ QWidget* ConfigEditorWindow::createNlsShadersPage()
         const bool member = available && state->section.compare(root, Qt::CaseInsensitive) != 0;
         title->setText(item ? item->text() : QStringLiteral("No NLS modes are configured"));
         shortcut->setEnabled(available);
+        cycleShortcut->setEnabled(available);
         useRule->setEnabled(available);
         normalFields->setVisible(member);
         advanced->setVisible(member);
@@ -5449,6 +5713,7 @@ QWidget* ConfigEditorWindow::createNlsShadersPage()
         if (!available)
         {
             shortcut->clear();
+            cycleShortcut->clear();
             useRule->setChecked(false);
             ruleField->setVisible(false);
             parameterEditor.reload();
@@ -5458,6 +5723,8 @@ QWidget* ConfigEditorWindow::createNlsShadersPage()
         }
         shortcut->setText(canonicalShortcutText(
             value(state->section, QStringLiteral("shortcut"))));
+        cycleShortcut->setText(canonicalShortcutText(
+            value(state->section, QStringLiteral("cycle_shortcut"))));
         const QString expression = value(state->section, QStringLiteral("when"));
         useRule->setChecked(!expression.isEmpty());
         rule->setPlainText(expression);

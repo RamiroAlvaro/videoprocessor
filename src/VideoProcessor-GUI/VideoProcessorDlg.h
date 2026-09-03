@@ -27,6 +27,7 @@
 #include <ShortcutRepeatGuard.h>
 #include <CCie1931Control.h>
 #include <IRenderer.h>
+#include <RendererPostStallResetAdvisor.h>
 #include <RendererResetCoordinator.h>
 #include <RendererResetPolicy.h>
 #include <RendererRetirementService.h>
@@ -319,6 +320,11 @@ protected:
 	// Optional LLDV heuristic.  DeckLink does not expose the HDMI VSIF, so
 	// BT.2020 + SDR + no static HDR metadata is only a best-effort signal.
 	bool m_useNewLldvHeuristic = false;
+	// Tester-facing LLDV diagnostics are emitted only when the decision or
+	// effective result changes, rather than for every state rebuild.
+	std::string m_lastLldvDecisionDiagnostic;
+	std::string m_lastLldvEffectiveDiagnostic;
+	bool m_lldvDiagnosticWasApplied = false;
 	// Negative means "use the profile/default fallback". Explicit command-line
 	// overrides intentionally win over a selected LLDV profile on both the
 	// legacy and new detection paths.
@@ -595,6 +601,11 @@ protected:
 	bool m_dropDiagnosticInitialized = false;
 	uint64_t m_lastLoggedCaptureMissed = 0;
 	uint64_t m_lastLoggedRendererDropped = 0;
+	// This advisory-only classifier has no reset callback. It makes opaque
+	// madVR queue limits explicit in the diagnostic record.
+	PostStallResetAdvisor m_madVRPostStallResetAdvisor;
+	uint64_t m_madVRLastObservedDeliveryEpoch = 0;
+	uint64_t m_madVRLastMaximumSuccessfulDeliveryUs = 0;
 	ULONGLONG m_lastLivenessRecoveryTick = 0;
 	bool m_queuePressureRecoveryRequested = false;
 	bool m_queueCapacityRecoveryRequested = false;
@@ -636,6 +647,14 @@ protected:
 	// preserve refresh cleanup while logging host/backend skips explicitly.
 	bool m_alphaHostTransitionPending = false;
 	bool m_alphaBackendHandoffPending = false;
+	// These are deterministic reset boundaries, not post-stall hypotheses.
+	// They are consumed only after the replacement/retarget is rendering so the
+	// configured queue-reset delay is measured against a usable renderer.
+	bool m_fullscreenEntryTransitionPending = false;
+	bool m_rendererSwitchTransitionPending = false;
+	// A renderer-family swap clears manual profile overrides only after the
+	// exact successor generation reaches the accepted running boundary.
+	uint32_t m_rendererSwitchProfileReapplyGeneration = 0;
 	double m_alphaRefreshTransitionPreviousRateHz = 0.0;
 	double m_alphaRefreshTransitionCurrentRateHz = 0.0;
 	// Initial DirectShow starts and backend handoffs need the proven madVR
@@ -798,6 +817,12 @@ protected:
 	UnifiedProfileRuntime::Runtime m_profileRuntime;
 	HANDLE m_unifiedActionCancelEvent = nullptr;
 	EventActionLauncher::PendingActionCoalescer m_unifiedActionCoalescer;
+	std::mutex m_profileActionLaunchMutex;
+	std::atomic<uint64_t> m_profileActionDebounceGeneration = 0;
+	// Profile actions are serialized. This flag lets us ignore profile changes
+	// caused by a running action's own keyboard injection, while still allowing
+	// an explicit cycle request to replace the pending final selection.
+	std::atomic<bool> m_profileActionProcessActive = false;
 	std::vector<std::thread> m_unifiedActionWorkers;
 	std::map<WORD, CString> m_unifiedProfileShortcutKeys;
 	WORD m_lastUnifiedProfileCommand = 0;
@@ -953,6 +978,8 @@ protected:
 	void RebuildRendererCombo();
 	void ClearRendererCombo();
 	void UpdateStatsOverlay();
+	void LogMadVRPostStallResetDiagnostics(const StatsData& stats,
+		double measuredCaptureRateHz);
 	void LogDroppedCounterChanges(const StatsData& stats);
 	void ApplyStatsOverlayForActiveRenderer();
 	void LoadDisplayRefreshRateOverrides();

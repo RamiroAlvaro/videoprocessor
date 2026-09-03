@@ -1371,6 +1371,63 @@ void testLldvMetadataMigratesToEnabledSingleton()
         "Explicit LLDV metadata remained silently disabled by FOLLOW_INPUT");
 }
 
+void testOptionalSectionsAreCreatedWhenEdited()
+{
+    QTemporaryDir directory;
+    require(directory.isValid(), "Cannot create optional-section test directory");
+    const QString path = copyFixture(directory);
+    QByteArray config = readBytes(path);
+    const auto removeSection = [&config](const QByteArray& section)
+    {
+        const int start = config.indexOf(section);
+        require(start >= 0, "Optional-section fixture is missing a section");
+        const int next = config.indexOf("\n[", start + section.size());
+        config.remove(start, next < 0 ? config.size() - start : next - start + 1);
+    };
+    removeSection("[lldv]\n");
+    removeSection("[logging]\n");
+    removeSection("[shortcuts]\n");
+    QFile file(path);
+    require(file.open(QIODevice::WriteOnly | QIODevice::Truncate),
+        "Cannot write optional-section fixture");
+    require(file.write(config) == config.size(),
+        "Cannot replace optional-section fixture");
+    file.close();
+
+    ConfigEditorWindow window(path, 0, true);
+    requireControl<QLineEdit>(window, QStringLiteral("config.lldv.max_cll"))
+        ->setText(QStringLiteral("1200"));
+    requireControl<QLineEdit>(window, QStringLiteral("config.lldv.max_fall"))
+        ->setText(QStringLiteral("400"));
+    requireControl<QLineEdit>(window,
+        QStringLiteral("config.lldv.mastering_min_luminance"))
+        ->setText(QStringLiteral("0.002"));
+    requireControl<QLineEdit>(window,
+        QStringLiteral("config.lldv.mastering_max_luminance"))
+        ->setText(QStringLiteral("3500"));
+    requireControl<QCheckBox>(window, QStringLiteral("config.logging.debug"))
+        ->setChecked(true);
+    requireControl<QLineEdit>(window,
+        QStringLiteral("config.shortcuts.fullscreen_toggle"))
+        ->setText(QStringLiteral("Ctrl+Alt+F"));
+    save(window);
+
+    const QByteArray saved = readBytes(path);
+    const int lldvStart = saved.indexOf("[lldv]\n");
+    const int lldvEnd = saved.indexOf("\n[", lldvStart + 1);
+    const QByteArray lldv = saved.mid(lldvStart,
+        lldvEnd < 0 ? -1 : lldvEnd - lldvStart);
+    require(lldvStart >= 0 && lldv.contains("max_cll: 1200") &&
+        lldv.contains("max_fall: 400") &&
+        lldv.contains("mastering_min_luminance: 0.002") &&
+        lldv.contains("mastering_max_luminance: 3500"),
+        "Editing LLDV metadata did not create and populate the [lldv] section");
+    require(saved.contains("[logging]\ndebug: true"),
+        "Editing a logging control did not create the [logging] section");
+    require(saved.contains("[shortcuts]\nfullscreen_toggle: Ctrl+Alt+F"),
+        "Editing a shortcut did not create the [shortcuts] section");
+}
+
 void answerInputDialog(const QString& text)
 {
     auto* timer = new QTimer(qApp);
@@ -1735,11 +1792,18 @@ void testRendererProfileSectionsCollapseAndPersist()
 		downscaler->findData(QStringLiteral("none")) < 0 &&
 		downscaler->findData(QStringLiteral("ewa_lanczos")) < 0,
 		"Downscaler choices include a removed or pathologically expensive mode");
-    require(pages->widget(0)->findChild<QCheckBox*>(
-        QStringLiteral("config.general.switch_refresh_rate")) != nullptr &&
-        pages->widget(2)->findChild<QCheckBox*>(
+    QComboBox* refreshRateSwitch = pages->widget(0)->findChild<QComboBox*>(
+        QStringLiteral("config.general.switch_refresh_rate"));
+    require(refreshRateSwitch != nullptr &&
+        refreshRateSwitch->itemData(0).toString() == QStringLiteral("never") &&
+        refreshRateSwitch->itemText(0) == QStringLiteral("Never") &&
+        refreshRateSwitch->itemData(1).toString() == QStringLiteral("fullscreen_only") &&
+        refreshRateSwitch->itemText(1) == QStringLiteral("Full Screen Only") &&
+        refreshRateSwitch->itemData(2).toString() == QStringLiteral("always") &&
+        refreshRateSwitch->itemText(2) == QStringLiteral("Always") &&
+        pages->widget(2)->findChild<QComboBox*>(
         QStringLiteral("config.general.switch_refresh_rate")) == nullptr,
-        "Switch refresh rate was not moved from Renderer Basic to General Display");
+        "Switch refresh rate selector was not moved from Renderer Basic to General Display");
     QComboBox* debanding = requireControl<QComboBox>(window,
         QStringLiteral("config.vprenderer.deband_strength"));
     require(debanding->findData(QStringLiteral("AUTO")) >= 0 &&
@@ -1767,11 +1831,26 @@ void testRendererProfileSectionsCollapseAndPersist()
         QStringLiteral("config.vprenderer.dithering"));
     require(dithering->itemText(dithering->findData(QStringLiteral("AUTO"))) ==
         QStringLiteral("Auto") &&
-        dithering->itemText(dithering->findData(QStringLiteral("on"))) ==
-        QStringLiteral("On") &&
+        dithering->itemText(dithering->findData(QStringLiteral("blue_noise"))) ==
+        QStringLiteral("Blue noise") &&
+        dithering->itemText(dithering->findData(QStringLiteral("ordered_lut"))) ==
+        QStringLiteral("Ordered (LUT)") &&
+        dithering->itemText(dithering->findData(QStringLiteral("ordered_fixed"))) ==
+        QStringLiteral("Ordered (fixed)") &&
+        dithering->itemText(dithering->findData(QStringLiteral("white_noise"))) ==
+        QStringLiteral("White noise") &&
+        dithering->itemText(dithering->findData(
+            QStringLiteral("error_diffusion_sierra_lite"))) ==
+        QStringLiteral("Error diffusion: Sierra Lite") &&
+        dithering->itemText(dithering->findData(
+            QStringLiteral("error_diffusion_floyd_steinberg"))) ==
+        QStringLiteral("Error diffusion: Floyd-Steinberg") &&
+        dithering->itemText(dithering->findData(
+            QStringLiteral("error_diffusion_sierra3"))) ==
+        QStringLiteral("Error diffusion: Sierra 3") &&
         dithering->itemText(dithering->findData(QStringLiteral("off"))) ==
         QStringLiteral("Off"),
-        "The dithering selector does not use concise Auto/On/Off labels");
+        "The dithering selector does not expose every libplacebo method");
     QComboBox* displayBitDepth = requireControl<QComboBox>(window,
         QStringLiteral("config.vprenderer.display_bit_depth"));
     require(displayBitDepth->currentData().toString() == QStringLiteral("AUTO") &&
@@ -2036,8 +2115,43 @@ void testScreenConfigSectionsAndInlineUnits()
         "Zoom does not use the expected Subtitles section heading and state");
     subtitles->click();
     QCoreApplication::processEvents();
+	QComboBox* hdrAnalysisMode = requireControl<QComboBox>(window,
+		QStringLiteral(
+			"config.vprenderer.zoom.hdr_peak_analysis_mode"));
+	require(hdrAnalysisMode->currentData().toString() == QStringLiteral("off") &&
+		hdrAnalysisMode->accessibleName() ==
+			QStringLiteral("HDR analysis protection") &&
+		hdrAnalysisMode->count() == 3 &&
+		hdrAnalysisMode->itemText(0) == QStringLiteral("Off") &&
+		hdrAnalysisMode->itemData(0).toString() == QStringLiteral("off") &&
+		hdrAnalysisMode->itemText(1) == QStringLiteral("Smart (Experimental)") &&
+		hdrAnalysisMode->itemData(1).toString() == QStringLiteral("automatic") &&
+		hdrAnalysisMode->itemText(2) == QStringLiteral("Percentage (Beta)") &&
+		hdrAnalysisMode->itemData(2).toString() == QStringLiteral("fixed"),
+		"Zoom subtitles do not expose the default-off exclusive HDR analysis modes");
+	QLineEdit* hdrAnalysisHeight = requireControl<QLineEdit>(window,
+		QStringLiteral(
+			"config.vprenderer.zoom.hdr_peak_analysis_height_percent"));
+	require(hdrAnalysisHeight->text() == QStringLiteral("75") &&
+		!hdrAnalysisHeight->isEnabled(),
+		"HDR analysis height does not default to 75% or follow the disabled toggle");
+	QComboBox* hdrAnalysisPosition = requireControl<QComboBox>(window,
+		QStringLiteral("config.vprenderer.zoom.hdr_peak_analysis_position"));
+	require(hdrAnalysisPosition->currentData().toString() == QStringLiteral("top") &&
+		!hdrAnalysisPosition->isEnabled(),
+		"HDR analysis position does not default to disabled Top");
+	QCheckBox* subtitleFit = requireControl<QCheckBox>(window,
+		QStringLiteral("config.vprenderer.zoom.subtitle_fit"));
     QLineEdit* hold = requireControl<QLineEdit>(window,
         QStringLiteral("config.vprenderer.zoom.subtitle_hold_seconds"));
+	QLineEdit* engageDrift = requireControl<QLineEdit>(window,
+		QStringLiteral("config.vprenderer.zoom.subtitle_engage_drift_ms"));
+	QLineEdit* releaseDrift = requireControl<QLineEdit>(window,
+		QStringLiteral("config.vprenderer.zoom.subtitle_release_drift_ms"));
+	QLineEdit* padding = requireControl<QLineEdit>(window,
+		QStringLiteral("config.vprenderer.zoom.subtitle_padding_pixels"));
+	QLineEdit* targetBuffer = requireControl<QLineEdit>(window,
+		QStringLiteral("config.vprenderer.zoom.subtitle_target_buffer_pixels"));
     QLabel* holdUnit = requireControl<QLabel>(window,
         QStringLiteral("config.vprenderer.zoom.subtitle_hold_seconds.unit"));
     QLabel* engageUnit = requireControl<QLabel>(window,
@@ -2050,6 +2164,18 @@ void testScreenConfigSectionsAndInlineUnits()
         "Zoom fixed-unit inputs are missing inline unit labels");
     require(hold->text() == QStringLiteral("2000"),
         "Subtitle hold is not presented in milliseconds");
+	subtitleFit->setChecked(false);
+	require(!hold->isEnabled() &&
+		!engageDrift->isEnabled() && !releaseDrift->isEnabled() &&
+		!padding->isEnabled() && !targetBuffer->isEnabled(),
+		"Subtitle-fit-only controls remain editable while fitting is disabled");
+	require(hdrAnalysisMode->isEnabled(),
+		"Independent HDR analysis protection was disabled with subtitle fitting");
+	subtitleFit->setChecked(true);
+	require(hold->isEnabled() && engageDrift->isEnabled() &&
+		releaseDrift->isEnabled() && padding->isEnabled() &&
+		targetBuffer->isEnabled(),
+		"Subtitle-fit-only controls did not enable with subtitle fitting");
     require(hold->minimumWidth() > 0 &&
         hold->minimumWidth() == hold->maximumWidth() &&
         hold->alignment() == Qt::AlignRight &&
@@ -2057,9 +2183,28 @@ void testScreenConfigSectionsAndInlineUnits()
         "Zoom unit input is not consistently sized, aligned, and labeled");
 
     hold->setText(QStringLiteral("1500"));
+	selectData(hdrAnalysisMode, QStringLiteral("fixed"));
+	require(hdrAnalysisHeight->isEnabled(),
+		"HDR analysis height did not enable in fixed-percentage mode");
+	require(hdrAnalysisPosition->isEnabled(),
+		"HDR analysis position did not enable in fixed-percentage mode");
+	hdrAnalysisHeight->setText(QStringLiteral("70"));
+	selectData(hdrAnalysisPosition, QStringLiteral("bottom"));
+	selectData(hdrAnalysisMode, QStringLiteral("automatic"));
+	require(!hdrAnalysisHeight->isEnabled() && !hdrAnalysisPosition->isEnabled(),
+		"HDR fixed-percentage controls remained enabled in automatic-movement mode");
     save(window);
-    require(readBytes(path).contains("subtitle_hold_seconds: 1.5"),
+    const QByteArray saved = readBytes(path);
+    require(saved.contains("subtitle_hold_seconds: 1.5"),
         "Millisecond subtitle hold did not preserve the seconds-based config contract");
+	require(saved.contains("hdr_peak_analysis_picture_only: false"),
+		"Automatic mode did not disable fixed-percentage HDR analysis");
+	require(saved.contains("hdr_peak_analysis_motion_compensation: true"),
+		"Automatic movement mode was not persisted in Zoom");
+	require(saved.contains("hdr_peak_analysis_height_percent: 70"),
+		"HDR active-picture analysis height was not persisted in Zoom");
+	require(saved.contains("hdr_peak_analysis_position: bottom"),
+		"HDR analysis position was not persisted in Zoom");
 
     QListWidget* profiles = requireControl<QListWidget>(window,
         QStringLiteral("config.vprenderer.zoom.profiles"));
@@ -2448,6 +2593,10 @@ void testChoiceLabelsAndVpRendererName()
     require(upscalerStatus->text() == QStringLiteral("Auto: EWA Lanczos sharp") &&
         upscalerStatus->font().italic(),
         "Auto upscaler does not use a concise italic effective-value label");
+    require(requireControl<QLabel>(window,
+        QStringLiteral("config.vprenderer.dithering.auto_status"))->text() ==
+            QStringLiteral("Auto: Blue noise"),
+        "Auto dithering does not identify its blue-noise policy");
     selectData(quality, QStringLiteral("balanced"));
     require(upscalerStatus->text() == QStringLiteral("Auto: Lanczos"),
         "Auto policy preview did not refresh after rendering quality changed");
@@ -2771,9 +2920,11 @@ void testGeneralInputApplyPreservesBackendOverrides()
     // Keep [general] without an explicit conversion default and save an
     // unrelated General edit. The two backend-specific values must remain
     // independent instead of being flattened into the shared default.
-    QCheckBox* switchRefreshRate = requireControl<QCheckBox>(window,
+    QComboBox* switchRefreshRate = requireControl<QComboBox>(window,
         QStringLiteral("config.general.switch_refresh_rate"));
-    switchRefreshRate->setChecked(!switchRefreshRate->isChecked());
+    const int always = switchRefreshRate->findData(QStringLiteral("always"));
+    require(always >= 0, "The Always refresh-rate switching option is missing");
+    switchRefreshRate->setCurrentIndex(always);
     const QString effectSummary = requireControl<QLabel>(window,
         QStringLiteral("configurationEffectSummary"))->text();
     const std::string effectFailure = QStringLiteral(
@@ -4475,6 +4626,8 @@ int main(int argc, char** argv)
         testLegacyVpInputOverrideMigratesToIndependentPolicySection);
     failures += run("LLDV metadata migrates to enabled singleton",
         testLldvMetadataMigratesToEnabledSingleton);
+    failures += run("optional config sections are created when edited",
+        testOptionalSectionsAreCreatedWhenEdited);
     failures += run("profile lifecycle through widgets", testProfileLifecycleThroughWidgets);
     failures += run("unrelated content remains exact", testUnrelatedContentRemainsExact);
     failures += run("scene detection defaults off and hides manual overrides",

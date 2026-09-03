@@ -31,6 +31,10 @@ namespace RendererProfileConfig
 	constexpr double MAX_SUBTITLE_HOLD_SECONDS = 30.0;
 	constexpr int DEFAULT_SUBTITLE_TARGET_BUFFER_PIXELS = 10;
 	constexpr int MAX_SUBTITLE_TARGET_BUFFER_PIXELS = 50;
+	constexpr int DEFAULT_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT = 75;
+	constexpr int MIN_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT = 10;
+	constexpr int MAX_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT = 100;
+	constexpr const char* DEFAULT_HDR_PEAK_ANALYSIS_POSITION = "top";
 
 	inline bool OwnsSection(const std::string& section)
 	{
@@ -70,6 +74,8 @@ namespace RendererProfileConfig
 		std::string name;
 		// Operator-facing name, currently configured for Screen Config profiles.
 		std::string label;
+		// An optional chord that advances through matching profiles in this group.
+		std::string cycleShortcut;
 		std::string when;
 		DisplayRuleExpression::Expression whenExpression;
 		int priority = 0;
@@ -150,7 +156,18 @@ namespace RendererProfileConfig
 		bool cropWiderContentToFillScreen = false;
 		AspectRatio cropWiderContentAspectLimit{ 1, 1, 1.0 };
 		bool hasCropWiderContentAspectLimit = false;
+		// A fixed crop is independent of the physical screen aspect. When set,
+		// trusted content is center-cropped to this exact source aspect before
+		// the normal screen fit is performed.
+		AspectRatio fixedCropAspect{ 1, 1, 1.0 };
+		bool hasFixedCropAspect = false;
 		bool subtitleFit = false;
+		bool hdrPeakAnalysisPictureOnly = false;
+		bool hdrPeakAnalysisMotionCompensation = false;
+		int hdrPeakAnalysisHeightPercent =
+			DEFAULT_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT;
+		std::string hdrPeakAnalysisPosition =
+			DEFAULT_HDR_PEAK_ANALYSIS_POSITION;
 		uint64_t subtitleHoldMilliseconds = 2000;
 		uint64_t subtitleEngageDriftMilliseconds = 0;
 		uint64_t subtitleReleaseDriftMilliseconds = 0;
@@ -465,7 +482,14 @@ namespace RendererProfileConfig
 					"bicubic", "gaussian", "catmull_rom", "mitchell", "lanczos",
 					"none", "ewa_lanczos" });
 			}
-			if (key == "sigmoid" || key == "dithering") return IsChoice(value, { "auto", "on", "off" });
+			if (key == "sigmoid") return IsChoice(value, { "auto", "on", "off" });
+			if (key == "dithering") return IsChoice(value, { "auto", "on", "off",
+				"blue_noise", "ordered_lut", "ordered_fixed", "white_noise",
+				"error_diffusion_simple", "error_diffusion_false_fs",
+				"error_diffusion_sierra_lite", "error_diffusion_floyd_steinberg",
+				"error_diffusion_atkinson", "error_diffusion_jarvis_judice_ninke",
+				"error_diffusion_stucki", "error_diffusion_burkes",
+				"error_diffusion_sierra2", "error_diffusion_sierra3" });
 			if (key == "deband_strength") return IsChoice(value, { "auto", "off", "light", "default" });
 			expected = "a scaling-owned setting"; return false;
 		}
@@ -516,6 +540,8 @@ namespace RendererProfileConfig
 			if (screenGroup && key == "anamorphic_scale")
 				return IsAspectInRange(value, 0.5, 2.0);
 			if (key == "automatic_crop" || key == "subtitle_fit" ||
+				key == "hdr_peak_analysis_picture_only" ||
+				key == "hdr_peak_analysis_motion_compensation" ||
 				key == "crop_narrower_content_to_fill_screen" ||
 				key == "crop_wider_content_to_fill_screen")
 				return IsBoolean(value);
@@ -525,9 +551,19 @@ namespace RendererProfileConfig
 				// absent or malformed value means no limit.
 				// ResolveViewport disables the limit when it cannot parse it.
 				return true;
+			if (group == "zoom" && key == "fixed_crop_aspect")
+				return IsAspectInRange(value, 1.0, 4.0);
 			if (key == "subtitle_hold_seconds")
 				return IsNumberInRange(value, MIN_SUBTITLE_HOLD_SECONDS,
 					MAX_SUBTITLE_HOLD_SECONDS);
+			if (key == "hdr_peak_analysis_height_percent")
+			{
+				int parsed = 0; return ParseInteger(value,
+					MIN_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+					MAX_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT, parsed);
+			}
+			if (key == "hdr_peak_analysis_position")
+				return IsChoice(value, { "top", "center", "bottom" });
 			if (key == "subtitle_engage_drift_ms" ||
 				key == "subtitle_release_drift_ms")
 			{
@@ -638,7 +674,8 @@ namespace RendererProfileConfig
 			ConfigSchema::Choice("profile_update_mode",
 				{ "rebuild", "live", "never" }),
 			ConfigSchema::Boolean("live_profile_updates"),
-			ConfigSchema::Boolean("switch_refresh_rate"),
+			ConfigSchema::Choice("switch_refresh_rate",
+				{ "true", "false", "never", "fullscreen_only", "full_screen_only", "always" }),
 			ConfigSchema::Boolean("output_diagnostics"),
 			ConfigSchema::Boolean("diagnostic_disable_shader_cache"),
 			ConfigSchema::Boolean("diagnostic_disable_compute"),
@@ -706,7 +743,8 @@ namespace RendererProfileConfig
 			key == "crop_narrower_content_to_fill_screen" ||
 			key == "crop_narrower_content_aspect_limit" ||
 			key == "crop_wider_content_to_fill_screen" ||
-			key == "crop_wider_content_aspect_limit") return false;
+			key == "crop_wider_content_aspect_limit" ||
+			key == "fixed_crop_aspect") return false;
 		return ValidateBaseSetting(key, value);
 	}
 
@@ -1010,6 +1048,7 @@ namespace RendererProfileConfig
 			base.name = baselineName;
 			std::string baseShortcut;
 			std::string resetShortcut;
+			std::string baseCycleShortcut;
 			if (baselineValues)
 				for (const auto& entry : *baselineValues)
 				{
@@ -1050,6 +1089,11 @@ namespace RendererProfileConfig
 					{
 						if (namedBaseline) baseShortcut = entry.second;
 						else resetShortcut = entry.second;
+						continue;
+					}
+					if (entry.first == "cycle_shortcut")
+					{
+						baseCycleShortcut = entry.second;
 						continue;
 					}
 					if (std::string(spec.name) == "queue")
@@ -1111,6 +1155,13 @@ namespace RendererProfileConfig
 			if (!MergeShortcutIntoWhen(resetShortcut, "[" + section + "]", group.resetWhen, error) ||
 				!MergeShortcutIntoWhen(baseShortcut, "[" + prefix + baselineName + "]", base.when, error))
 				return false;
+			if (!baseCycleShortcut.empty() &&
+				!CanonicalizeKeyChord(baseCycleShortcut, base.cycleShortcut))
+			{
+				error = "[" + (namedBaseline ? prefix + baselineName : section) +
+					"] cycle_shortcut is not a valid shortcut";
+				return false;
+			}
 			if (!group.resetWhen.empty() &&
 				(!group.resetExpression.Compile(group.resetWhen, error, true) ||
 				 !ValidateExpressionVariables(group.resetExpression, { "key" },
@@ -1135,6 +1186,7 @@ namespace RendererProfileConfig
 				profile.whenExpression = {};
 				profile.priority = 0;
 				std::string profileShortcut;
+				std::string profileCycleShortcut;
 				for (const auto& entry : *values)
 				{
 					if ((std::string(spec.name) == "viewport" ||
@@ -1159,6 +1211,7 @@ namespace RendererProfileConfig
 					}
 					if (entry.first == "when") { profile.when = entry.second; continue; }
 					if (entry.first == "shortcut") { profileShortcut = entry.second; continue; }
+					if (entry.first == "cycle_shortcut") { profileCycleShortcut = entry.second; continue; }
 					if (entry.first == "priority")
 					{
 						if (!ParseInteger(entry.second, -100000, 100000, profile.priority))
@@ -1189,6 +1242,12 @@ namespace RendererProfileConfig
 				}
 				if (!MergeShortcutIntoWhen(profileShortcut, "[" + variantSection + "]", profile.when, error))
 					return false;
+				if (!profileCycleShortcut.empty() &&
+					!CanonicalizeKeyChord(profileCycleShortcut, profile.cycleShortcut))
+				{
+					error = "[" + variantSection + "] cycle_shortcut is not a valid shortcut";
+					return false;
+				}
 				if (!profile.when.empty() &&
 					(!profile.whenExpression.Compile(profile.when, error, true) ||
 					 !ValidateExpressionVariables(profile.whenExpression,
@@ -1359,7 +1418,8 @@ namespace RendererProfileConfig
 			ConfigSchema::Choice("profile_update_mode",
 				{ "rebuild", "live", "never" }),
 			ConfigSchema::Boolean("live_profile_updates"),
-			ConfigSchema::Boolean("switch_refresh_rate"),
+			ConfigSchema::Choice("switch_refresh_rate",
+				{ "true", "false", "never", "fullscreen_only", "full_screen_only", "always" }),
 			ConfigSchema::Integer("event_action_delay_seconds", 0, 30),
 			ConfigSchema::Boolean("output_diagnostics"),
 			ConfigSchema::Boolean("diagnostic_disable_shader_cache"),
@@ -1402,7 +1462,11 @@ namespace RendererProfileConfig
 				"automatic_crop", "crop_narrower_content_to_fill_screen",
 				"crop_narrower_content_aspect_limit",
 				"crop_wider_content_to_fill_screen",
-				"crop_wider_content_aspect_limit", "subtitle_fit",
+				"crop_wider_content_aspect_limit", "fixed_crop_aspect", "subtitle_fit",
+				"hdr_peak_analysis_picture_only",
+				"hdr_peak_analysis_motion_compensation",
+				"hdr_peak_analysis_height_percent",
+				"hdr_peak_analysis_position",
 				"subtitle_hold_seconds", "subtitle_engage_drift_ms",
 				"subtitle_release_drift_ms",
 				"subtitle_padding_pixels", "subtitle_target_buffer_pixels"
@@ -1925,6 +1989,42 @@ namespace RendererProfileConfig
 				"] subtitle_fit is invalid";
 			return false;
 		}
+		value = settings.find("hdr_peak_analysis_picture_only");
+		if (value != settings.end() && !ParseBoolean(value->second,
+			viewport.hdrPeakAnalysisPictureOnly))
+		{
+			error = "[profiles.viewport." + viewport.profile +
+				"] hdr_peak_analysis_picture_only is invalid";
+			return false;
+		}
+		value = settings.find("hdr_peak_analysis_motion_compensation");
+		if (value != settings.end() && !ParseBoolean(value->second,
+			viewport.hdrPeakAnalysisMotionCompensation))
+		{
+			error = "[profiles.viewport." + viewport.profile +
+				"] hdr_peak_analysis_motion_compensation is invalid";
+			return false;
+		}
+		value = settings.find("hdr_peak_analysis_height_percent");
+		if (value != settings.end() && !ParseInteger(value->second,
+			MIN_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+			MAX_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+			viewport.hdrPeakAnalysisHeightPercent))
+		{
+			error = "[profiles.viewport." + viewport.profile +
+				"] hdr_peak_analysis_height_percent is invalid";
+			return false;
+		}
+		value = settings.find("hdr_peak_analysis_position");
+		if (value != settings.end() &&
+			!IsChoice(value->second, { "top", "center", "bottom" }))
+		{
+			error = "[profiles.viewport." + viewport.profile +
+				"] hdr_peak_analysis_position is invalid";
+			return false;
+		}
+		if (value != settings.end())
+			viewport.hdrPeakAnalysisPosition = value->second;
 		value = settings.find("subtitle_hold_seconds");
 		if (value != settings.end())
 		{
@@ -1989,6 +2089,41 @@ namespace RendererProfileConfig
 		return true;
 	}
 
+	// Cycle keys are independent from normal shortcut expressions. Each group
+	// advances only through profiles that explicitly share the pressed chord;
+	// an inactive/non-member current profile starts at the first match.
+	inline bool SelectCycleForKey(const Model& model, const std::string& key,
+		const std::map<std::string, std::string>& currentSelections,
+		std::vector<KeySelection>& selections, std::string& error)
+	{
+		selections.clear();
+		error.clear();
+		std::string canonicalKey;
+		if (!CanonicalizeKeyChord(key, canonicalKey))
+		{
+			error = "key '" + key + "' is not a registrable shortcut";
+			return false;
+		}
+		for (const Group& group : model.groups)
+		{
+			std::vector<std::string> matches;
+			for (const std::string& name : group.profiles)
+			{
+				const Profile& profile = model.profiles.at(group.name + "." + name);
+				if (profile.cycleShortcut == canonicalKey)
+					matches.push_back(name);
+			}
+			if (matches.empty()) continue;
+			const auto current = currentSelections.find(group.name);
+			auto selected = current == currentSelections.end() ? matches.end() :
+				std::find(matches.begin(), matches.end(), current->second);
+			const size_t next = selected == matches.end() ? 0 :
+				(static_cast<size_t>(selected - matches.begin()) + 1) % matches.size();
+			selections.push_back({ group.name, matches[next], false });
+		}
+		return true;
+	}
+
 	// Zoom is a second, independently selected profile family. It deliberately
 	// overlays only crop and subtitle controls, leaving the selected physical
 	// screen geometry untouched.
@@ -2046,6 +2181,16 @@ namespace RendererProfileConfig
 					viewport.cropWiderContentAspectLimit, error);
 			if (!viewport.hasCropWiderContentAspectLimit) error.clear();
 		}
+		value = settings.find("fixed_crop_aspect");
+		if (value != settings.end() &&
+			!AspectRatioParser::Parse(value->second, 1.0, 4.0,
+				viewport.fixedCropAspect, error))
+		{
+			error = "[profiles.zoom." + viewport.zoomProfile +
+				"] fixed_crop_aspect: " + error;
+			return false;
+		}
+		viewport.hasFixedCropAspect = value != settings.end();
 		value = settings.find("subtitle_fit");
 		if (value != settings.end() && !ParseBoolean(value->second,
 			viewport.subtitleFit))
@@ -2054,6 +2199,42 @@ namespace RendererProfileConfig
 				"] subtitle_fit is invalid";
 			return false;
 		}
+		value = settings.find("hdr_peak_analysis_picture_only");
+		if (value != settings.end() && !ParseBoolean(value->second,
+			viewport.hdrPeakAnalysisPictureOnly))
+		{
+			error = "[profiles.zoom." + viewport.zoomProfile +
+				"] hdr_peak_analysis_picture_only is invalid";
+			return false;
+		}
+		value = settings.find("hdr_peak_analysis_motion_compensation");
+		if (value != settings.end() && !ParseBoolean(value->second,
+			viewport.hdrPeakAnalysisMotionCompensation))
+		{
+			error = "[profiles.zoom." + viewport.zoomProfile +
+				"] hdr_peak_analysis_motion_compensation is invalid";
+			return false;
+		}
+		value = settings.find("hdr_peak_analysis_height_percent");
+		if (value != settings.end() && !ParseInteger(value->second,
+			MIN_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+			MAX_HDR_PEAK_ANALYSIS_HEIGHT_PERCENT,
+			viewport.hdrPeakAnalysisHeightPercent))
+		{
+			error = "[profiles.zoom." + viewport.zoomProfile +
+				"] hdr_peak_analysis_height_percent is invalid";
+			return false;
+		}
+		value = settings.find("hdr_peak_analysis_position");
+		if (value != settings.end() &&
+			!IsChoice(value->second, { "top", "center", "bottom" }))
+		{
+			error = "[profiles.zoom." + viewport.zoomProfile +
+				"] hdr_peak_analysis_position is invalid";
+			return false;
+		}
+		if (value != settings.end())
+			viewport.hdrPeakAnalysisPosition = value->second;
 		value = settings.find("subtitle_hold_seconds");
 		if (value != settings.end())
 		{
@@ -2290,6 +2471,7 @@ namespace RendererProfileConfig
 			{
 				const Profile& profile = model.profiles.at(group.name + "." + name);
 				if (!profile.when.empty()) collect(profile.whenExpression);
+				if (!profile.cycleShortcut.empty()) chords.push_back(profile.cycleShortcut);
 			}
 		}
 		std::sort(chords.begin(), chords.end());

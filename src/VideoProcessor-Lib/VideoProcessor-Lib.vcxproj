@@ -210,6 +210,7 @@
 	<ClInclude Include="MadVRShaderTransactionPolicy.h" />
     <ClInclude Include="IRenderer.h" />
     <ClInclude Include="RendererLiveness.h" />
+    <ClInclude Include="RendererPostStallResetAdvisor.h" />
     <ClInclude Include="RendererIngressState.h" />
     <ClInclude Include="RendererResetCoordinator.h" />
     <ClInclude Include="RendererResetPolicy.h" />
@@ -232,6 +233,7 @@
     <ClInclude Include="vprenderer\\AlphaSourceCropPolicy.h" />
     <ClInclude Include="vprenderer\\LibplaceboOutputPolicy.h" />
     <ClInclude Include="vprenderer\\LibplaceboRenderParameters.h" />
+    <ClInclude Include="vprenderer\\HdrPeakAnalysisCrop.h" />
     <ClInclude Include="vprenderer\\LibplaceboPluginVideoRenderer.h" />
     <ClInclude Include="vprenderer\\LibplaceboRendererPluginApi.h" />
     <ClInclude Include="vprenderer\\OptionalRendererLayout.h" />

@@ -151,6 +151,14 @@ NlsSourceGeometry ResolveNlsPresentationSourceGeometry(bool nlsRequested,
 	int viewportLeft, int viewportTop, int viewportRight, int viewportBottom,
 	int rasterWidth, int rasterHeight)
 {
+	if (viewportCropApplied)
+	{
+		const NlsSourceGeometry viewport = ResolveNlsSourceGeometry(true,
+			viewportLeft, viewportTop, viewportRight, viewportBottom,
+			rasterWidth, rasterHeight);
+		if (viewport.valid)
+			return viewport;
+	}
 	if (nlsRequested && activePictureAvailable)
 	{
 		const NlsSourceGeometry activePicture = ResolveNlsSourceGeometry(true,
@@ -159,9 +167,27 @@ NlsSourceGeometry ResolveNlsPresentationSourceGeometry(bool nlsRequested,
 		if (activePicture.valid)
 			return activePicture;
 	}
-	return ResolveNlsSourceGeometry(viewportCropApplied,
+	return ResolveNlsSourceGeometry(false,
 		viewportLeft, viewportTop, viewportRight, viewportBottom,
 		rasterWidth, rasterHeight);
+}
+
+
+bool NlsOwnsPresentationGeometry(bool nlsRequested,
+	bool presentationFailOpen, bool activePictureAvailable,
+	bool viewportCropApplied, bool viewportCropIsFixed,
+	NlsMappingMode mappingMode,
+	bool presentationCropApplied)
+{
+	// A fixed viewport crop is an explicit operator geometry contract. NLS may
+	// map within that rectangle, but must never replace or further crop it.
+	if (!nlsRequested || presentationFailOpen || viewportCropIsFixed)
+		return false;
+	if (presentationCropApplied || mappingMode == NlsMappingMode::ACTIVE ||
+		mappingMode == NlsMappingMode::SAFE_FIT)
+		return true;
+	return mappingMode == NlsMappingMode::LINEAR_PASSTHROUGH &&
+		activePictureAvailable && !viewportCropApplied;
 }
 
 

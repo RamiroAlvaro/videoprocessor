@@ -4,6 +4,8 @@
 #include <RendererResetCoordinator.h>
 #include <RendererRetirementService.h>
 #include <IRenderer.h>
+#include <vprenderer/PresentationResetEpoch.h>
+#include <vprenderer/ViewportIntentMailbox.h>
 
 #include <atomic>
 #include <chrono>
@@ -237,6 +239,45 @@ namespace Tests
 	TEST_CLASS(RendererResetCoordinatorTests)
 	{
 	public:
+		TEST_METHOD(PresentationResetEpochInvalidatesPriorGeometryForLiveQueueReset)
+		{
+			PresentationResetEpoch resetEpoch;
+			uint64_t consumedEpoch = 0;
+			uint64_t queueGeneration = 41;
+
+			// A refresh-transition uses ResetLiveQueue. Its first new frame must
+			// see this request before the reset publishes generation 42; otherwise
+			// old 2:1 crop authority could be presented once as Scope.
+			resetEpoch.Request();
+			++queueGeneration;
+			Assert::AreEqual<uint64_t>(42, queueGeneration);
+			Assert::IsTrue(resetEpoch.Consume(consumedEpoch));
+			Assert::AreEqual<uint64_t>(1, consumedEpoch);
+			Assert::IsFalse(resetEpoch.Consume(consumedEpoch));
+
+			resetEpoch.Request();
+			Assert::IsTrue(resetEpoch.Consume(consumedEpoch));
+			Assert::AreEqual<uint64_t>(2, consumedEpoch);
+		}
+
+		TEST_METHOD(ViewportIntentCoalescingCannotSplitSettingsFromGeometry)
+		{
+			ViewportIntentMailbox<int> mailbox;
+			Assert::IsFalse(mailbox.Publish(220, true, 17, 1700));
+			Assert::IsTrue(mailbox.Publish(235, true, 18, 1800));
+			Assert::IsTrue(mailbox.Publish(0, true, 19, 1900));
+
+			ViewportIntentMailbox<int>::Intent consumed;
+			Assert::IsTrue(mailbox.Consume(consumed));
+			// The automatic Scope/F2 request replaces the entire fixed-crop
+			// transaction, including its boundary metadata.
+			Assert::AreEqual(0, consumed.settings);
+			Assert::IsTrue(consumed.configuredScreenActive);
+			Assert::AreEqual<uint64_t>(19, consumed.viewportRequestSerial);
+			Assert::AreEqual<int64_t>(1900, consumed.viewportRequestNs);
+			Assert::IsFalse(mailbox.Consume(consumed));
+		}
+
 		TEST_METHOD(IncompleteRetirementPolicySeparatesShutdownConversionFromRetention)
 		{
 			using Action = RendererRetirementService::IncompleteAction;
