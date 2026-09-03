@@ -4,6 +4,9 @@ run-name: Build PR3 NLS+ test
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feature/nlsplus-madvr-partial-fill
 
 permissions:
   contents: read
