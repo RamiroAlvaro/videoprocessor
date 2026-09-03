@@ -10,9 +10,54 @@
 
 #include "MadVRShaderRuntimeState.h"
 
+#include <ConfigFile.h>
+
 #include <algorithm>
 #include <cmath>
 #include <sstream>
+
+
+namespace
+{
+	double ConfiguredNlsTargetFill(const std::string& effectiveRule)
+	{
+		if (effectiveRule.empty())
+			return 1.0;
+
+		ConfigFile config;
+		if (!config.Load())
+			return 1.0;
+
+		std::istringstream selectors(effectiveRule);
+		std::string selector;
+		while (std::getline(selectors, selector, ','))
+		{
+			selector = ConfigFile::NormalizeName(ConfigFile::Trim(selector));
+			if (selector.empty() || selector.rfind("@shader-key:", 0) == 0)
+				continue;
+
+			std::string raw;
+			if (!config.TryGetString("shader." + selector, "target_fill", raw))
+				continue;
+
+			try
+			{
+				size_t consumed = 0;
+				const std::string text = ConfigFile::Trim(raw);
+				const double fill = std::stod(text, &consumed);
+				if (consumed == text.size() && std::isfinite(fill) &&
+					fill >= 0.50 && fill <= 1.0)
+					return fill;
+			}
+			catch (...)
+			{
+				// Validation owns the user-facing diagnostic. Runtime fail-open is
+				// intentionally the historical full-target NLS behavior.
+			}
+		}
+		return 1.0;
+	}
+}
 
 
 bool ResolveMadVRNlsOutputAspect(double targetAspect,
@@ -216,6 +261,22 @@ uint64_t MadVRShaderRuntimeState::BeginRendererGeneration()
 }
 
 
+void MadVRShaderRuntimeState::RecalculateNlsTargetAspectLocked()
+{
+	if (!std::isfinite(m_physicalNlsTargetAspect) ||
+		m_physicalNlsTargetAspect < 1.0 || m_physicalNlsTargetAspect > 4.0)
+	{
+		m_state.nlsTargetAspect = 0.0;
+		return;
+	}
+
+	const double fill = ConfiguredNlsTargetFill(m_state.effectiveRule);
+	const double target = m_physicalNlsTargetAspect / fill;
+	m_state.nlsTargetAspect = std::isfinite(target) &&
+		target >= 1.0 && target <= 4.0 ? target : m_physicalNlsTargetAspect;
+}
+
+
 void MadVRShaderRuntimeState::SetRuleSelection(
 	const std::string& requestedRule, const std::string& effectiveRule,
 	MadVRNlsMappingMode nlsMode)
@@ -223,6 +284,7 @@ void MadVRShaderRuntimeState::SetRuleSelection(
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_state.requestedRule = requestedRule;
 	m_state.effectiveRule = effectiveRule;
+	RecalculateNlsTargetAspectLocked();
 	m_state.nlsMode = nlsMode;
 	if (nlsMode == MadVRNlsMappingMode::ACTIVE ||
 		nlsMode == MadVRNlsMappingMode::LINEAR_PASSTHROUGH ||
@@ -255,14 +317,16 @@ void MadVRShaderRuntimeState::SetEffectiveRule(
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_state.effectiveRule = effectiveRule;
+	RecalculateNlsTargetAspectLocked();
 }
 
 
 void MadVRShaderRuntimeState::SetNlsTargetAspect(double targetAspect)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
-	m_state.nlsTargetAspect = std::isfinite(targetAspect) &&
+	m_physicalNlsTargetAspect = std::isfinite(targetAspect) &&
 		targetAspect >= 1.0 && targetAspect <= 4.0 ? targetAspect : 0.0;
+	RecalculateNlsTargetAspectLocked();
 }
 
 
