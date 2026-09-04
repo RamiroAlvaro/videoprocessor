@@ -19,6 +19,33 @@
 
 namespace
 {
+	bool TryConfiguredNlsTargetFill(const ConfigFile& config,
+		const std::string& section, double& fill)
+	{
+		std::string raw;
+		if (!config.TryGetString(section, "target_fill", raw))
+			return false;
+		try
+		{
+			size_t consumed = 0;
+			const std::string text = ConfigFile::Trim(raw);
+			const double parsed = std::stod(text, &consumed);
+			if (consumed == text.size() && std::isfinite(parsed) &&
+				parsed >= 0.50 && parsed <= 1.0)
+			{
+				fill = parsed;
+				return true;
+			}
+		}
+		catch (...)
+		{
+			// Validation owns the user-facing diagnostic. Runtime fail-open is
+			// intentionally the historical full-target NLS behavior.
+		}
+		return false;
+	}
+
+
 	double ConfiguredNlsTargetFill(const std::string& effectiveRule)
 	{
 		if (effectiveRule.empty())
@@ -33,26 +60,36 @@ namespace
 		while (std::getline(selectors, selector, ','))
 		{
 			selector = ConfigFile::NormalizeName(ConfigFile::Trim(selector));
-			if (selector.empty() || selector.rfind("@shader-key:", 0) == 0)
+			if (selector.empty())
 				continue;
 
-			std::string raw;
-			if (!config.TryGetString("shader." + selector, "target_fill", raw))
-				continue;
-
-			try
+			double fill = 1.0;
+			if (selector.rfind("@shader-key:", 0) != 0)
 			{
-				size_t consumed = 0;
-				const std::string text = ConfigFile::Trim(raw);
-				const double fill = std::stod(text, &consumed);
-				if (consumed == text.size() && std::isfinite(fill) &&
-					fill >= 0.50 && fill <= 1.0)
+				if (TryConfiguredNlsTargetFill(
+					"shader." + selector, config, fill))
 					return fill;
+				continue;
 			}
-			catch (...)
+
+			// Manual NLS selection reaches the runtime first as @shader-key:<key>.
+			// Resolve that key through the same shader sections instead of silently
+			// falling back to a full-screen target before the named rule is exposed.
+			const std::string key = ConfigFile::NormalizeName(
+				ConfigFile::Trim(selector.substr(std::string("@shader-key:").size())));
+			if (key.empty())
+				continue;
+			for (const std::string& section : config.GetSectionNames())
 			{
-				// Validation owns the user-facing diagnostic. Runtime fail-open is
-				// intentionally the historical full-target NLS behavior.
+				if (section.rfind("shader.", 0) != 0)
+					continue;
+				std::string shortcut;
+				if (!config.TryGetString(section, "shortcut", shortcut))
+					continue;
+				if (ConfigFile::NormalizeName(ConfigFile::Trim(shortcut)) != key)
+					continue;
+				if (TryConfiguredNlsTargetFill(config, section, fill))
+					return fill;
 			}
 		}
 		return 1.0;
