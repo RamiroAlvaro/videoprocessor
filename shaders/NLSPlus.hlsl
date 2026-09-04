@@ -18,10 +18,10 @@
  * complete shader-domain picture (0..1 in both axes) and applies one continuous
  * mapping to every row and column.
  *
- * The current field-test preset caps symmetric side crop at 5% per edge when
+ * The current field-test preset caps symmetric side crop at 6.5% per edge when
  * the source is wider than the target.  Crop is automatically reduced when
  * less is needed, so the shader never crops past the target AR.  The remaining
- * aspect correction is then shared between both axes.  For the 16:9 / 86%
+ * aspect correction is then shared between both axes.  For the 16:9 / 89%
  * height / ~2.39:1 test case this leaves only about 4% residual AR correction,
  * split roughly evenly between horizontal and vertical mapping.
  *
@@ -186,7 +186,7 @@ float4 main(float2 tex : TEXCOORD0) : COLOR
     float maximumUsefulSideCrop = 0.0;
     if (sourceWider && requestedRatio > 1.000001)
         maximumUsefulSideCrop = 0.5 * (1.0 - 1.0 / requestedRatio);
-    float sideCrop = sourceWider ? min(0.05, maximumUsefulSideCrop) : 0.0;
+    float sideCrop = sourceWider ? min(0.065, maximumUsefulSideCrop) : 0.0;
     float keptWidth = 1.0 - 2.0 * sideCrop;
 
     // Cropping already supplies part of the aspect correction.  Share only the
