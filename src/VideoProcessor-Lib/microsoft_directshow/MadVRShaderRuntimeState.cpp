@@ -67,7 +67,7 @@ namespace
 			if (selector.rfind("@shader-key:", 0) != 0)
 			{
 				if (TryConfiguredNlsTargetFill(
-					"shader." + selector, config, fill))
+					config, "shader." + selector, fill))
 					return fill;
 				continue;
 			}
@@ -104,9 +104,6 @@ bool ResolveMadVRNlsOutputAspect(double targetAspect,
 	aspectY = 0;
 	if (!std::isfinite(targetAspect) || targetAspect <= 0.0)
 		return false;
-	// Find the closest small rational without teaching the shader layer about
-	// named or conventional screen shapes. Exact ratios such as 16:9 and 47:20
-	// naturally resolve to their canonical representation.
 	double bestError = (std::numeric_limits<double>::max)();
 	for (unsigned long denominator = 1; denominator <= 10000; ++denominator)
 	{
@@ -125,9 +122,7 @@ bool ResolveMadVRNlsOutputAspect(double targetAspect,
 				break;
 		}
 	}
-	if (aspectX == 0 || aspectY == 0)
-		return false;
-	return true;
+	return aspectX != 0 && aspectY != 0;
 }
 
 
@@ -149,32 +144,19 @@ MadVRNlsPresentationPlan ResolveMadVRNlsPresentationPlan(
 		geometry.right > geometry.left && geometry.bottom > geometry.top;
 	if (!validBounds || !std::isfinite(decision.targetAspect) ||
 		decision.targetAspect <= 0.0)
-	{
 		return plan;
-	}
 
 	const double activeWidth = geometry.right - geometry.left;
 	const double activeHeight = geometry.bottom - geometry.top;
-	// The shader leaves every encoded bar untouched and maps only within the
-	// measured active rectangle. madVR can therefore remove its independently
-	// detected videoCropRect exactly once, including bars on the warp axis. This
-	// whole-raster DAR makes the resulting cropped DAR equal the target:
-	// rasterDAR * activeWidth / activeHeight = targetDAR.
 	const double rasterAspect =
 		decision.targetAspect * activeHeight / activeWidth;
 	if (!std::isfinite(rasterAspect) || rasterAspect < 0.25 ||
 		rasterAspect > 4.0 ||
-		!ResolveMadVRNlsOutputAspect(
-			rasterAspect, plan.aspectX, plan.aspectY))
-	{
+		!ResolveMadVRNlsOutputAspect(rasterAspect, plan.aspectX, plan.aspectY))
 		return MadVRNlsPresentationPlan{};
-	}
 
 	plan.customShader = true;
 	plan.rasterAspect = rasterAspect;
-	// Pass the measured rectangle to the shader as a coordinate boundary, not as
-	// a crop request. The shader preserves pixels outside it and maps active
-	// edges to themselves, while madVR remains the sole bar-removal owner.
 	return plan;
 }
 
@@ -186,14 +168,9 @@ MadVRNlsMappingDecision ConstrainMadVRNlsMappingToGeometry(
 	MadVRNlsMappingDecision constrained = decision;
 	const MadVRNlsPresentationPlan plan =
 		ResolveMadVRNlsPresentationPlan(decision, geometry);
-	if (decision.mode != MadVRNlsMappingMode::ACTIVE ||
-		plan.customShader)
-	{
+	if (decision.mode != MadVRNlsMappingMode::ACTIVE || plan.customShader)
 		return constrained;
-	}
 
-	// Malformed or stale geometry cannot safely establish the compensated
-	// output contract. Preserve the complete picture instead.
 	constrained.mode = MadVRNlsMappingMode::SAFE_FIT;
 	constrained.safeFitVertical =
 		decision.sourceAspect > decision.targetAspect;
@@ -211,10 +188,7 @@ bool MadVROutputAspectRequiresRestart(unsigned long currentAspectX,
 	unsigned long desiredAspectY, double nativeAspect)
 {
 	if (!std::isfinite(nativeAspect) || nativeAspect <= 0.0)
-	{
-		return desiredAspectX != currentAspectX ||
-			desiredAspectY != currentAspectY;
-	}
+		return desiredAspectX != currentAspectX || desiredAspectY != currentAspectY;
 	const auto effectiveAspect = [nativeAspect](
 		unsigned long aspectX, unsigned long aspectY)
 	{
@@ -232,8 +206,7 @@ bool MadVRNlsOutputContractIsPrepared(
 	return snapshot.nlsMode != MadVRNlsMappingMode::OFF &&
 		snapshot.nlsMode != MadVRNlsMappingMode::WAITING &&
 		snapshot.activeGeometry.stable &&
-		snapshot.activeGeometry.rendererGeneration ==
-			snapshot.rendererGeneration;
+		snapshot.activeGeometry.rendererGeneration == snapshot.rendererGeneration;
 }
 
 
@@ -244,9 +217,6 @@ MadVRShaderChainUpdatePlan ResolveMadVRShaderChainUpdatePlan(
 	uint64_t desiredPostFingerprint, bool desiredPostEmpty)
 {
 	MadVRShaderChainUpdatePlan plan;
-	// A newly created madVR instance has no VP-installed chain. Do not clear an
-	// empty stage merely to establish that fact; this also avoids disturbing an
-	// unrelated stage when only the other stage changes.
 	plan.preScale = previousPreKnown ?
 		previousPreFingerprint != desiredPreFingerprint : !desiredPreEmpty;
 	plan.postScale = previousPostKnown ?
@@ -261,6 +231,7 @@ MadVRShaderRuntimeSnapshot MadVRShaderRuntimeState::GetSnapshot() const
 	return m_state;
 }
 
+
 bool MadVRShaderRuntimeState::PrepareNlsOutputContractRendererReplacement()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
@@ -274,18 +245,13 @@ uint64_t MadVRShaderRuntimeState::BeginRendererGeneration()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
 	++m_state.rendererGeneration;
-	// A controlled output-contract replacement does not change the source
-	// epoch. Preserve the exact source-owned rectangle and bind it to the new
-	// renderer generation so output aspect and shader mapping become visible
-	// together. Never reconstruct coordinates from scalar aspect.
 	if (m_preserveGeometryOnNextRenderer &&
 		m_state.activeGeometry.stable &&
 		(m_state.nlsMode == MadVRNlsMappingMode::ACTIVE ||
 			m_state.nlsMode == MadVRNlsMappingMode::LINEAR_PASSTHROUGH ||
 			m_state.nlsMode == MadVRNlsMappingMode::SAFE_FIT))
 	{
-		m_state.activeGeometry.rendererGeneration =
-			m_state.rendererGeneration;
+		m_state.activeGeometry.rendererGeneration = m_state.rendererGeneration;
 	}
 	else
 	{
@@ -326,18 +292,14 @@ void MadVRShaderRuntimeState::SetRuleSelection(
 	if (nlsMode == MadVRNlsMappingMode::ACTIVE ||
 		nlsMode == MadVRNlsMappingMode::LINEAR_PASSTHROUGH ||
 		nlsMode == MadVRNlsMappingMode::SAFE_FIT)
-	{
 		m_state.lastSafeNlsMode = nlsMode;
-	}
 	else if (nlsMode == MadVRNlsMappingMode::OFF)
 	{
 		m_state.lastSafeNlsMode = MadVRNlsMappingMode::OFF;
 		m_state.activeGeometry = {};
 	}
 	else
-	{
 		m_state.activeGeometry = {};
-	}
 }
 
 
