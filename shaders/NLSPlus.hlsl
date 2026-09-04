@@ -7,12 +7,23 @@
  * of correction required by the selected target.  It does not reproduce or
  * reverse-engineer proprietary Envy code.
  *
- * The current field-test preset intentionally caps symmetric side crop at 5%
- * per edge when the source is wider than the target.  Crop is automatically
- * reduced when less is needed, so the shader never crops past the target AR.
- * The remaining aspect correction is then shared between both axes.  For the
- * 16:9 / 86%-height / ~2.39:1 test case this leaves only about 4% residual AR
- * correction, split roughly evenly between horizontal and vertical mapping.
+ * IMPORTANT madVR coordinate contract:
+ * VideoProcessor still uses its detected active-picture bounds to decide the
+ * source aspect and target geometry.  However, when madVR hard-coded black-bar
+ * cropping is enabled, the external pre-resize shader operates in the picture
+ * domain presented by madVR.  Re-applying the original full-raster top/bottom
+ * bounds inside this shader creates horizontal seams: the middle of the frame
+ * receives the NLS+/side-crop X mapping while the rows outside those stale
+ * bounds keep the old X mapping.  Therefore this HLSL treats TEXCOORD0 as the
+ * complete shader-domain picture (0..1 in both axes) and applies one continuous
+ * mapping to every row and column.
+ *
+ * The current field-test preset caps symmetric side crop at 5% per edge when
+ * the source is wider than the target.  Crop is automatically reduced when
+ * less is needed, so the shader never crops past the target AR.  The remaining
+ * aspect correction is then shared between both axes.  For the 16:9 / 86%
+ * height / ~2.39:1 test case this leaves only about 4% residual AR correction,
+ * split roughly evenly between horizontal and vertical mapping.
  *
  * $MinimumShaderProfile: ps_3_0
  */
@@ -141,13 +152,11 @@ float4 main(float2 tex : TEXCOORD0) : COLOR
     const int geometry = (int)clamp({{geometry}}, 0.0, 1.0);
     const int quality = (int)clamp({{quality}}, 0.0, 3.0);
 
-    const float activeLeft = saturate({{active_left}});
-    const float activeTop = saturate({{active_top}});
-    const float activeRight = clamp({{active_right}}, activeLeft + 0.01, 1.0);
-    const float activeBottom = clamp({{active_bottom}}, activeTop + 0.01, 1.0);
-    const float2 activeMinimum = float2(activeLeft, activeTop);
-    const float2 activeMaximum = float2(activeRight, activeBottom);
-    const float2 activeSize = activeMaximum - activeMinimum;
+    // With madVR black-bar crop enabled, TEXCOORD0 is treated as the complete
+    // picture domain.  Do not re-apply VideoProcessor's original raster bounds
+    // here; those bounds remain upstream geometry metadata only.
+    const float2 pictureMinimum = float2(0.0, 0.0);
+    const float2 pictureMaximum = float2(1.0, 1.0);
 
     const bool safeFit = {{safe_fit}} >= 0.5;
     const bool safeFitVertical = {{safe_fit_axis}} >= 0.5;
@@ -165,22 +174,15 @@ float4 main(float2 tex : TEXCOORD0) : COLOR
             fittedTex.y = fittedCoordinate;
         else
             fittedTex.x = fittedCoordinate;
-        return tex2D(s0, float2(
-            lerp(activeLeft, activeRight, fittedTex.x),
-            lerp(activeTop, activeBottom, fittedTex.y)));
+        return tex2D(s0, saturate(fittedTex));
     }
 
-    const bool insideActivePicture =
-        tex.x >= activeLeft && tex.x <= activeRight &&
-        tex.y >= activeTop && tex.y <= activeBottom;
-    if (!insideActivePicture)
-        return tex2D(s0, tex);
+    float2 pictureTex = saturate(tex);
 
-    float2 activeTex = saturate((tex - activeMinimum) / activeSize);
-
-    // Public Envy guidance explicitly recommends crop first so less nonlinear
-    // stretch is required.  For this field-test preset, allow at most 5% crop
-    // per side and automatically reduce it when the target needs less.
+    // Crop first so less nonlinear correction is needed.  The crop is applied
+    // continuously to the whole shader domain, avoiding the old top/bottom
+    // discontinuity when horizontal crop was applied only inside stale raster
+    // active-picture bounds.
     float maximumUsefulSideCrop = 0.0;
     if (sourceWider && requestedRatio > 1.000001)
         maximumUsefulSideCrop = 0.5 * (1.0 - 1.0 / requestedRatio);
@@ -212,32 +214,31 @@ float4 main(float2 tex : TEXCOORD0) : COLOR
         clamp({{horizontal_center_protection}}, 0.0, 0.45);
     float verticalProtection =
         clamp({{vertical_center_protection}}, 0.0, 0.45);
-    float mappedX = NlsMapCoordinate(activeTex.x, xScale, curve,
+    float mappedX = NlsMapCoordinate(pictureTex.x, xScale, curve,
         geometry, horizontalProtection);
-    float mappedY = NlsMapCoordinate(activeTex.y, yScale, curve,
+    float mappedY = NlsMapCoordinate(pictureTex.y, yScale, curve,
         geometry, verticalProtection);
 
-    float croppedLeft = activeLeft + activeSize.x * sideCrop;
-    float croppedRight = activeRight - activeSize.x * sideCrop;
-    float2 sampleMinimum = float2(croppedLeft, activeTop);
-    float2 sampleMaximum = float2(croppedRight, activeBottom);
+    float croppedLeft = sideCrop;
+    float croppedRight = 1.0 - sideCrop;
+    float2 sampleMinimum = float2(croppedLeft, 0.0);
+    float2 sampleMaximum = float2(croppedRight, 1.0);
     float2 sampleTex = float2(
-        lerp(croppedLeft, croppedRight, mappedX),
-        lerp(activeTop, activeBottom, mappedY));
+        lerp(croppedLeft, croppedRight, mappedX), mappedY);
 
-    // The wider-content case still has its largest residual minification on
-    // the vertical axis; filter along that dominant axis.  Horizontal crop is
-    // a magnification, so it does not need an expensive second separable pass.
+    // The wider-content case has its largest residual minification on the
+    // vertical axis; filter along that dominant axis.  Horizontal crop is a
+    // magnification, so it does not need an expensive second separable pass.
     float footprint;
     float2 sampleAxis;
     if (sourceWider)
     {
-        footprint = max(abs(ddy(sampleTex.y)), abs(ddy(activeTex.y)));
-        sampleAxis = float2(0.0, activeSize.y);
+        footprint = max(abs(ddy(sampleTex.y)), abs(ddy(pictureTex.y)));
+        sampleAxis = float2(0.0, 1.0);
     }
     else
     {
-        footprint = max(abs(ddx(sampleTex.x)), abs(ddx(activeTex.x)));
+        footprint = max(abs(ddx(sampleTex.x)), abs(ddx(pictureTex.x)));
         sampleAxis = float2(croppedRight - croppedLeft, 0.0);
     }
 
