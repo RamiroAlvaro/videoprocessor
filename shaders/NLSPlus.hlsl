@@ -138,7 +138,7 @@ float4 FilterAlongAxis(float2 sampleTex, float2 sampleAxis, float footprint,
         min(min(c4, c5), min(c6, c7)));
     float4 neighborhoodMax = max(max(max(c0, c1), max(c2, c3)),
         max(max(c4, c5), max(c6, c7)));
-    return clamp(color, neighborhoodMin, neighborhoodMaximum);
+    return clamp(color, neighborhoodMin, neighborhoodMax);
 }
 
 float4 main(float2 tex : TEXCOORD0) : COLOR
