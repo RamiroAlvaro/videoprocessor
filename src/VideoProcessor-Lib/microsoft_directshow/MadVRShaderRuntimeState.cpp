@@ -19,41 +19,93 @@
 
 namespace
 {
+	bool TryParseRuntimeDouble(const std::string& raw, double minimum,
+		double maximum, double& value)
+	{
+		try
+		{
+			size_t consumed = 0;
+			const std::string text = ConfigFile::Trim(raw);
+			const double parsed = std::stod(text, &consumed);
+			if (consumed != text.size() || !std::isfinite(parsed) ||
+				parsed < minimum || parsed > maximum)
+				return false;
+			value = parsed;
+			return true;
+		}
+		catch (...)
+		{
+			return false;
+		}
+	}
+
+
 	bool TryConfiguredNlsTargetFill(const ConfigFile& config,
 		const std::string& section, double& fill)
 	{
 		std::string raw;
 		if (!config.TryGetString(section, "target_fill", raw))
 			return false;
-		try
-		{
-			size_t consumed = 0;
-			const std::string text = ConfigFile::Trim(raw);
-			const double parsed = std::stod(text, &consumed);
-			if (consumed == text.size() && std::isfinite(parsed) &&
-				parsed >= 0.50 && parsed <= 1.0)
-			{
-				fill = parsed;
-				return true;
-			}
-		}
-		catch (...)
-		{
-			// Validation owns the user-facing diagnostic. Runtime fail-open is
-			// intentionally the historical full-target NLS behavior.
-		}
-		return false;
+		return TryParseRuntimeDouble(raw, 0.50, 1.0, fill);
 	}
 
 
-	double ConfiguredNlsTargetFill(const std::string& effectiveRule)
+	struct RuntimeNlsPolicy
+	{
+		double tolerancePercent = 5.0;
+		double activeAspectMinimum = 0.0;
+		NlsAspectDirection direction = NlsAspectDirection::NARROWER_ONLY;
+		double maximumStretchRatio = NLS_DEFAULT_MAXIMUM_STRETCH_RATIO;
+	};
+
+
+	bool TryConfiguredNlsPolicy(const ConfigFile& config,
+		const std::string& section, RuntimeNlsPolicy& policy)
+	{
+		std::string raw;
+		if (!config.TryGetString(section, "shader_type", raw) ||
+			ConfigFile::NormalizeName(raw) != "nls")
+			return false;
+
+		RuntimeNlsPolicy parsed;
+		if (config.TryGetString(section, "tolerance_percent", raw) &&
+			!TryParseRuntimeDouble(raw, 0.0, 50.0, parsed.tolerancePercent))
+			return false;
+		if (config.TryGetString(section, "active_aspect_min", raw) &&
+			!TryParseRuntimeDouble(raw, 1.0, 4.0, parsed.activeAspectMinimum))
+			return false;
+		if (config.TryGetString(section, "max_stretch_ratio", raw) &&
+			!TryParseRuntimeDouble(raw, NLS_MINIMUM_STRETCH_RATIO,
+				NLS_SHADER_MAXIMUM_STRETCH_RATIO,
+				parsed.maximumStretchRatio))
+			return false;
+		if (config.TryGetString(section, "aspect_direction", raw))
+		{
+			const std::string direction = ConfigFile::NormalizeName(raw);
+			if (direction == "narrower_only")
+				parsed.direction = NlsAspectDirection::NARROWER_ONLY;
+			else if (direction == "wider_only")
+				parsed.direction = NlsAspectDirection::WIDER_ONLY;
+			else if (direction == "any")
+				parsed.direction = NlsAspectDirection::ANY;
+			else
+				return false;
+		}
+		policy = parsed;
+		return true;
+	}
+
+
+	template <typename Reader>
+	bool ResolveConfiguredNlsSection(const std::string& effectiveRule,
+		Reader&& reader)
 	{
 		if (effectiveRule.empty())
-			return 1.0;
+			return false;
 
 		ConfigFile config;
 		if (!config.Load())
-			return 1.0;
+			return false;
 
 		std::istringstream selectors(effectiveRule);
 		std::string selector;
@@ -63,20 +115,18 @@ namespace
 			if (selector.empty())
 				continue;
 
-			double fill = 1.0;
 			if (selector.rfind("@shader-key:", 0) != 0)
 			{
-				if (TryConfiguredNlsTargetFill(
-					config, "shader." + selector, fill))
-					return fill;
+				if (reader(config, "shader." + selector))
+					return true;
 				continue;
 			}
 
-			// Manual NLS selection reaches the runtime first as @shader-key:<key>.
-			// Resolve that key through the same shader sections instead of silently
-			// falling back to a full-screen target before the named rule is exposed.
-			const std::string key = ConfigFile::NormalizeName(
-				ConfigFile::Trim(selector.substr(std::string("@shader-key:").size())));
+			// Manual target-mode selection is stored as @shader-key:<key>. Resolve
+			// that key back to its shader section so runtime geometry can honor the
+			// same target_fill/aspect guards as an automatically selected rule.
+			const std::string key = ConfigFile::NormalizeName(ConfigFile::Trim(
+				selector.substr(std::string("@shader-key:").size())));
 			if (key.empty())
 				continue;
 			for (const std::string& section : config.GetSectionNames())
@@ -88,11 +138,89 @@ namespace
 					continue;
 				if (ConfigFile::NormalizeName(ConfigFile::Trim(shortcut)) != key)
 					continue;
-				if (TryConfiguredNlsTargetFill(config, section, fill))
-					return fill;
+				if (reader(config, section))
+					return true;
 			}
 		}
-		return 1.0;
+		return false;
+	}
+
+
+	double ConfiguredNlsTargetFill(const std::string& effectiveRule)
+	{
+		double fill = 1.0;
+		ResolveConfiguredNlsSection(effectiveRule,
+			[&fill](const ConfigFile& config, const std::string& section)
+			{
+				return TryConfiguredNlsTargetFill(config, section, fill);
+			});
+		return fill;
+	}
+
+
+	bool ConfiguredRuntimeNlsPolicy(const std::string& effectiveRule,
+		RuntimeNlsPolicy& policy)
+	{
+		return ResolveConfiguredNlsSection(effectiveRule,
+			[&policy](const ConfigFile& config, const std::string& section)
+			{
+				return TryConfiguredNlsPolicy(config, section, policy);
+			});
+	}
+
+
+	void RecalculateRuntimeNlsDecision(MadVRShaderRuntimeSnapshot& state)
+	{
+		if (state.nlsMode == MadVRNlsMappingMode::OFF)
+			return;
+		if (!state.activeGeometry.stable ||
+			!std::isfinite(state.activeGeometry.aspectRatio) ||
+			state.activeGeometry.aspectRatio <= 0.0 ||
+			!std::isfinite(state.nlsTargetAspect) || state.nlsTargetAspect <= 0.0)
+		{
+			state.nlsMode = MadVRNlsMappingMode::WAITING;
+			return;
+		}
+
+		RuntimeNlsPolicy policy;
+		if (!ConfiguredRuntimeNlsPolicy(state.effectiveRule, policy))
+			return;
+
+		// A stable picture below active_aspect_min is not "waiting" for geometry;
+		// it is an intentionally ineligible picture. Keep the NLS mode armed but
+		// present the source natively. This is critical for Smart 90: 16:9, 1.85,
+		// 1.90 and 2.00 must remain untouched while the same N selection stays on.
+		if (policy.activeAspectMinimum > 0.0 &&
+			state.activeGeometry.aspectRatio < policy.activeAspectMinimum)
+		{
+			MadVRNlsMappingDecision decision;
+			decision.mode = MadVRNlsMappingMode::LINEAR_PASSTHROUGH;
+			decision.sourceAspect = state.activeGeometry.aspectRatio;
+			decision.targetAspect = state.nlsTargetAspect;
+			decision.maximumRatio = policy.maximumStretchRatio;
+			decision.requestedRatio = std::max(
+				state.nlsTargetAspect / state.activeGeometry.aspectRatio,
+				state.activeGeometry.aspectRatio / state.nlsTargetAspect);
+			decision.reason =
+				"active picture is below the configured NLS minimum; preserving source geometry";
+			state.nlsDecision = decision;
+			state.nlsMode = decision.mode;
+			state.lastSafeNlsMode = decision.mode;
+			return;
+		}
+
+		MadVRNlsMappingDecision decision = EvaluateNlsMapping(true,
+			state.activeGeometry.aspectRatio, state.nlsTargetAspect,
+			policy.tolerancePercent, policy.activeAspectMinimum,
+			policy.direction, policy.maximumStretchRatio);
+		decision = ConstrainMadVRNlsMappingToGeometry(
+			decision, state.activeGeometry);
+		state.nlsDecision = decision;
+		state.nlsMode = decision.mode;
+		if (decision.mode == MadVRNlsMappingMode::ACTIVE ||
+			decision.mode == MadVRNlsMappingMode::LINEAR_PASSTHROUGH ||
+			decision.mode == MadVRNlsMappingMode::SAFE_FIT)
+			state.lastSafeNlsMode = decision.mode;
 	}
 }
 
@@ -300,6 +428,7 @@ void MadVRShaderRuntimeState::SetRuleSelection(
 	}
 	else
 		m_state.activeGeometry = {};
+	RecalculateRuntimeNlsDecision(m_state);
 }
 
 
@@ -317,6 +446,7 @@ void MadVRShaderRuntimeState::SetEffectiveRule(
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_state.effectiveRule = effectiveRule;
 	RecalculateNlsTargetAspectLocked();
+	RecalculateRuntimeNlsDecision(m_state);
 }
 
 
@@ -326,6 +456,7 @@ void MadVRShaderRuntimeState::SetNlsTargetAspect(double targetAspect)
 	m_physicalNlsTargetAspect = std::isfinite(targetAspect) &&
 		targetAspect >= 1.0 && targetAspect <= 4.0 ? targetAspect : 0.0;
 	RecalculateNlsTargetAspectLocked();
+	RecalculateRuntimeNlsDecision(m_state);
 }
 
 
@@ -350,5 +481,6 @@ bool MadVRShaderRuntimeState::SetActiveGeometry(
 	if (!valid)
 		return false;
 	m_state.activeGeometry = geometry;
+	RecalculateRuntimeNlsDecision(m_state);
 	return true;
 }
