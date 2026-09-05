@@ -356,13 +356,73 @@ MadVRShaderChainUpdatePlan ResolveMadVRShaderChainUpdatePlan(
 MadVRShaderRuntimeSnapshot MadVRShaderRuntimeState::GetSnapshot() const
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	ApplyConfiguredDefaultLocked();
 	return m_state;
+}
+
+
+void MadVRShaderRuntimeState::ApplyConfiguredDefaultLocked() const
+{
+	if (m_defaultSelectionInitialized)
+		return;
+	m_defaultSelectionInitialized = true;
+
+	// A real runtime selection always wins. The configured default is strictly
+	// a process-start baseline and must never reassert itself after an explicit
+	// Off (or any other manual selection).
+	if (!m_state.requestedRule.empty() || !m_state.effectiveRule.empty() ||
+		m_state.nlsMode != MadVRNlsMappingMode::OFF)
+		return;
+
+	ConfigFile config;
+	if (!config.Load())
+		return;
+
+	std::string shortcut;
+	if (!config.TryGetString("shader.nls", "default_shortcut", shortcut))
+		return;
+	shortcut = ConfigFile::Trim(shortcut);
+	if (shortcut.empty())
+		return;
+
+	const std::string normalizedShortcut = ConfigFile::NormalizeName(shortcut);
+	bool validNlsMember = false;
+	const std::string prefix = "shader.nls.";
+	for (const std::string& section : config.GetSectionNames())
+	{
+		if (section.rfind(prefix, 0) != 0)
+			continue;
+		const std::string member = section.substr(prefix.size());
+		if (member.empty() || member.find('.') != std::string::npos)
+			continue;
+
+		std::string memberShortcut;
+		std::string shaderType;
+		if (!config.TryGetString(section, "shortcut", memberShortcut) ||
+			!config.TryGetString(section, "shader_type", shaderType))
+			continue;
+		if (ConfigFile::NormalizeName(ConfigFile::Trim(memberShortcut)) ==
+				normalizedShortcut &&
+			ConfigFile::NormalizeName(shaderType) == "nls")
+		{
+			validNlsMember = true;
+			break;
+		}
+	}
+	if (!validNlsMember)
+		return;
+
+	const std::string selector = "@shader-key:" + shortcut;
+	m_state.requestedRule = selector;
+	m_state.effectiveRule = selector;
+	m_state.nlsMode = MadVRNlsMappingMode::WAITING;
 }
 
 
 bool MadVRShaderRuntimeState::PrepareNlsOutputContractRendererReplacement()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	ApplyConfiguredDefaultLocked();
 	m_preserveGeometryOnNextRenderer =
 		MadVRNlsOutputContractIsPrepared(m_state);
 	return m_preserveGeometryOnNextRenderer;
@@ -372,6 +432,7 @@ bool MadVRShaderRuntimeState::PrepareNlsOutputContractRendererReplacement()
 uint64_t MadVRShaderRuntimeState::BeginRendererGeneration()
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	ApplyConfiguredDefaultLocked();
 	++m_state.rendererGeneration;
 	if (m_preserveGeometryOnNextRenderer &&
 		m_state.activeGeometry.stable &&
@@ -413,6 +474,9 @@ void MadVRShaderRuntimeState::SetRuleSelection(
 	MadVRNlsMappingMode nlsMode)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!requestedRule.empty() || !effectiveRule.empty() ||
+		nlsMode != MadVRNlsMappingMode::OFF)
+		m_defaultSelectionInitialized = true;
 	m_state.requestedRule = requestedRule;
 	m_state.effectiveRule = effectiveRule;
 	RecalculateNlsTargetAspectLocked();
@@ -436,6 +500,8 @@ void MadVRShaderRuntimeState::SetRequestedRule(
 	const std::string& requestedRule)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!requestedRule.empty())
+		m_defaultSelectionInitialized = true;
 	m_state.requestedRule = requestedRule;
 }
 
@@ -444,6 +510,8 @@ void MadVRShaderRuntimeState::SetEffectiveRule(
 	const std::string& effectiveRule)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	if (!effectiveRule.empty())
+		m_defaultSelectionInitialized = true;
 	m_state.effectiveRule = effectiveRule;
 	RecalculateNlsTargetAspectLocked();
 	RecalculateRuntimeNlsDecision(m_state);
@@ -453,6 +521,7 @@ void MadVRShaderRuntimeState::SetEffectiveRule(
 void MadVRShaderRuntimeState::SetNlsTargetAspect(double targetAspect)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	ApplyConfiguredDefaultLocked();
 	m_physicalNlsTargetAspect = std::isfinite(targetAspect) &&
 		targetAspect >= 1.0 && targetAspect <= 4.0 ? targetAspect : 0.0;
 	RecalculateNlsTargetAspectLocked();
@@ -472,6 +541,7 @@ bool MadVRShaderRuntimeState::SetActiveGeometry(
 	const MadVRActivePictureGeometry& geometry)
 {
 	std::lock_guard<std::mutex> lock(m_mutex);
+	ApplyConfiguredDefaultLocked();
 	const bool valid = geometry.stable &&
 		geometry.rendererGeneration == m_state.rendererGeneration &&
 		std::isfinite(geometry.aspectRatio) && geometry.aspectRatio > 0.0 &&
