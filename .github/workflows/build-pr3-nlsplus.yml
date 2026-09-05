@@ -41,6 +41,43 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Apply Smart 90 presentation-state hotfix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = ".\src\VideoProcessor-Lib\microsoft_directshow\video_renderers\DirectShowGenericHDRVideoRenderer.cpp"
+          $text = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n")
+
+          # Selecting NLS must not resize the window from a stale configured target.
+          # Non-NLS selections still restore the native host immediately.
+          $oldSelect = "`tm_requestedRuleUsesNlsMapping = nlsMapping;`n`tApplyVideoWindowPlacement();`n"
+          $newSelect = "`tm_requestedRuleUsesNlsMapping = nlsMapping;`n`tif (!nlsMapping)`n`t`tApplyVideoWindowPlacement();`n"
+          $selectCount = ([regex]::Matches($text, [regex]::Escape($oldSelect))).Count
+          if ($selectCount -ne 1) { throw "Expected exactly one pre-decision placement call, found $selectCount" }
+          $text = $text.Replace($oldSelect, $newSelect)
+
+          # Once the active-picture decision is coherent, apply the windowed canvas
+          # from decision.targetAspect. This occurs both on manual selection and on
+          # later active-aspect refreshes (e.g. Scope <-> IMAX transitions).
+          $oldDecision = "`t`tm_nlsTargetAspect = decision.targetAspect;`n`t`tUpdateNlsOsdMode(decision.mode);`n"
+          $newDecision = "`t`tm_nlsTargetAspect = decision.targetAspect;`n`t`tUpdateNlsOsdMode(decision.mode);`n`t`tApplyVideoWindowPlacement();`n"
+          $decisionCount = ([regex]::Matches($text, [regex]::Escape($oldDecision))).Count
+          if ($decisionCount -ne 2) { throw "Expected two coherent NLS decision sites, found $decisionCount" }
+          $text = $text.Replace($oldDecision, $newDecision)
+
+          # A viewport/config update follows the same rule: NLS placement is deferred
+          # until RefreshShaderRule has recomputed ACTIVE vs PASSTHROUGH. Without an
+          # NLS request, native placement can be applied immediately.
+          $oldViewport = "`tMadVRShaderLoader::SetRuntimeNlsTargetAspect(m_nlsTargetAspect);`n`tApplyVideoWindowPlacement();`n"
+          $newViewport = "`tMadVRShaderLoader::SetRuntimeNlsTargetAspect(m_nlsTargetAspect);`n`tif (!m_requestedRuleUsesNlsMapping)`n`t`tApplyVideoWindowPlacement();`n"
+          $viewportCount = ([regex]::Matches($text, [regex]::Escape($oldViewport))).Count
+          if ($viewportCount -ne 1) { throw "Expected exactly one pre-refresh viewport placement call, found $viewportCount" }
+          $text = $text.Replace($oldViewport, $newViewport)
+
+          [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+          git diff --check
+          git diff -- $path
+
       - name: Install required Visual Studio components
         shell: pwsh
         run: |
@@ -151,7 +188,7 @@ jobs:
           VP_SHORT_SHA: ${{ steps.revision.outputs.short_sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          $zipName = "VideoProcessor-PR3-NLSPlus-$env:VP_SHORT_SHA-x64.zip"
+          $zipName = "VideoProcessor-PR3-NLSPlus-Smart90Fix-$env:VP_SHORT_SHA-x64.zip"
           Compress-Archive -Path .\artifacts\release\VideoProcessor\* -DestinationPath ".\$zipName" -Force
           "zip_name=$zipName" >> $env:GITHUB_OUTPUT
         id: zip
@@ -159,15 +196,16 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoProcessor-PR3-NLSPlus-${{ steps.revision.outputs.short_sha }}-x64
+          name: VideoProcessor-PR3-NLSPlus-Smart90Fix-${{ steps.revision.outputs.short_sha }}-x64
           path: ${{ steps.zip.outputs.zip_name }}
           retention-days: 14
 
       - name: Build summary
         shell: pwsh
         run: |
-          Add-Content $env:GITHUB_STEP_SUMMARY "## PR #3 NLS+ test build"
+          Add-Content $env:GITHUB_STEP_SUMMARY "## PR #3 NLS+ Smart 90 presentation test build"
           Add-Content $env:GITHUB_STEP_SUMMARY ""
           Add-Content $env:GITHUB_STEP_SUMMARY "- Branch: ``feature/nlsplus-madvr-partial-fill``"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Commit: ``${{ steps.revision.outputs.sha }}``"
-          Add-Content $env:GITHUB_STEP_SUMMARY "- Physical viewport remains 16:9; NLS+ target_fill defaults to 0.82 in the sample config."
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Includes runtime re-evaluation from 43d52ec plus a CI-applied presentation hotfix: windowed scope canvas is applied only after the coherent ACTIVE/PASSTHROUGH decision."
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Smart 90 keeps the physical viewport at 16:9 and uses the selected rule target_fill for Scope content."
