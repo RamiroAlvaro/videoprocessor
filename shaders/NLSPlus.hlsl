@@ -36,6 +36,15 @@
  * local inverse-map slope remains comfortably positive, so fold-over cannot
  * occur.
  *
+ * Quality-preserving adaptive prefilter:
+ * The expensive reconstruction kernel is required only where the nonlinear
+ * map locally MINIFIES the source.  Where the local Jacobian instead MAGNIFIES
+ * it, prefiltering cannot prevent aliasing and only spends texture bandwidth
+ * before madVR performs the final upscale.  Those pixels therefore use one
+ * native bilinear sample.  Neutral and minifying regions keep the exact same
+ * 6-tap medium-quality kernel as before.  This is an algorithmic fast path,
+ * not a lower-quality preset: no anti-minification filtering is removed.
+ *
  * IMPORTANT madVR coordinate contract:
  * With madVR hard-coded black-bar crop enabled, the external pre-resize shader
  * operates over the complete active-picture domain.  Do not re-apply the
@@ -206,7 +215,25 @@ float4 main(float2 tex : TEXCOORD0) : COLOR
     // on Y.  X is crop/magnification plus a small horizontal correction, so
     // retain the proven single-axis prefilter and avoid an unnecessary second
     // separable pass.
-    float footprint = max(abs(ddy(sampleTex.y)), abs(ddy(pictureTex.y)));
+    //
+    // Crucially, only invoke the expensive reconstruction kernel when the
+    // local Y Jacobian is neutral/minifying.  If warpedFootprint is smaller
+    // than the unwarped footprint, this pixel is being magnified: there is no
+    // source-frequency aliasing to suppress, so one native bilinear fetch is
+    // the correct reconstruction and preserves detail for madVR's later NGU
+    // scaling.  The 0.05% guard avoids numerical chatter around unity.
+    float baseFootprint = max(abs(ddy(pictureTex.y)), 0.000001);
+    float warpedFootprint = abs(ddy(sampleTex.y));
+    const float magnificationGuard = 0.9995;
+    if (quality == 0 ||
+        warpedFootprint <= baseFootprint * magnificationGuard)
+    {
+        return tex2D(s0, clamp(sampleTex, sampleMinimum, sampleMaximum));
+    }
+
+    // Neutral/minifying pixels keep the exact same footprint and quality
+    // kernel used by the previous Smart 90 build.
+    float footprint = max(warpedFootprint, baseFootprint);
     float2 sampleAxis = float2(0.0, 1.0);
 
     return FilterAlongAxis(sampleTex, sampleAxis, footprint,
