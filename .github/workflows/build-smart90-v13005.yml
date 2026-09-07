@@ -1,12 +1,12 @@
-name: Build v1.3.005 Smart90 package
+name: Build v1.3.005 Smart90 DisneyFix package
 
-run-name: Build v1.3.005 Smart90 package
+run-name: Build v1.3.005 Smart90 DisneyFix package
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - feature/nlsplus-smart90-v1.3.005
+      - fix/disney-eotf-restart-race-v1.3.005
 
 permissions:
   contents: read
@@ -17,10 +17,10 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout integration branch
+      - name: Checkout DisneyFix integration branch
         uses: actions/checkout@v4
         with:
-          ref: feature/nlsplus-smart90-v1.3.005
+          ref: fix/disney-eotf-restart-race-v1.3.005
           fetch-depth: 0
 
       - name: Verify base and diff hygiene
@@ -36,7 +36,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
           Write-Host "Repository : RamiroAlvaro/videoprocessor"
           Write-Host "Base       : origin/v1.3.005-beta"
-          Write-Host "Branch     : feature/nlsplus-smart90-v1.3.005"
+          Write-Host "Branch     : fix/disney-eotf-restart-race-v1.3.005"
           Write-Host "Commit     : $sha"
           "sha=$sha" >> $env:GITHUB_OUTPUT
           "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
@@ -109,7 +109,45 @@ jobs:
           $text = $text.Replace($oldViewport, $newViewport)
           [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
           git diff --check
-          if ($LASTEXITCODE -ne 0) { throw "Hotfix diff check failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Smart90 hotfix diff check failed" }
+
+      - name: Apply Disney Plus EOTF restart coalescing hotfix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = ".\src\VideoProcessor-GUI\VideoProcessorDlg.cpp"
+          $text = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n")
+          $old = "`t`t`tm_eotfCheckCooldownSeconds == 0 &&  // Cooldown expired`n`t`t`tm_captureDeviceVideoState &&`n"
+          $new = "`t`t`tm_eotfCheckCooldownSeconds == 0 &&  // Cooldown expired`n`t`t`tm_eotfChangeRestartCooldownSeconds < 0 &&  // Raw EOTF stabilization owns this transition`n`t`t`tm_captureDeviceVideoState &&`n"
+          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
+          if ($count -ne 1) { throw "Expected exactly one legacy EOTF polling detector, found $count" }
+          $text = $text.Replace($old, $new)
+          if (-not $text.Contains("m_eotfChangeRestartCooldownSeconds < 0 &&  // Raw EOTF stabilization owns this transition")) {
+            throw "Disney Plus EOTF coalescing guard was not applied"
+          }
+          [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Disney Plus hotfix diff check failed" }
+          Write-Host "Disney Plus EOTF coalescing guard applied: legacy capture-restart fallback is suppressed while the stabilized renderer restart is pending."
+
+      - name: Validate Disney Plus EOTF fix source contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = ".\src\VideoProcessor-GUI\VideoProcessorDlg.cpp"
+          $text = [System.IO.File]::ReadAllText($path)
+          $guard = "m_eotfChangeRestartCooldownSeconds < 0 &&  // Raw EOTF stabilization owns this transition"
+          $guardCount = ([regex]::Matches($text, [regex]::Escape($guard))).Count
+          if ($guardCount -ne 1) { throw "Expected one Disney Plus EOTF coalescing guard, found $guardCount" }
+          foreach ($required in @(
+            "EOTF change detected: %s -> %s - renderer restart in 3 seconds",
+            "m_eotfChangeRestartCooldownSeconds = 5;",
+            "SetTimer(EOTF_CHANGE_RESTART_TIMER_ID, 1000, nullptr)",
+            "m_wantToRestartCapture = true;"
+          )) {
+            if (-not $text.Contains($required)) { throw "EOTF lifecycle contract token missing: $required" }
+          }
+          Write-Host "EOTF lifecycle contract validated: stabilized renderer restart remains intact; only duplicate legacy escalation is gated."
 
       - name: Install required Visual Studio components
         shell: pwsh
@@ -183,7 +221,7 @@ jobs:
           if (-not $discovery) { throw "VideoProcessorConfigDiscovery.dll not found" }
           Copy-Item $discovery.FullName (Join-Path $buildRoot "VideoProcessorConfigDiscovery.dll") -Force
           Get-ChildItem $configDir -Filter "Qt6*.dll" -File | ForEach-Object { Copy-Item $_.FullName $buildRoot -Force }
-          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) { Copy-Item (Join-Path $configDir "opengl32sw.dll") $buildRoot -Force }
+          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) { Copy-Item (Join-Path $buildRoot "opengl32sw.dll") -Force }
           foreach ($dir in @("generic","iconengines","imageformats","networkinformation","platforms","styles","tls")) {
             $source = Join-Path $configDir $dir
             if (Test-Path $source) { Copy-Item $source (Join-Path $buildRoot $dir) -Recurse -Force }
@@ -224,24 +262,25 @@ jobs:
           VP_SHORT_SHA: ${{ steps.revision.outputs.short_sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          $zipName = "VideoProcessor-v1.3.005-beta-Smart90-$env:VP_SHORT_SHA-x64.zip"
+          $zipName = "VideoProcessor-v1.3.005-beta-Smart90-DisneyFix-$env:VP_SHORT_SHA-x64.zip"
           Compress-Archive -Path .\artifacts\release\VideoProcessor\* -DestinationPath ".\$zipName" -Force
           "zip_name=$zipName" >> $env:GITHUB_OUTPUT
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoProcessor-v1.3.005-beta-Smart90-${{ steps.revision.outputs.short_sha }}-x64
+          name: VideoProcessor-v1.3.005-beta-Smart90-DisneyFix-${{ steps.revision.outputs.short_sha }}-x64
           path: ${{ steps.zip.outputs.zip_name }}
           retention-days: 14
 
       - name: Build summary
         shell: pwsh
         run: |
-          Add-Content $env:GITHUB_STEP_SUMMARY "## VideoProcessor v1.3.005-beta + NLS+ Smart 90"
+          Add-Content $env:GITHUB_STEP_SUMMARY "## VideoProcessor v1.3.005-beta + NLS+ Smart 90 + Disney EOTF restart fix"
           Add-Content $env:GITHUB_STEP_SUMMARY ""
           Add-Content $env:GITHUB_STEP_SUMMARY "- Base: ``v1.3.005-beta``"
-          Add-Content $env:GITHUB_STEP_SUMMARY "- Branch: ``feature/nlsplus-smart90-v1.3.005``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Branch: ``fix/disney-eotf-restart-race-v1.3.005``"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Commit: ``${{ steps.revision.outputs.sha }}``"
-          Add-Content $env:GITHUB_STEP_SUMMARY "- Config duplicate-key guard: passed"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Smart90 config duplicate-key guard: passed"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Disney EOTF restart coalescing guard: passed"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Full x64 release ZIP uploaded as artifact"
