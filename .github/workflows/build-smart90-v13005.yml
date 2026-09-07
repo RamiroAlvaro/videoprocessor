@@ -221,7 +221,7 @@ jobs:
           if (-not $discovery) { throw "VideoProcessorConfigDiscovery.dll not found" }
           Copy-Item $discovery.FullName (Join-Path $buildRoot "VideoProcessorConfigDiscovery.dll") -Force
           Get-ChildItem $configDir -Filter "Qt6*.dll" -File | ForEach-Object { Copy-Item $_.FullName $buildRoot -Force }
-          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) { Copy-Item (Join-Path $buildRoot "opengl32sw.dll") -Force }
+          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) { Copy-Item (Join-Path $configDir "opengl32sw.dll") $buildRoot -Force }
           foreach ($dir in @("generic","iconengines","imageformats","networkinformation","platforms","styles","tls")) {
             $source = Join-Path $configDir $dir
             if (Test-Path $source) { Copy-Item $source (Join-Path $buildRoot $dir) -Recurse -Force }
