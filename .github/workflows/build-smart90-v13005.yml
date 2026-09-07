@@ -30,10 +30,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           $sha = git rev-parse HEAD
           $shortSha = git rev-parse --short HEAD
-          git merge-base --is-ancestor v1.3.005-beta HEAD
-          git diff --check v1.3.005-beta..HEAD
+          git merge-base --is-ancestor origin/v1.3.005-beta HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Branch is not based on v1.3.005-beta" }
+          git diff --check origin/v1.3.005-beta..HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
           Write-Host "Repository : RamiroAlvaro/videoprocessor"
-          Write-Host "Base       : v1.3.005-beta"
+          Write-Host "Base       : origin/v1.3.005-beta"
           Write-Host "Branch     : feature/nlsplus-smart90-v1.3.005"
           Write-Host "Commit     : $sha"
           "sha=$sha" >> $env:GITHUB_OUTPUT
@@ -66,7 +68,6 @@ jobs:
               $seen[$section][$key] = $lineNo
             }
           }
-
           $cfg = Get-Content $path -Raw
           foreach ($required in @(
             "default_shortcut: N",
@@ -74,8 +75,7 @@ jobs:
             "label: NLS+ Smart 90",
             "hlsl_file: NLSPlus.hlsl",
             "target_fill: 0.90",
-            "active_aspect_min: 2.30",
-            "shortcut: N"
+            "active_aspect_min: 2.30"
           )) {
             if (-not $cfg.Contains($required)) { throw "Missing Smart90 config token: $required" }
           }
@@ -92,27 +92,24 @@ jobs:
           $ErrorActionPreference = "Stop"
           $path = ".\src\VideoProcessor-Lib\microsoft_directshow\video_renderers\DirectShowGenericHDRVideoRenderer.cpp"
           $text = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n")
-
           $oldSelect = "`tm_requestedRuleUsesNlsMapping = nlsMapping;`n`tApplyVideoWindowPlacement();`n"
           $newSelect = "`tm_requestedRuleUsesNlsMapping = nlsMapping;`n`tif (!nlsMapping)`n`t`tApplyVideoWindowPlacement();`n"
           $selectCount = ([regex]::Matches($text, [regex]::Escape($oldSelect))).Count
           if ($selectCount -ne 1) { throw "Expected one pre-decision placement call, found $selectCount" }
           $text = $text.Replace($oldSelect, $newSelect)
-
           $oldDecision = "`t`tm_nlsTargetAspect = decision.targetAspect;`n`t`tUpdateNlsOsdMode(decision.mode);`n"
           $newDecision = "`t`tm_nlsTargetAspect = decision.targetAspect;`n`t`tUpdateNlsOsdMode(decision.mode);`n`t`tApplyVideoWindowPlacement();`n"
           $decisionCount = ([regex]::Matches($text, [regex]::Escape($oldDecision))).Count
           if ($decisionCount -ne 2) { throw "Expected two coherent NLS decision sites, found $decisionCount" }
           $text = $text.Replace($oldDecision, $newDecision)
-
           $oldViewport = "`tMadVRShaderLoader::SetRuntimeNlsTargetAspect(m_nlsTargetAspect);`n`tApplyVideoWindowPlacement();`n"
           $newViewport = "`tMadVRShaderLoader::SetRuntimeNlsTargetAspect(m_nlsTargetAspect);`n`tif (!m_requestedRuleUsesNlsMapping)`n`t`tApplyVideoWindowPlacement();`n"
           $viewportCount = ([regex]::Matches($text, [regex]::Escape($oldViewport))).Count
           if ($viewportCount -ne 1) { throw "Expected one pre-refresh viewport placement call, found $viewportCount" }
           $text = $text.Replace($oldViewport, $newViewport)
-
           [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
           git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Hotfix diff check failed" }
 
       - name: Install required Visual Studio components
         shell: pwsh
@@ -144,19 +141,27 @@ jobs:
 
       - name: Build VideoProcessor GUI x64 Release
         shell: pwsh
-        run: msbuild .\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+        run: |
+          $ErrorActionPreference = "Stop"
+          msbuild .\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
 
       - name: Build VP Renderer x64 Release
         shell: pwsh
-        run: msbuild .\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+        run: |
+          $ErrorActionPreference = "Stop"
+          msbuild .\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
 
       - name: Build Config Discovery x64 Release
         shell: pwsh
-        run: msbuild .\src\VideoProcessor-ConfigDiscovery\VideoProcessor-ConfigDiscovery.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+        run: |
+          $ErrorActionPreference = "Stop"
+          msbuild .\src\VideoProcessor-ConfigDiscovery\VideoProcessor-ConfigDiscovery.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
 
       - name: Build Config Editor x64 Release
         shell: pwsh
-        run: msbuild .\src\VideoProcessor-Config\VideoProcessor-Config.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+        run: |
+          $ErrorActionPreference = "Stop"
+          msbuild .\src\VideoProcessor-Config\VideoProcessor-Config.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
 
       - name: Prepare canonical build root
         shell: pwsh
@@ -165,29 +170,24 @@ jobs:
           $buildRoot = Join-Path $env:GITHUB_WORKSPACE "x64\Release"
           if (Test-Path $buildRoot) { Remove-Item $buildRoot -Recurse -Force }
           New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
-
           $gui = Get-ChildItem . -Filter "VideoProcessor-GUI.exe" -File -Recurse | Select-Object -First 1
           if (-not $gui) { $gui = Get-ChildItem . -Filter "VideoProcessor.exe" -File -Recurse | Select-Object -First 1 }
           if (-not $gui) { throw "VideoProcessor GUI executable not found" }
           Copy-Item $gui.FullName (Join-Path $buildRoot "VideoProcessor-GUI.exe") -Force
-
           $configExe = Get-ChildItem .\src\VideoProcessor-Config -Filter "VideoProcessorConfig.exe" -File -Recurse | Select-Object -First 1
           if (-not $configExe) { throw "VideoProcessorConfig.exe not found" }
           $configDir = $configExe.Directory.FullName
           Copy-Item $configExe.FullName (Join-Path $buildRoot "VideoProcessorConfig.exe") -Force
-
           $discovery = Get-ChildItem $configDir -Filter "VideoProcessorConfigDiscovery.dll" -File | Select-Object -First 1
           if (-not $discovery) { $discovery = Get-ChildItem .\src\VideoProcessor-ConfigDiscovery -Filter "VideoProcessorConfigDiscovery.dll" -File -Recurse | Select-Object -First 1 }
           if (-not $discovery) { throw "VideoProcessorConfigDiscovery.dll not found" }
           Copy-Item $discovery.FullName (Join-Path $buildRoot "VideoProcessorConfigDiscovery.dll") -Force
-
           Get-ChildItem $configDir -Filter "Qt6*.dll" -File | ForEach-Object { Copy-Item $_.FullName $buildRoot -Force }
           if (Test-Path (Join-Path $configDir "opengl32sw.dll")) { Copy-Item (Join-Path $configDir "opengl32sw.dll") $buildRoot -Force }
           foreach ($dir in @("generic","iconengines","imageformats","networkinformation","platforms","styles","tls")) {
             $source = Join-Path $configDir $dir
             if (Test-Path $source) { Copy-Item $source (Join-Path $buildRoot $dir) -Recurse -Force }
           }
-
           $renderer = Get-ChildItem . -Filter "VideoProcessorVPRenderer.dll" -File -Recurse | Select-Object -First 1
           if (-not $renderer) { throw "VideoProcessorVPRenderer.dll not found" }
           New-Item -ItemType Directory -Path (Join-Path $buildRoot "vprenderer") -Force | Out-Null
