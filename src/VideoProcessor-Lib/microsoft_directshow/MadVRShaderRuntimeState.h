@@ -99,7 +99,14 @@ public:
 	bool SetActiveGeometry(const MadVRActivePictureGeometry& geometry);
 
 private:
+	void ApplyConfiguredDefaultLocked() const;
+	void RecalculateNlsTargetAspectLocked();
 	mutable std::mutex m_mutex;
-	MadVRShaderRuntimeSnapshot m_state;
+	mutable MadVRShaderRuntimeSnapshot m_state;
+	mutable bool m_defaultSelectionInitialized = false;
+	// Keep the physical viewport target separate from the NLS-only target.
+	// This mirrors the existing project contract where screen presentation is
+	// owned by the viewport while NLS may use a different geometric target.
+	double m_physicalNlsTargetAspect = 0.0;
 	bool m_preserveGeometryOnNextRenderer = false;
 };

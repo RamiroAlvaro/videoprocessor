@@ -40,6 +40,7 @@ namespace
 		if (name == "curve") return Bounded(raw, 0.5, 4.0);
 		if (name == "axis_balance") return Bounded(raw, 0.0, 1.0);
 		if (name == "max_center_zoom") return Bounded(raw, 1.0, 1.25);
+		if (name == "target_fill") return Bounded(raw, 0.50, 1.0);
 		return false;
 	}
 
@@ -142,7 +143,7 @@ bool ShaderConfigValidation::Validate(const ConfigFile& config,
 		{
 			for (const char* rawName :
 				{ "strength", "geometry", "center_protection", "curve", "quality",
-				  "axis_balance", "max_center_zoom",
+				  "axis_balance", "max_center_zoom", "target_fill",
 				  "horizontal_center_protection",
 				  "vertical_center_protection" })
 			{
