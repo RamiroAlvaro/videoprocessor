@@ -1,6 +1,6 @@
-name: Build v1.3.005 Smart90 DisneyFix package
+name: Build v1.3.005 Smart90 DisneyFix2 package
 
-run-name: Build v1.3.005 Smart90 DisneyFix package
+run-name: Build v1.3.005 Smart90 DisneyFix2 package
 
 on:
   workflow_dispatch:
@@ -130,6 +130,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Disney Plus hotfix diff check failed" }
           Write-Host "Disney Plus EOTF coalescing guard applied: legacy capture-restart fallback is suppressed while the stabilized renderer restart is pending."
 
+      - name: Coalesce source-gap graph recovery during EOTF stabilization
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = ".\src\VideoProcessor-GUI\VideoProcessorDlg.cpp"
+          $text = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n")
+          $old = "`tRendererResetCoordinator::SelectedReset selected;`n`tif (m_rendererResetCoordinator->DrainReady(now, selected))`n`t{`n"
+          $new = "`tRendererResetCoordinator::SelectedReset selected;`n`tif (m_rendererResetCoordinator->DrainReady(now, selected))`n`t{`n`t`tif (m_eotfChangeRestartCooldownSeconds >= 0 &&`n`t`t`tselected.request.reason == RendererResetReason::SourceGapRecovery &&`n`t`t`tselected.request.scope == RendererResetScope::Graph)`n`t`t{`n`t`t`tDebugLog::Log(`n`t`t`t`t\"DirectShow source-gap recovery coalesced with pending EOTF renderer restart: \"`n`t`t`t`t\"request=%llu action=live-queue-only\",`n`t`t`t`tstatic_cast<unsigned long long>(selected.request.sequence));`n`t`t`tselected.request.scope = RendererResetScope::LiveQueue;`n`t`t}`n"
+          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
+          if ($count -ne 1) { throw "Expected exactly one reset coordinator drain entry point, found $count" }
+          $text = $text.Replace($old, $new)
+          [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Disney source-gap coalescing diff check failed" }
+          Write-Host "Source-gap graph recovery will use LiveQueue while an EOTF stabilization renderer restart is pending."
+
       - name: Validate Disney Plus EOTF fix source contract
         shell: pwsh
         run: |
@@ -138,16 +154,27 @@ jobs:
           $text = [System.IO.File]::ReadAllText($path)
           $guard = "m_eotfChangeRestartCooldownSeconds < 0 &&  // Raw EOTF stabilization owns this transition"
           $guardCount = ([regex]::Matches($text, [regex]::Escape($guard))).Count
-          if ($guardCount -ne 1) { throw "Expected one Disney Plus EOTF coalescing guard, found $guardCount" }
+          if ($guardCount -ne 1) { throw "Expected one Disney Plus legacy EOTF coalescing guard, found $guardCount" }
+          $sourceGapMarker = "DirectShow source-gap recovery coalesced with pending EOTF renderer restart: "
+          $sourceGapCount = ([regex]::Matches($text, [regex]::Escape($sourceGapMarker))).Count
+          if ($sourceGapCount -ne 1) { throw "Expected one Disney Plus source-gap coalescing guard, found $sourceGapCount" }
           foreach ($required in @(
             "EOTF change detected: %s -> %s - renderer restart in 3 seconds",
             "m_eotfChangeRestartCooldownSeconds = 5;",
             "SetTimer(EOTF_CHANGE_RESTART_TIMER_ID, 1000, nullptr)",
-            "m_wantToRestartCapture = true;"
+            "m_wantToRestartCapture = true;",
+            "selected.request.reason == RendererResetReason::SourceGapRecovery",
+            "selected.request.scope == RendererResetScope::Graph",
+            "selected.request.scope = RendererResetScope::LiveQueue;"
           )) {
-            if (-not $text.Contains($required)) { throw "EOTF lifecycle contract token missing: $required" }
+            if (-not $text.Contains($required)) { throw "EOTF/source-gap lifecycle contract token missing: $required" }
           }
-          Write-Host "EOTF lifecycle contract validated: stabilized renderer restart remains intact; only duplicate legacy escalation is gated."
+          $rendererPath = ".\src\VideoProcessor-Lib\microsoft_directshow\video_renderers\DirectShowVideoRenderer.cpp"
+          $rendererText = [System.IO.File]::ReadAllText($rendererPath)
+          if (-not $rendererText.Contains("void DirectShowVideoRenderer::ResetLiveQueue()")) {
+            throw "DirectShow LiveQueue reset implementation missing"
+          }
+          Write-Host "Disney transition contract validated: duplicate legacy restart gated, source-gap graph reset downgraded only while EOTF stabilization owns the transition, full stabilized renderer restart preserved."
 
       - name: Install required Visual Studio components
         shell: pwsh
@@ -262,25 +289,26 @@ jobs:
           VP_SHORT_SHA: ${{ steps.revision.outputs.short_sha }}
         run: |
           $ErrorActionPreference = "Stop"
-          $zipName = "VideoProcessor-v1.3.005-beta-Smart90-DisneyFix-$env:VP_SHORT_SHA-x64.zip"
+          $zipName = "VideoProcessor-v1.3.005-beta-Smart90-DisneyFix2-$env:VP_SHORT_SHA-x64.zip"
           Compress-Archive -Path .\artifacts\release\VideoProcessor\* -DestinationPath ".\$zipName" -Force
           "zip_name=$zipName" >> $env:GITHUB_OUTPUT
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VideoProcessor-v1.3.005-beta-Smart90-DisneyFix-${{ steps.revision.outputs.short_sha }}-x64
+          name: VideoProcessor-v1.3.005-beta-Smart90-DisneyFix2-${{ steps.revision.outputs.short_sha }}-x64
           path: ${{ steps.zip.outputs.zip_name }}
           retention-days: 14
 
       - name: Build summary
         shell: pwsh
         run: |
-          Add-Content $env:GITHUB_STEP_SUMMARY "## VideoProcessor v1.3.005-beta + NLS+ Smart 90 + Disney EOTF restart fix"
+          Add-Content $env:GITHUB_STEP_SUMMARY "## VideoProcessor v1.3.005-beta + NLS+ Smart 90 + Disney transition fix 2"
           Add-Content $env:GITHUB_STEP_SUMMARY ""
           Add-Content $env:GITHUB_STEP_SUMMARY "- Base: ``v1.3.005-beta``"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Branch: ``fix/disney-eotf-restart-race-v1.3.005``"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Commit: ``${{ steps.revision.outputs.sha }}``"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Smart90 config duplicate-key guard: passed"
-          Add-Content $env:GITHUB_STEP_SUMMARY "- Disney EOTF restart coalescing guard: passed"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Legacy EOTF duplicate restart guard: passed"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Source-gap/EOTF graph-reset coalescing guard: passed"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Full x64 release ZIP uploaded as artifact"
