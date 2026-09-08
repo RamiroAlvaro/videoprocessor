@@ -1,0 +1,211 @@
+name: Build PR3 NLS+ test
+
+run-name: Build PR3 NLS+ test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/nlsplus-madvr-partial-fill
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout PR3 branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/nlsplus-madvr-partial-fill
+          fetch-depth: 0
+
+      - name: Verify source revision
+        id: revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sha = git rev-parse HEAD
+          $shortSha = git rev-parse --short HEAD
+          Write-Host "Repository : RamiroAlvaro/videoprocessor"
+          Write-Host "Branch     : feature/nlsplus-madvr-partial-fill"
+          Write-Host "Commit     : $sha"
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply Smart 90 presentation-state hotfix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = ".\src\VideoProcessor-Lib\microsoft_directshow\video_renderers\DirectShowGenericHDRVideoRenderer.cpp"
+          $text = [System.IO.File]::ReadAllText($path).Replace("`r`n", "`n")
+
+          # Selecting NLS must not resize the window from a stale configured target.
+          # Non-NLS selections still restore the native host immediately.
+          $oldSelect = "`tm_requestedRuleUsesNlsMapping = nlsMapping;`n`tApplyVideoWindowPlacement();`n"
+          $newSelect = "`tm_requestedRuleUsesNlsMapping = nlsMapping;`n`tif (!nlsMapping)`n`t`tApplyVideoWindowPlacement();`n"
+          $selectCount = ([regex]::Matches($text, [regex]::Escape($oldSelect))).Count
+          if ($selectCount -ne 1) { throw "Expected exactly one pre-decision placement call, found $selectCount" }
+          $text = $text.Replace($oldSelect, $newSelect)
+
+          # Once the active-picture decision is coherent, apply the windowed canvas
+          # from decision.targetAspect. This occurs both on manual selection and on
+          # later active-aspect refreshes (e.g. Scope <-> IMAX transitions).
+          $oldDecision = "`t`tm_nlsTargetAspect = decision.targetAspect;`n`t`tUpdateNlsOsdMode(decision.mode);`n"
+          $newDecision = "`t`tm_nlsTargetAspect = decision.targetAspect;`n`t`tUpdateNlsOsdMode(decision.mode);`n`t`tApplyVideoWindowPlacement();`n"
+          $decisionCount = ([regex]::Matches($text, [regex]::Escape($oldDecision))).Count
+          if ($decisionCount -ne 2) { throw "Expected two coherent NLS decision sites, found $decisionCount" }
+          $text = $text.Replace($oldDecision, $newDecision)
+
+          # A viewport/config update follows the same rule: NLS placement is deferred
+          # until RefreshShaderRule has recomputed ACTIVE vs PASSTHROUGH. Without an
+          # NLS request, native placement can be applied immediately.
+          $oldViewport = "`tMadVRShaderLoader::SetRuntimeNlsTargetAspect(m_nlsTargetAspect);`n`tApplyVideoWindowPlacement();`n"
+          $newViewport = "`tMadVRShaderLoader::SetRuntimeNlsTargetAspect(m_nlsTargetAspect);`n`tif (!m_requestedRuleUsesNlsMapping)`n`t`tApplyVideoWindowPlacement();`n"
+          $viewportCount = ([regex]::Matches($text, [regex]::Escape($oldViewport))).Count
+          if ($viewportCount -ne 1) { throw "Expected exactly one pre-refresh viewport placement call, found $viewportCount" }
+          $text = $text.Replace($oldViewport, $newViewport)
+
+          [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+          git diff --check
+          git diff -- $path
+
+      - name: Install required Visual Studio components
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $installPath) { throw "Visual Studio installation not found" }
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $arguments = @(
+            "modify", "--installPath", "`"$installPath`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.MFC",
+            "--add", "Microsoft.VisualStudio.Component.Windows10SDK.19041",
+            "--add", "Microsoft.VisualStudio.Component.Windows11SDK.26100",
+            "--quiet", "--norestart"
+          )
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+            throw "Visual Studio Installer failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install Qt 6.8.3 for Config editor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\scripts\bootstrap-config-editor-qt.ps1
+
+      - name: Build VideoProcessor GUI x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          msbuild .\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+
+      - name: Build VP Renderer x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          msbuild .\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+
+      - name: Build Config Discovery x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          msbuild .\src\VideoProcessor-ConfigDiscovery\VideoProcessor-ConfigDiscovery.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+
+      - name: Build Config Editor x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          msbuild .\src\VideoProcessor-Config\VideoProcessor-Config.vcxproj /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+
+      - name: Prepare canonical build root
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $buildRoot = Join-Path $env:GITHUB_WORKSPACE "x64\Release"
+          if (Test-Path $buildRoot) { Remove-Item $buildRoot -Recurse -Force }
+          New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+          $gui = Get-ChildItem . -Filter "VideoProcessor-GUI.exe" -File -Recurse | Select-Object -First 1
+          if (-not $gui) { $gui = Get-ChildItem . -Filter "VideoProcessor.exe" -File -Recurse | Select-Object -First 1 }
+          if (-not $gui) { throw "VideoProcessor GUI executable not found" }
+          Copy-Item $gui.FullName (Join-Path $buildRoot "VideoProcessor-GUI.exe") -Force
+
+          $configExe = Get-ChildItem .\src\VideoProcessor-Config -Filter "VideoProcessorConfig.exe" -File -Recurse | Select-Object -First 1
+          if (-not $configExe) { throw "VideoProcessorConfig.exe not found" }
+          $configDir = $configExe.Directory.FullName
+          Copy-Item $configExe.FullName (Join-Path $buildRoot "VideoProcessorConfig.exe") -Force
+
+          $discovery = Get-ChildItem $configDir -Filter "VideoProcessorConfigDiscovery.dll" -File | Select-Object -First 1
+          if (-not $discovery) { $discovery = Get-ChildItem .\src\VideoProcessor-ConfigDiscovery -Filter "VideoProcessorConfigDiscovery.dll" -File -Recurse | Select-Object -First 1 }
+          if (-not $discovery) { throw "VideoProcessorConfigDiscovery.dll not found" }
+          Copy-Item $discovery.FullName (Join-Path $buildRoot "VideoProcessorConfigDiscovery.dll") -Force
+
+          Get-ChildItem $configDir -Filter "Qt6*.dll" -File | ForEach-Object { Copy-Item $_.FullName $buildRoot -Force }
+          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) { Copy-Item (Join-Path $configDir "opengl32sw.dll") $buildRoot -Force }
+          foreach ($dir in @("generic","iconengines","imageformats","networkinformation","platforms","styles","tls")) {
+            $source = Join-Path $configDir $dir
+            if (Test-Path $source) { Copy-Item $source (Join-Path $buildRoot $dir) -Recurse -Force }
+          }
+
+          $renderer = Get-ChildItem . -Filter "VideoProcessorVPRenderer.dll" -File -Recurse | Select-Object -First 1
+          if (-not $renderer) { throw "VideoProcessorVPRenderer.dll not found" }
+          New-Item -ItemType Directory -Path (Join-Path $buildRoot "vprenderer") -Force | Out-Null
+          Copy-Item $renderer.FullName (Join-Path $buildRoot "vprenderer\VideoProcessorVPRenderer.dll") -Force
+
+      - name: Build official release staging tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\tools\package_release.ps1
+
+      - name: Add PR3 NLSPlus HLSL to staging tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $shaderDir = ".\artifacts\release\VideoProcessor\shaders"
+          if (-not (Test-Path ".\shaders\NLSPlus.hlsl")) { throw "NLSPlus.hlsl is missing from PR3 branch" }
+          Copy-Item ".\shaders\NLSPlus.hlsl" (Join-Path $shaderDir "NLSPlus.hlsl") -Force
+          if (-not (Test-Path (Join-Path $shaderDir "NLSPlus.hlsl"))) { throw "NLSPlus.hlsl was not staged" }
+
+      - name: Create PR3 ZIP
+        shell: pwsh
+        env:
+          VP_SHORT_SHA: ${{ steps.revision.outputs.short_sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zipName = "VideoProcessor-PR3-NLSPlus-Smart90Fix-$env:VP_SHORT_SHA-x64.zip"
+          Compress-Archive -Path .\artifacts\release\VideoProcessor\* -DestinationPath ".\$zipName" -Force
+          "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+        id: zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoProcessor-PR3-NLSPlus-Smart90Fix-${{ steps.revision.outputs.short_sha }}-x64
+          path: ${{ steps.zip.outputs.zip_name }}
+          retention-days: 14
+
+      - name: Build summary
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_STEP_SUMMARY "## PR #3 NLS+ Smart 90 presentation test build"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Branch: ``feature/nlsplus-madvr-partial-fill``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Commit: ``${{ steps.revision.outputs.sha }}``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Includes runtime re-evaluation from 43d52ec plus a CI-applied presentation hotfix: windowed scope canvas is applied only after the coherent ACTIVE/PASSTHROUGH decision."
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Smart 90 keeps the physical viewport at 16:9 and uses the selected rule target_fill for Scope content."

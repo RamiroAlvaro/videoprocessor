@@ -1,0 +1,460 @@
+name: Build latest upstream VideoProcessor beta
+
+run-name: Build latest upstream VideoProcessor beta
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: billslack2/videoprocessor
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      # ------------------------------------------------------------
+      # Discover Bill's current active branch.
+      # ------------------------------------------------------------
+      - name: Detect latest upstream beta
+        id: upstream
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          Write-Host "Querying upstream repository:"
+          Write-Host "https://github.com/$env:UPSTREAM_REPOSITORY"
+
+          $repo = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/$env:UPSTREAM_REPOSITORY" `
+            -Headers $headers
+
+          $branch = $repo.default_branch
+
+          if ([string]::IsNullOrWhiteSpace($branch)) {
+            throw "Could not determine upstream default branch."
+          }
+
+          if ($branch -notmatch '^v\d+\.\d+\.\d+-beta$') {
+            throw "Upstream default branch '$branch' does not look like a VideoProcessor beta branch."
+          }
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Upstream active beta: $branch"
+          Write-Host "========================================"
+          Write-Host ""
+
+          "branch=$branch" >> $env:GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # Checkout Bill's repository directly.
+      #
+      # IMPORTANT:
+      # This does NOT build the source code from Ramiro's fork.
+      # The fork only hosts this GitHub Actions workflow.
+      # ------------------------------------------------------------
+      - name: Checkout latest upstream beta
+        uses: actions/checkout@v4
+        with:
+          repository: billslack2/videoprocessor
+          ref: ${{ steps.upstream.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Verify upstream source revision
+        id: revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $branch = "${{ steps.upstream.outputs.branch }}"
+          $sha = git rev-parse HEAD
+          $shortSha = git rev-parse --short HEAD
+          $subject = git log -1 --pretty=%s
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Repository : billslack2/videoprocessor"
+          Write-Host "Branch     : $branch"
+          Write-Host "Commit     : $sha"
+          Write-Host "Short SHA  : $shortSha"
+          Write-Host "Subject    : $subject"
+          Write-Host "========================================"
+          Write-Host ""
+
+          git remote -v
+          git status --short
+
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # Build environment
+      # ------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install required Visual Studio components
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          $installPath = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.Component.MSBuild `
+            -property installationPath
+
+          if (-not $installPath) {
+            throw "Visual Studio installation not found"
+          }
+
+          Write-Host "Visual Studio installation: $installPath"
+
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+
+          $arguments = @(
+            "modify",
+            "--installPath", "`"$installPath`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.MFC",
+            "--add", "Microsoft.VisualStudio.Component.Windows10SDK.19041",
+            "--add", "Microsoft.VisualStudio.Component.Windows11SDK.26100",
+            "--quiet",
+            "--norestart"
+          )
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList $arguments `
+            -Wait `
+            -PassThru
+
+          Write-Host "Visual Studio Installer exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+            throw "Visual Studio Installer failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Show MSBuild version
+        shell: pwsh
+        run: |
+          msbuild -version
+
+      # ------------------------------------------------------------
+      # Config editor dependencies
+      # ------------------------------------------------------------
+      - name: Install Qt 6.8.3 for Config editor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\scripts\bootstrap-config-editor-qt.ps1
+
+      # ------------------------------------------------------------
+      # Compile VideoProcessor
+      # ------------------------------------------------------------
+      - name: Build VideoProcessor GUI x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          msbuild .\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Build VP Renderer x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          msbuild .\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Build Config Discovery x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          msbuild .\src\VideoProcessor-ConfigDiscovery\VideoProcessor-ConfigDiscovery.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      - name: Build Config Editor x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          msbuild .\src\VideoProcessor-Config\VideoProcessor-Config.vcxproj `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /verbosity:minimal
+
+      # ------------------------------------------------------------
+      # Build canonical release directory
+      # ------------------------------------------------------------
+      - name: Prepare canonical build root
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $buildRoot = Join-Path $env:GITHUB_WORKSPACE "x64\Release"
+
+          if (Test-Path $buildRoot) {
+            Remove-Item $buildRoot -Recurse -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $buildRoot `
+            -Force | Out-Null
+
+          Write-Host "Finding VideoProcessor GUI..."
+
+          $gui = Get-ChildItem . `
+            -Filter "VideoProcessor-GUI.exe" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $gui) {
+            $gui = Get-ChildItem . `
+              -Filter "VideoProcessor.exe" `
+              -File `
+              -Recurse |
+              Select-Object -First 1
+          }
+
+          if (-not $gui) {
+            throw "VideoProcessor GUI executable not found"
+          }
+
+          Write-Host "GUI found:"
+          Write-Host $gui.FullName
+
+          Copy-Item `
+            $gui.FullName `
+            (Join-Path $buildRoot "VideoProcessor-GUI.exe") `
+            -Force
+
+          Write-Host ""
+          Write-Host "Finding Config editor..."
+
+          $configExe = Get-ChildItem .\src\VideoProcessor-Config `
+            -Filter "VideoProcessorConfig.exe" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $configExe) {
+            throw "VideoProcessorConfig.exe not found"
+          }
+
+          $configDir = $configExe.Directory.FullName
+
+          Write-Host "Config runtime directory:"
+          Write-Host $configDir
+
+          Copy-Item `
+            $configExe.FullName `
+            (Join-Path $buildRoot "VideoProcessorConfig.exe") `
+            -Force
+
+          Write-Host ""
+          Write-Host "Finding Config Discovery DLL..."
+
+          $discovery = Get-ChildItem $configDir `
+            -Filter "VideoProcessorConfigDiscovery.dll" `
+            -File |
+            Select-Object -First 1
+
+          if (-not $discovery) {
+            $discovery = Get-ChildItem .\src\VideoProcessor-ConfigDiscovery `
+              -Filter "VideoProcessorConfigDiscovery.dll" `
+              -File `
+              -Recurse |
+              Select-Object -First 1
+          }
+
+          if (-not $discovery) {
+            throw "VideoProcessorConfigDiscovery.dll not found"
+          }
+
+          Copy-Item `
+            $discovery.FullName `
+            (Join-Path $buildRoot "VideoProcessorConfigDiscovery.dll") `
+            -Force
+
+          Write-Host ""
+          Write-Host "Copying Qt runtime..."
+
+          Get-ChildItem $configDir `
+            -Filter "Qt6*.dll" `
+            -File |
+            ForEach-Object {
+              Copy-Item `
+                $_.FullName `
+                $buildRoot `
+                -Force
+            }
+
+          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) {
+            Copy-Item `
+              (Join-Path $configDir "opengl32sw.dll") `
+              $buildRoot `
+              -Force
+          }
+
+          $qtPluginDirs = @(
+            "generic",
+            "iconengines",
+            "imageformats",
+            "networkinformation",
+            "platforms",
+            "styles",
+            "tls"
+          )
+
+          foreach ($dir in $qtPluginDirs) {
+            $source = Join-Path $configDir $dir
+
+            if (Test-Path $source) {
+              Copy-Item `
+                $source `
+                (Join-Path $buildRoot $dir) `
+                -Recurse `
+                -Force
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Finding VP Renderer plugin..."
+
+          $renderer = Get-ChildItem . `
+            -Filter "VideoProcessorVPRenderer.dll" `
+            -File `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $renderer) {
+            throw "VideoProcessorVPRenderer.dll not found"
+          }
+
+          Write-Host "VP Renderer found:"
+          Write-Host $renderer.FullName
+
+          New-Item `
+            -ItemType Directory `
+            -Path (Join-Path $buildRoot "vprenderer") `
+            -Force | Out-Null
+
+          Copy-Item `
+            $renderer.FullName `
+            (Join-Path $buildRoot "vprenderer\VideoProcessorVPRenderer.dll") `
+            -Force
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Canonical build root"
+          Write-Host "========================================"
+
+          Get-ChildItem $buildRoot -Recurse |
+            Select-Object FullName
+
+      # ------------------------------------------------------------
+      # Use Bill's official packaging script from the checked-out
+      # upstream beta.
+      # ------------------------------------------------------------
+      - name: Build official release package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          .\tools\package_release.ps1
+
+      - name: Show official release tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-ChildItem `
+            .\artifacts\release\VideoProcessor `
+            -Recurse |
+            Select-Object FullName
+
+      # ------------------------------------------------------------
+      # ZIP name automatically follows Bill's current beta branch.
+      # Example:
+      # VideoProcessor-v1.3.003-beta-x64.zip
+      # ------------------------------------------------------------
+      - name: Create ZIP
+        shell: pwsh
+        env:
+          VP_BRANCH: ${{ steps.upstream.outputs.branch }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $zipName = "VideoProcessor-$($env:VP_BRANCH)-x64.zip"
+
+          Write-Host "Creating:"
+          Write-Host $zipName
+
+          Compress-Archive `
+            -Path .\artifacts\release\VideoProcessor\* `
+            -DestinationPath ".\$zipName" `
+            -Force
+
+      # ------------------------------------------------------------
+      # Upload ZIP to GitHub Actions.
+      # ------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoProcessor-${{ steps.upstream.outputs.branch }}-x64
+          path: VideoProcessor-${{ steps.upstream.outputs.branch }}-x64.zip
+          retention-days: 14
+
+      # ------------------------------------------------------------
+      # Final summary visible on the Actions run page.
+      # ------------------------------------------------------------
+      - name: Build summary
+        shell: pwsh
+        env:
+          VP_BRANCH: ${{ steps.upstream.outputs.branch }}
+          VP_SHA: ${{ steps.revision.outputs.sha }}
+          VP_SHORT_SHA: ${{ steps.revision.outputs.short_sha }}
+        run: |
+          Add-Content $env:GITHUB_STEP_SUMMARY "## VideoProcessor upstream build"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Repository: ``billslack2/videoprocessor``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Branch: ``$env:VP_BRANCH``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Commit: ``$env:VP_SHA``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Short SHA: ``$env:VP_SHORT_SHA``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Configuration: ``Release x64``"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Artifact: ``VideoProcessor-$env:VP_BRANCH-x64``"
