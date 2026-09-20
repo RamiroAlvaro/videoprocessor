@@ -1,0 +1,444 @@
+name: Build latest upstream VideoProcessor beta
+
+run-name: Build latest upstream VideoProcessor beta
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: billslack2/videoprocessor
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Detect and pin latest upstream beta
+        id: upstream
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $repo = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:UPSTREAM_REPOSITORY" -Headers $headers
+          $branch = $repo.default_branch
+
+          if ([string]::IsNullOrWhiteSpace($branch)) {
+            throw "Could not determine upstream default branch."
+          }
+          if ($branch -notmatch '^v\d+\.\d+\.\d+-beta$') {
+            throw "Upstream default branch '$branch' does not look like a VideoProcessor beta branch."
+          }
+
+          $branchInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:UPSTREAM_REPOSITORY/branches/$branch" -Headers $headers
+          $sha = $branchInfo.commit.sha
+
+          if ($sha -notmatch '^[0-9a-f]{40}$') {
+            throw "Could not pin upstream beta SHA."
+          }
+
+          Write-Host "========================================"
+          Write-Host "Upstream active beta: $branch"
+          Write-Host "Pinned upstream SHA : $sha"
+          Write-Host "========================================"
+
+          "branch=$branch" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short_sha=$($sha.Substring(0,8))" >> $env:GITHUB_OUTPUT
+
+      - name: Checkout pinned upstream beta
+        uses: actions/checkout@v4
+        with:
+          repository: billslack2/videoprocessor
+          ref: ${{ steps.upstream.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Verify upstream source revision
+        id: revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $expected = "${{ steps.upstream.outputs.sha }}"
+          $branch = "${{ steps.upstream.outputs.branch }}"
+          $sha = git rev-parse HEAD
+          $shortSha = git rev-parse --short HEAD
+          $subject = git log -1 --pretty=%s
+
+          if ($sha -ne $expected) {
+            throw "Pinned checkout mismatch. Expected $expected but got $sha"
+          }
+
+          Write-Host "========================================"
+          Write-Host "Repository : billslack2/videoprocessor"
+          Write-Host "Branch     : $branch"
+          Write-Host "Commit     : $sha"
+          Write-Host "Short SHA  : $shortSha"
+          Write-Host "Subject    : $subject"
+          Write-Host "========================================"
+
+          if (git status --porcelain) {
+            throw "Upstream checkout is not clean before the build."
+          }
+
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short_sha=$shortSha" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install required Visual Studio components
+        id: vs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+          $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+
+          if (-not $installPath) {
+            throw "Visual Studio installation not found"
+          }
+
+          Write-Host "Visual Studio installation: $installPath"
+
+          $installer = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vs_installer.exe"
+          $arguments = @(
+            "modify",
+            "--installPath", $installPath,
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.x86.x64",
+            "--add", "Microsoft.VisualStudio.Component.VC.14.29.16.11.MFC",
+            "--add", "Microsoft.VisualStudio.Component.Windows10SDK.19041",
+            "--add", "Microsoft.VisualStudio.Component.Windows11SDK.26100",
+            "--quiet",
+            "--norestart"
+          )
+
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          Write-Host "Visual Studio Installer exit code: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+            throw "Visual Studio Installer failed with exit code $($process.ExitCode)"
+          }
+
+          "install_path=$installPath" >> $env:GITHUB_OUTPUT
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Show MSBuild version
+        shell: pwsh
+        run: msbuild -version
+
+      - name: Install Qt 6.8.3 for Config editor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\scripts\bootstrap-config-editor-qt.ps1
+
+      - name: Download and verify Microsoft VC++ x64 Redistributable
+        id: vcredist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vcRedist = Join-Path $env:RUNNER_TEMP "vc_redist.x64.exe"
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile $vcRedist -UseBasicParsing
+
+          . .\packaging\prerequisites\runtime-common.ps1
+          $manifest = Get-Content .\packaging\release-manifest.json -Raw | ConvertFrom-Json
+          $minimum = [version]$manifest.vcRuntime.minimumVersion
+          $version = Assert-VpRedistributable -FilePath $vcRedist -MinimumVersion $minimum
+
+          Write-Host "VC Redistributable verified: $version"
+          Write-Host "Required minimum          : $minimum"
+          "path=$vcRedist" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build VideoProcessor GUI x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $args = @(".\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj", "/m", "/p:Configuration=Release", "/p:Platform=x64", "/p:ImportDirectoryBuildTargets=false", "/verbosity:minimal")
+          & msbuild @args
+          if ($LASTEXITCODE -ne 0) { throw "GUI build failed." }
+
+      - name: Build VP Renderer x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $args = @(".\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj", "/m", "/p:Configuration=Release", "/p:Platform=x64", "/p:ImportDirectoryBuildTargets=false", "/verbosity:minimal")
+          & msbuild @args
+          if ($LASTEXITCODE -ne 0) { throw "VP Renderer build failed." }
+
+      - name: Build Config Discovery x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $args = @(".\src\VideoProcessor-ConfigDiscovery\VideoProcessor-ConfigDiscovery.vcxproj", "/m", "/p:Configuration=Release", "/p:Platform=x64", "/p:ImportDirectoryBuildTargets=false", "/verbosity:minimal")
+          & msbuild @args
+          if ($LASTEXITCODE -ne 0) { throw "Config Discovery build failed." }
+
+      - name: Build Config Editor x64 Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $args = @(".\src\VideoProcessor-Config\VideoProcessor-Config.vcxproj", "/m", "/p:Configuration=Release", "/p:Platform=x64", "/p:ImportDirectoryBuildTargets=false", "/verbosity:minimal")
+          & msbuild @args
+          if ($LASTEXITCODE -ne 0) { throw "Config Editor build failed." }
+
+      - name: Record runtime metadata with PowerShell 7
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Find-One([string]$name, [string]$under) {
+            $items = @(Get-ChildItem $under -Filter $name -File -Recurse)
+            if ($items.Count -ne 1) {
+              throw "Expected exactly one $name under $under, found $($items.Count)."
+            }
+            return $items[0]
+          }
+
+          function Get-ToolsetVersion([string]$project) {
+            $args = @($project, "/nologo", "/p:Configuration=Release", "/p:Platform=x64", "/p:ImportDirectoryBuildTargets=false", "-getProperty:VCToolsVersion")
+            $output = @(& msbuild @args)
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not query VCToolsVersion for $project"
+            }
+
+            $versions = @($output | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+\.\d+\.\d+(\.\d+)?$' })
+            if ($versions.Count -lt 1) {
+              throw "No VCToolsVersion returned for $project. Output: $($output -join ' | ')"
+            }
+            return $versions[-1]
+          }
+
+          function Record-One([string]$project, [System.IO.FileInfo]$binary) {
+            $toolset = Get-ToolsetVersion $project
+            Write-Host "Runtime metadata: $($binary.FullName)"
+            Write-Host "Toolset version : $toolset"
+
+            & pwsh -NoProfile -File .\tools\record_runtime_requirement.ps1 -BinaryPath $binary.FullName -ToolsetVersion $toolset
+            if ($LASTEXITCODE -ne 0) {
+              throw "Runtime metadata generation failed for $($binary.Name)"
+            }
+
+            if (-not (Test-Path -LiteralPath ($binary.FullName + ".runtime.json"))) {
+              throw "Runtime metadata sidecar missing for $($binary.Name)"
+            }
+          }
+
+          $gui = Find-One "VideoProcessor-GUI.exe" ".\src\VideoProcessor-GUI"
+          $renderer = Find-One "VideoProcessorVPRenderer.dll" ".\src\VideoProcessor-VPRenderer"
+          $discovery = Find-One "VideoProcessorConfigDiscovery.dll" ".\src\VideoProcessor-ConfigDiscovery"
+          $config = Find-One "VideoProcessorConfig.exe" ".\src\VideoProcessor-Config"
+
+          Record-One ".\src\VideoProcessor-GUI\VideoProcessor-GUI.vcxproj" $gui
+          Record-One ".\src\VideoProcessor-VPRenderer\VideoProcessor-VPRenderer.vcxproj" $renderer
+          Record-One ".\src\VideoProcessor-ConfigDiscovery\VideoProcessor-ConfigDiscovery.vcxproj" $discovery
+          Record-One ".\src\VideoProcessor-Config\VideoProcessor-Config.vcxproj" $config
+
+      - name: Build native test suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $args = @(".\src\VideoProcessor-Test\VideoProcessor-Test.vcxproj.vcxproj", "/m", "/p:Configuration=Release", "/p:Platform=x64", "/p:ImportDirectoryBuildTargets=false", "/verbosity:minimal")
+          & msbuild @args
+          if ($LASTEXITCODE -ne 0) { throw "Native test build failed." }
+
+      - name: Run native test suite
+        shell: pwsh
+        env:
+          VS_INSTALL_PATH: ${{ steps.vs.outputs.install_path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vstest = Join-Path $env:VS_INSTALL_PATH "Common7\IDE\CommonExtensions\Microsoft\TestWindow\vstest.console.exe"
+          if (-not (Test-Path -LiteralPath $vstest)) {
+            throw "vstest.console.exe not found: $vstest"
+          }
+
+          $testDll = Get-ChildItem . -Filter "VideoProcessor-Test.dll" -File -Recurse | Select-Object -First 1
+          if (-not $testDll) {
+            throw "VideoProcessor-Test.dll not found."
+          }
+
+          & $vstest $testDll.FullName /Platform:x64
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native VideoProcessor tests failed."
+          }
+
+      - name: Run crop log analyzer tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m unittest discover -s tools -p test_analyze_crop_log.py
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python crop analyzer tests failed."
+          }
+
+      - name: Prepare canonical build root
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $buildRoot = Join-Path $env:GITHUB_WORKSPACE "x64\Release"
+          if (Test-Path $buildRoot) {
+            Remove-Item $buildRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+
+          function Find-One([string]$name, [string]$under) {
+            $items = @(Get-ChildItem $under -Filter $name -File -Recurse)
+            if ($items.Count -ne 1) {
+              throw "Expected exactly one $name under $under, found $($items.Count)."
+            }
+            return $items[0]
+          }
+
+          function Copy-BinaryAndRuntime([System.IO.FileInfo]$source, [string]$destination) {
+            $destParent = Split-Path -Parent $destination
+            if ($destParent -and -not (Test-Path $destParent)) {
+              New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+            }
+
+            Copy-Item $source.FullName $destination -Force
+
+            $sidecar = $source.FullName + ".runtime.json"
+            if (-not (Test-Path -LiteralPath $sidecar)) {
+              throw "Missing runtime sidecar for $($source.FullName)"
+            }
+            Copy-Item $sidecar ($destination + ".runtime.json") -Force
+          }
+
+          $gui = Find-One "VideoProcessor-GUI.exe" ".\src\VideoProcessor-GUI"
+          $configExe = Find-One "VideoProcessorConfig.exe" ".\src\VideoProcessor-Config"
+          $discovery = Find-One "VideoProcessorConfigDiscovery.dll" ".\src\VideoProcessor-ConfigDiscovery"
+          $renderer = Find-One "VideoProcessorVPRenderer.dll" ".\src\VideoProcessor-VPRenderer"
+
+          Copy-BinaryAndRuntime $gui (Join-Path $buildRoot "VideoProcessor-GUI.exe")
+          Copy-BinaryAndRuntime $configExe (Join-Path $buildRoot "VideoProcessorConfig.exe")
+          Copy-BinaryAndRuntime $discovery (Join-Path $buildRoot "VideoProcessorConfigDiscovery.dll")
+          Copy-BinaryAndRuntime $renderer (Join-Path $buildRoot "vprenderer\VideoProcessorVPRenderer.dll")
+
+          $configDir = $configExe.Directory.FullName
+
+          Get-ChildItem $configDir -Filter "Qt6*.dll" -File | ForEach-Object {
+            Copy-Item $_.FullName $buildRoot -Force
+          }
+
+          if (Test-Path (Join-Path $configDir "opengl32sw.dll")) {
+            Copy-Item (Join-Path $configDir "opengl32sw.dll") $buildRoot -Force
+          }
+
+          foreach ($dir in @("generic", "iconengines", "imageformats", "networkinformation", "platforms", "styles", "tls")) {
+            $source = Join-Path $configDir $dir
+            if (Test-Path $source) {
+              Copy-Item $source (Join-Path $buildRoot $dir) -Recurse -Force
+            }
+          }
+
+          Write-Host "Canonical build root:"
+          Get-ChildItem $buildRoot -Recurse | Select-Object FullName
+
+      - name: Run runtime packaging regression tests
+        shell: pwsh
+        env:
+          VC_REDIST_PATH: ${{ steps.vcredist.outputs.path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\tools\test_runtime_packaging.ps1 -VcRedistPath $env:VC_REDIST_PATH
+          if ($LASTEXITCODE -ne 0) {
+            throw "Runtime packaging regression tests failed."
+          }
+
+      - name: Build official release package
+        shell: pwsh
+        env:
+          VC_REDIST_PATH: ${{ steps.vcredist.outputs.path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\tools\package_release.ps1 -VcRedistPath $env:VC_REDIST_PATH
+
+      - name: Verify official release tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $releaseRoot = ".\artifacts\release\VideoProcessor"
+          if (-not (Test-Path $releaseRoot)) {
+            throw "Official release root was not created."
+          }
+
+          $files = @(Get-ChildItem $releaseRoot -Recurse -File)
+          if ($files.Count -lt 1) {
+            throw "Official release package is empty."
+          }
+
+          Write-Host "Release contains $($files.Count) files."
+          $files | Select-Object FullName
+
+      - name: Create ZIP
+        id: zip
+        shell: pwsh
+        env:
+          VP_BRANCH: ${{ steps.upstream.outputs.branch }}
+          VP_SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $zipName = "VideoProcessor-$($env:VP_BRANCH)-$($env:VP_SHORT_SHA)-x64.zip"
+          Compress-Archive -Path .\artifacts\release\VideoProcessor\* -DestinationPath ".\$zipName" -Force
+
+          $hash = (Get-FileHash -LiteralPath ".\$zipName" -Algorithm SHA256).Hash
+          Write-Host "ZIP    : $zipName"
+          Write-Host "SHA256 : $hash"
+
+          "name=$zipName" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoProcessor-${{ steps.upstream.outputs.branch }}-${{ steps.upstream.outputs.short_sha }}-x64
+          path: ${{ steps.zip.outputs.name }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Build summary
+        shell: pwsh
+        env:
+          VP_BRANCH: ${{ steps.upstream.outputs.branch }}
+          VP_SHA: ${{ steps.upstream.outputs.sha }}
+          VP_SHORT_SHA: ${{ steps.upstream.outputs.short_sha }}
+          ZIP_NAME: ${{ steps.zip.outputs.name }}
+          ZIP_SHA256: ${{ steps.zip.outputs.sha256 }}
+          VC_REDIST_VERSION: ${{ steps.vcredist.outputs.version }}
+        run: |
+          Add-Content $env:GITHUB_STEP_SUMMARY "## VideoProcessor upstream build"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Repository: billslack2/videoprocessor"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Branch: $env:VP_BRANCH"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Commit: $env:VP_SHA"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Short SHA: $env:VP_SHORT_SHA"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Configuration: Release x64"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Native tests: PASS"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Crop analyzer tests: PASS"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Runtime packaging tests: PASS"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- VC++ Redistributable: $env:VC_REDIST_VERSION"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- ZIP: $env:ZIP_NAME"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- ZIP SHA-256: $env:ZIP_SHA256"
