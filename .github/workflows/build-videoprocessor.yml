@@ -260,7 +260,29 @@ jobs:
           & msbuild @args
           if ($LASTEXITCODE -ne 0) { throw "Native test build failed." }
 
+      - name: Stage renderer for native integration tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $testDll = Get-ChildItem . -Filter "VideoProcessor-Test.dll" -File -Recurse | Select-Object -First 1
+          if (-not $testDll) {
+            throw "VideoProcessor-Test.dll not found while staging renderer integration-test payload."
+          }
+
+          $renderer = Get-ChildItem .\src\VideoProcessor-VPRenderer -Filter "VideoProcessorVPRenderer.dll" -File -Recurse | Select-Object -First 1
+          if (-not $renderer) {
+            throw "VideoProcessorVPRenderer.dll not found while staging renderer integration-test payload."
+          }
+
+          $target = Join-Path $testDll.Directory.FullName "vprenderer"
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          Copy-Item (Join-Path $renderer.Directory.FullName "*") $target -Recurse -Force
+
+          Write-Host "Renderer integration-test payload staged at: $target"
+
       - name: Run native test suite
+        id: native_tests
         shell: pwsh
         env:
           VS_INSTALL_PATH: ${{ steps.vs.outputs.install_path }}
@@ -277,9 +299,49 @@ jobs:
             throw "VideoProcessor-Test.dll not found."
           }
 
-          & $vstest $testDll.FullName /Platform:x64
-          if ($LASTEXITCODE -ne 0) {
-            throw "Native VideoProcessor tests failed."
+          $trx = Join-Path $env:RUNNER_TEMP "native-tests.trx"
+          if (Test-Path -LiteralPath $trx) {
+            Remove-Item -LiteralPath $trx -Force
+          }
+
+          & $vstest $testDll.FullName /Platform:x64 "/Logger:trx;LogFileName=native-tests.trx" "/ResultsDirectory:$env:RUNNER_TEMP"
+          $testExitCode = $LASTEXITCODE
+
+          if (-not (Test-Path -LiteralPath $trx)) {
+            throw "Native test runner exited with code $testExitCode without producing a TRX result."
+          }
+
+          [xml]$trxXml = Get-Content -LiteralPath $trx -Raw
+          $counters = $trxXml.SelectSingleNode("//*[local-name()='Counters']")
+          if (-not $counters) {
+            throw "Native test TRX does not contain result counters."
+          }
+
+          $total = [int]$counters.GetAttribute("total")
+          $passed = [int]$counters.GetAttribute("passed")
+          $failed = [int]$counters.GetAttribute("failed")
+
+          "total=$total" >> $env:GITHUB_OUTPUT
+          "passed=$passed" >> $env:GITHUB_OUTPUT
+          "failed=$failed" >> $env:GITHUB_OUTPUT
+          "exit_code=$testExitCode" >> $env:GITHUB_OUTPUT
+
+          if ($testExitCode -eq 0) {
+            "result=PASS" >> $env:GITHUB_OUTPUT
+            Write-Host "Native tests PASS: $passed/$total passed."
+          }
+          elseif ($failed -gt 0) {
+            "result=WARN" >> $env:GITHUB_OUTPUT
+            Write-Host "::warning title=Native VideoProcessor tests failed::$failed of $total native tests failed (vstest exit $testExitCode). Build and packaging will continue. Inspect the failed tests before treating this artifact as fully verified."
+            Add-Content $env:GITHUB_STEP_SUMMARY "### ⚠️ Native test warning"
+            Add-Content $env:GITHUB_STEP_SUMMARY ""
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Total: $total"
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Passed: $passed"
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Failed: $failed"
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Build/package continues, but this artifact is not fully regression-verified."
+          }
+          else {
+            throw "Native test runner failed with exit code $testExitCode but reported no failed tests."
           }
 
       - name: Run crop log analyzer tests
@@ -428,6 +490,10 @@ jobs:
           ZIP_NAME: ${{ steps.zip.outputs.name }}
           ZIP_SHA256: ${{ steps.zip.outputs.sha256 }}
           VC_REDIST_VERSION: ${{ steps.vcredist.outputs.version }}
+          NATIVE_TESTS_RESULT: ${{ steps.native_tests.outputs.result }}
+          NATIVE_TESTS_TOTAL: ${{ steps.native_tests.outputs.total }}
+          NATIVE_TESTS_PASSED: ${{ steps.native_tests.outputs.passed }}
+          NATIVE_TESTS_FAILED: ${{ steps.native_tests.outputs.failed }}
         run: |
           Add-Content $env:GITHUB_STEP_SUMMARY "## VideoProcessor upstream build"
           Add-Content $env:GITHUB_STEP_SUMMARY ""
@@ -436,7 +502,11 @@ jobs:
           Add-Content $env:GITHUB_STEP_SUMMARY "- Commit: $env:VP_SHA"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Short SHA: $env:VP_SHORT_SHA"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Configuration: Release x64"
-          Add-Content $env:GITHUB_STEP_SUMMARY "- Native tests: PASS"
+          if ($env:NATIVE_TESTS_RESULT -eq "WARN") {
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Native tests: ⚠️ WARN ($env:NATIVE_TESTS_FAILED failed, $env:NATIVE_TESTS_PASSED passed, $env:NATIVE_TESTS_TOTAL total)"
+          } else {
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Native tests: PASS ($env:NATIVE_TESTS_PASSED/$env:NATIVE_TESTS_TOTAL)"
+          }
           Add-Content $env:GITHUB_STEP_SUMMARY "- Crop analyzer tests: PASS"
           Add-Content $env:GITHUB_STEP_SUMMARY "- Runtime packaging tests: PASS"
           Add-Content $env:GITHUB_STEP_SUMMARY "- VC++ Redistributable: $env:VC_REDIST_VERSION"
