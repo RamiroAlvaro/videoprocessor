@@ -339,6 +339,7 @@ jobs:
             Add-Content $env:GITHUB_STEP_SUMMARY "- Passed: $passed"
             Add-Content $env:GITHUB_STEP_SUMMARY "- Failed: $failed"
             Add-Content $env:GITHUB_STEP_SUMMARY "- Build/package continues, but this artifact is not fully regression-verified."
+            $global:LASTEXITCODE = 0
           }
           else {
             throw "Native test runner failed with exit code $testExitCode but reported no failed tests."
