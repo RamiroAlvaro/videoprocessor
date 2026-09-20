@@ -4,6 +4,9 @@ run-name: Build latest upstream VideoProcessor beta
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - v1.3.005-beta
 
 permissions:
   contents: read
