@@ -131,6 +131,8 @@ public:
 		uint64_t detectorFrameNumber);
 	void BreakContinuity(uint64_t detectorFrameNumber);
 	void InvalidateLookaheadPolicy(bool resetPartialEvidence = false);
+	// Withdraw obsolete crop authority without discarding queued source frames.
+	void InvalidateGeometryForReacquisition();
 	bool TrackLookaheadEvidence(
 		const ActivePictureFrameIdentity& identity,
 		const ActivePictureObservation& observation,
@@ -154,6 +156,11 @@ public:
 		ActivePictureFrameDecision& published,
 		const ActivePicturePresentationIntent& presentation = {});
 
+	// Before stamping a buffered certificate, every contributing identity must
+	// still be pending in the same current source-continuity generation.
+	bool CanProveBufferedFrames(const ActivePictureFrameIdentity* identities,
+		size_t count) const;
+	uint64_t ContinuityGeneration() const { return m_continuityGeneration; }
 	uint64_t TransportGeneration() const { return m_transportGeneration; }
 	uint64_t LastConsumedSequence() const { return m_lastConsumedSequence; }
 

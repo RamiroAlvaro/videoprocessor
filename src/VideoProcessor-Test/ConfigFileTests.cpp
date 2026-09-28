@@ -7,6 +7,8 @@
 #include <ModernOperatorLayout.h>
 #include <ModernOperatorStatusPolicy.h>
 #include <ConfigFile.h>
+#include <ActiveProfileStatus.h>
+#include <PPMCorrectionLoader.h>
 #include <ColorOutputProfileMigration.h>
 #include <ConfigurationLiveApply.h>
 #include <ConfigurationApplyPolicy.h>
@@ -947,17 +949,66 @@ namespace VideoProcessorTest
 				ShouldConsumeRestartForFreshRenderer(false, false));
 		}
 
-		TEST_METHOD(AutoFrameOffsetWaitsForUsableCaptureMode)
-		{
-			Assert::IsFalse(ConfigurationLiveApply::
-				HasUsableCaptureModeForAutoOffset(false, false, false));
-			Assert::IsFalse(ConfigurationLiveApply::
-				HasUsableCaptureModeForAutoOffset(true, false, true));
-			Assert::IsFalse(ConfigurationLiveApply::
-				HasUsableCaptureModeForAutoOffset(true, true, false));
-			Assert::IsTrue(ConfigurationLiveApply::
-				HasUsableCaptureModeForAutoOffset(true, true, true));
-		}
+        TEST_METHOD(FrameOffsetAutoAndOmissionUseStableDefault)
+        {
+            for (const char* raw : { "", "auto", "0", "90", "135" })
+            {
+                bool automatic = false;
+                int ms = -1;
+                Assert::IsTrue(ConfigurationLiveApply::ParseFrameOffset(raw, automatic, ms));
+                const bool isAuto = std::string(raw).empty() || std::string(raw) == "auto";
+                Assert::AreEqual(isAuto, automatic);
+                Assert::AreEqual(isAuto ? 90 : std::stoi(raw), ms);
+            }
+            Assert::AreEqual(90, ConfigurationLiveApply::AutomaticFrameOffsetMs(false));
+            Assert::AreEqual(0, ConfigurationLiveApply::AutomaticFrameOffsetMs(true));
+            for (const char* raw : { "-1", "90oops", "2147483648" })
+            {
+                bool automatic = true; int ms = 90;
+                Assert::IsFalse(ConfigurationLiveApply::ParseFrameOffset(raw, automatic, ms));
+                Assert::IsTrue(automatic); Assert::AreEqual(90, ms);
+            }
+        }
+
+        TEST_METHOD(NamedBaseIdentityAndRootCollision)
+        {
+            for (const char* root : { "vprenderer", "vprenderer.color" })
+            {
+                CachedConfigTestFile file;
+                const std::string setting = std::string(root) == "vprenderer" ? "quality: fast\n" : "output_range: limited\n";
+                std::ofstream(file.path) << "[" << root << ".BaSe]\n" << setting
+                    << "[" << root << ".Child]\n" << setting;
+                ConfigFile config; Assert::IsTrue(config.Load(file.path));
+                RendererProfileConfig::Model model; std::string error;
+                Assert::IsTrue(RendererProfileConfig::Read(config, model, error), std::wstring(error.begin(),error.end()).c_str());
+                Assert::AreEqual((std::string(root)+".base").c_str(),
+                    ActiveProfileStatus::SectionFor(root, "base", &config).c_str());
+                Assert::AreEqual((std::string(root)+".base").c_str(),
+                    ProfileSectionIdentity::Resolve(config,root,"BASE").c_str());
+                std::ofstream(file.path) << "[" << root << "]\n" << setting << "[" << root << ".Base]\n" << setting;
+                Assert::IsTrue(config.Load(file.path, ConfigFile::ReadPolicy::Fresh));
+                Assert::IsFalse(RendererProfileConfig::Read(config, model, error));
+                Assert::IsTrue(error.find("rename") != std::string::npos);
+            }
+        }
+
+        TEST_METHOD(PpmNumericSentinelDoesNotEnableAutomaticMode)
+        {
+            for (const char* raw : { "auto", "999999", "0", "-12" })
+            {
+                CachedConfigTestFile file;
+                std::ofstream(file.path) << "[directshow.ppm]\nppm: " << raw << "\n";
+                ConfigFile config; Assert::IsTrue(config.Load(file.path));
+                PPMCorrectionLoader loader; Assert::IsTrue(loader.LoadCorrections(config));
+                for (double rate : { 23.976, 50.0, 59.94 })
+                {
+                    const bool automatic = std::string(raw) == "auto";
+                    Assert::AreEqual(automatic, loader.IsAutomatic(rate));
+                    Assert::AreEqual(automatic ? 0 : std::stoi(raw), loader.GetPPMCorrection(rate));
+                }
+                loader.Clear(); Assert::IsFalse(loader.IsAutomatic(60));
+            }
+        }
 
 		TEST_METHOD(OmittedHardwareSelectionsUseFirstDiscoveredValues)
 		{
@@ -2850,6 +2901,141 @@ namespace VideoProcessorTest
 			Assert::IsTrue(coalescer.Claim(colorIdentity, newColor));
 		}
 
+
+        TEST_METHOD(ScreenIntentSurvivesRunningProfileScript)
+        {
+            for (const auto event : { "profile.viewport.changed", "profile.zoom.changed",
+                "profile.color.changed", "profile.queue.changed", "profile.nls.changed" })
+                Assert::IsFalse(EventActionLauncher::IsProfileActionFeedback(true, event, "manual"));
+        }
+
+        TEST_METHOD(RenderingFeedbackRemainsSuppressedDuringScriptOnly)
+        {
+            Assert::IsTrue(EventActionLauncher::IsProfileActionFeedback(true,
+                "profile.display.changed", "manual"));
+            Assert::IsFalse(EventActionLauncher::IsProfileActionFeedback(false,
+                "profile.display.changed", "manual"));
+            Assert::IsFalse(EventActionLauncher::IsProfileActionFeedback(true,
+                "profile.display.changed", "cycle"));
+            Assert::IsFalse(EventActionLauncher::IsProfileActionFeedback(true,
+                "renderer.ready", "renderer_ready"));
+        }
+
+        TEST_METHOD(DelayedActionCannotClaimReusedGenerationAfterCompletion)
+        {
+            EventActionLauncher::PendingActionCoalescer queue;
+            const auto stale = queue.Schedule("screen-state");
+            const auto settled = queue.Schedule("screen-state");
+            Assert::IsTrue(queue.Claim("screen-state", settled));
+            const auto latest = queue.Schedule("screen-state");
+            Assert::IsFalse(queue.Claim("screen-state", stale));
+            Assert::IsTrue(queue.Claim("screen-state", latest));
+        }
+
+        TEST_METHOD(CanceledActionCannotClaimNewSelectionAfterReload)
+        {
+            EventActionLauncher::PendingActionCoalescer queue;
+            const auto canceled = queue.Schedule("renderer-nits");
+            queue.CancelAll();
+            const auto current = queue.Schedule("renderer-nits");
+            Assert::IsFalse(queue.Claim("renderer-nits", canceled));
+            Assert::IsTrue(queue.Claim("renderer-nits", current));
+        }
+
+
+        TEST_METHOD(ScopeActionSurvivesOldRenderingFeedbackAndRepeatedSelections)
+        {
+            char directory[MAX_PATH] = {};
+            Assert::IsTrue(GetTempPathA(ARRAYSIZE(directory), directory) > 0);
+            const std::string path = std::string(directory) + "VP-action-latest-regression.cfg";
+            {
+                std::ofstream file(path);
+                file << "[vprenderer.rec709_169]\nshortcut: Q\nsdr_target_nits: 113\n"
+                    "[vprenderer.rec709_scope]\nshortcut: Ctrl+Q\nsdr_target_nits: 117\n"
+                    "[vprenderer.viewport.wide]\nlabel: 16x9\nshortcut: F3\nscreen_aspect: 16:9\n"
+                    "[vprenderer.viewport.scope]\nlabel: Scope\nshortcut: F2\nscreen_aspect: 2.35:1\n"
+                    "[actions.screen_wide]\non: profile.viewport.changed\n"
+                    "when: ${screen_config} == \"16x9\"\ncoalesce_role: screen-state\n"
+                    "run: C:\\Windows\\System32\\cmd.exe /c exit 0\n"
+                    "[actions.screen_scope]\non: profile.viewport.changed\n"
+                    "when: ${screen_config} == \"Scope\"\ncoalesce_role: screen-state\n"
+                    "run: C:\\Windows\\System32\\cmd.exe /c exit 0\n"
+                    "[actions.rendering_feedback]\non: profile.display.changed\n"
+                    "run: C:\\Windows\\System32\\cmd.exe /c exit 0\n"
+                    "[actions.generic_feedback]\non: state.committed\n"
+                    "run: C:\\Windows\\System32\\cmd.exe /c exit 0\n";
+            }
+            ConfigFile config;
+            Assert::IsTrue(config.Load(path));
+            UnifiedProfileRuntime::Runtime runtime;
+            std::string error;
+            const auto source = [](const std::string&, std::string&) { return false; };
+            Assert::IsTrue(runtime.Initialize(config, source, error),
+                std::wstring(error.begin(), error.end()).c_str());
+            UnifiedProfileRuntime::SelectionResult selected;
+            Assert::IsTrue(runtime.SelectKey("Ctrl+Q", source, selected, error));
+            EventActionLauncher::PendingActionCoalescer queue;
+            for (int cycle = 0; cycle < 3; ++cycle)
+            {
+                Assert::IsTrue(runtime.SelectKey("F3", source, selected, error));
+                const auto old = queue.Schedule("screen-state");
+                Assert::IsTrue(queue.Claim("screen-state", old)); // 16:9 script running
+                Assert::IsTrue(runtime.SelectKey("F2", source, selected, error));
+                Assert::AreEqual("scope", selected.snapshot->viewport.profile.c_str());
+                const auto scope = std::find_if(selected.actions.begin(), selected.actions.end(),
+                    [](const auto& a) { return a.action.name == "screen_scope"; });
+                Assert::IsTrue(scope != selected.actions.end());
+                Assert::IsFalse(EventActionLauncher::IsProfileActionFeedback(true, scope->event, scope->reason));
+                const auto latest = queue.Schedule("screen-state");
+                Assert::IsTrue(runtime.SelectKey("Q", source, selected, error)); // old script's key
+                Assert::IsFalse(selected.actions.empty());
+                Assert::IsTrue(EventActionLauncher::IsRenderingSelectionFeedback(true, selected.selections, false));
+                Assert::IsTrue(std::any_of(selected.actions.begin(), selected.actions.end(),
+                    [](const auto& a) { return a.event == "state.committed"; }));
+                Assert::IsTrue(queue.Claim("screen-state", latest)); // queued Scope still runs
+                Assert::IsTrue(runtime.SelectKey("Ctrl+Q", source, selected, error));
+                Assert::AreEqual("scope", selected.snapshot->viewport.profile.c_str());
+                Assert::IsTrue(runtime.SelectKey("Ctrl+Q", source, selected, error));
+                Assert::IsFalse(selected.changed);
+                Assert::IsTrue(selected.actions.empty()); // idempotent script does not loop
+            }
+            DeleteFileA(path.c_str());
+        }
+
+        TEST_METHOD(CoalescerReportsOnlyActualPendingReplacement)
+        {
+            EventActionLauncher::PendingActionCoalescer queue;
+            bool replaced = true;
+            const auto first = queue.Schedule("screen", &replaced);
+            Assert::IsFalse(replaced);
+            const auto next = queue.Schedule("screen", &replaced);
+            Assert::IsTrue(replaced);
+            Assert::IsFalse(queue.Claim("screen", first));
+            Assert::IsTrue(queue.Claim("screen", next));
+            const auto fresh = queue.Schedule("screen", &replaced);
+            Assert::IsFalse(replaced);
+            const auto color = queue.Schedule("color", &replaced);
+            Assert::IsFalse(replaced);
+            Assert::IsTrue(queue.Claim("color", color));
+            Assert::IsTrue(queue.Claim("screen", fresh));
+        }
+
+        TEST_METHOD(RenderingFeedbackClassificationKeepsMixedAndCycleSelections)
+        {
+            std::vector<RendererProfileConfig::KeySelection> selection(1);
+            selection[0].group = "display";
+            Assert::IsTrue(EventActionLauncher::IsRenderingSelectionFeedback(true, selection, false));
+            Assert::IsFalse(EventActionLauncher::IsRenderingSelectionFeedback(false, selection, false));
+            Assert::IsFalse(EventActionLauncher::IsRenderingSelectionFeedback(true, selection, true));
+            selection.emplace_back();
+            selection.back().group = "viewport";
+            Assert::IsFalse(EventActionLauncher::IsRenderingSelectionFeedback(true, selection, false));
+            selection.erase(selection.begin());
+            Assert::IsFalse(EventActionLauncher::IsRenderingSelectionFeedback(true, selection, false));
+            selection.clear();
+            Assert::IsFalse(EventActionLauncher::IsRenderingSelectionFeedback(true, selection, false));
+        }
+
 		TEST_METHOD(ProfileActionCircuitBreakerBoundsRecursiveLaunches)
 		{
 			using Decision = EventActionLauncher::ProfileActionCircuitBreaker::Decision;
@@ -3028,15 +3214,15 @@ namespace VideoProcessorTest
 
 		TEST_METHOD(ProfileChangeDisplayDurationIsBoundedAndLive)
 		{
-			char temporaryDirectory[MAX_PATH] = {};
-			Assert::IsTrue(GetTempPathA(ARRAYSIZE(temporaryDirectory),
-				temporaryDirectory) > 0);
-			const std::string path = std::string(temporaryDirectory) +
-				"VideoProcessor-profile-display-duration-test.cfg";
+			CachedConfigTestFile temporaryFile;
+			const auto& path = temporaryFile.path;
 			{
 				std::ofstream file(path, std::ios::out | std::ios::trunc);
+				Assert::IsTrue(file.is_open());
 				file << "[general]\nprofile_change_display_seconds: 60\n"
 					"[vprenderer]\nquality: high\n";
+				file.close();
+				Assert::IsFalse(file.fail());
 			}
 			ConfigFile config;
 			Assert::IsTrue(config.Load(path));
@@ -3047,14 +3233,21 @@ namespace VideoProcessorTest
 					{ "general", "profile_change_display_seconds" }));
 			{
 				std::ofstream file(path, std::ios::out | std::ios::trunc);
+				Assert::IsTrue(file.is_open());
 				file << "[general]\nprofile_change_display_seconds: 61\n"
 					"[vprenderer]\nquality: high\n";
+				file.close();
+				Assert::IsFalse(file.fail());
 			}
-			Assert::IsTrue(config.Load(path));
+			// Explicit reload validation uses Fresh in production; a same-length
+			// edit must not depend on filesystem timestamp resolution in this test.
+			Assert::IsTrue(config.Load(path, ConfigFile::ReadPolicy::Fresh));
+			std::string reloadedDuration;
+			Assert::IsTrue(config.TryGetString("general", "profile_change_display_seconds", reloadedDuration));
+			Assert::AreEqual(std::string("61"), reloadedDuration);
 			Assert::IsFalse(MainConfigSchema::Validate(config, error));
 			Assert::IsTrue(error.find("profile_change_display_seconds") !=
 				std::string::npos, std::wstring(error.begin(), error.end()).c_str());
-			DeleteFileA(path.c_str());
 		}
 
 		TEST_METHOD(EventActionArgumentsExpandAllSupportedValues)
@@ -3938,7 +4131,7 @@ namespace VideoProcessorTest
 				{ "vprenderer.color.bt2020", "F6" },
 				{ "vprenderer.viewport.viewport_16x9", "F3" },
 				{ "vprenderer.viewport.scope", "F2" },
-				{ "shader.nls", "N" },
+				{ "shader.nls.off", "N" },
 				{ "shader.nls.standard", "Shift+N" },
 				{ "shader.nls.protected", "Shift+P" }
 			};
@@ -4281,6 +4474,59 @@ namespace VideoProcessorTest
 			Assert::IsTrue(offSelection.front().none);
 			Assert::IsTrue(activeSections.empty());
 			DeleteFileA(statePath.c_str());
+			DeleteFileA(path.c_str());
+		}
+
+		TEST_METHOD(Vp0159ShaderProfilesResolveRootBaseSelection)
+		{
+			char temporaryDirectory[MAX_PATH] = {};
+			Assert::IsTrue(GetTempPathA(
+				ARRAYSIZE(temporaryDirectory), temporaryDirectory) > 0);
+			const std::string path = std::string(temporaryDirectory) +
+				"VideoProcessor-vp0159-root-base-selection.cfg";
+			{
+				std::ofstream file(path, std::ios::out | std::ios::trunc);
+				file << "[shader.nls]\n"
+					"[shader.nls.standard]\n"
+					"shader_type: nls\n"
+					"glsl_file: NLS.glsl\n"
+					"[shader.nls.plus]\n"
+					"shader_type: nls\n"
+					"glsl_file: NLSPlus.glsl\n"
+					"[shader.standard]\n"
+					"type: multi\n";
+			}
+
+			ConfigFile config;
+			Assert::IsTrue(config.Load(path));
+			std::string error;
+			Assert::IsTrue(ShaderConfigValidation::Validate(config, error),
+				std::wstring(error.begin(), error.end()).c_str());
+			std::vector<ConfiguredShaderRule> selection;
+			std::vector<std::string> activeSections;
+			Assert::IsTrue(MadVRShaderLoader::ResolveConfiguredRuleSelection(
+				config, "@shader-profiles:nls.plus|standard.base",
+				ShaderRendererBackend::LIBPLACEBO, selection, activeSections,
+				error), std::wstring(error.begin(), error.end()).c_str());
+			Assert::AreEqual(static_cast<size_t>(1), selection.size());
+			Assert::IsTrue(selection.front().nls);
+			Assert::AreEqual("NLSPlus.glsl", selection.front().filename.c_str());
+			Assert::AreEqual(static_cast<size_t>(2), activeSections.size());
+			Assert::AreEqual("shader.nls.plus", activeSections[0].c_str());
+			Assert::AreEqual("shader.standard", activeSections[1].c_str());
+			selection.clear();
+			activeSections.clear();
+			error.clear();
+			Assert::IsTrue(MadVRShaderLoader::ResolveConfiguredRuleSelection(
+				config, "@shader-profiles:nls.standard|standard.base",
+				ShaderRendererBackend::LIBPLACEBO, selection, activeSections,
+				error), std::wstring(error.begin(), error.end()).c_str());
+			Assert::AreEqual(static_cast<size_t>(1), selection.size());
+			Assert::IsTrue(selection.front().nls);
+			Assert::AreEqual("NLS.glsl", selection.front().filename.c_str());
+			Assert::AreEqual(static_cast<size_t>(2), activeSections.size());
+			Assert::AreEqual("shader.nls.standard", activeSections[0].c_str());
+			Assert::AreEqual("shader.standard", activeSections[1].c_str());
 			DeleteFileA(path.c_str());
 		}
 

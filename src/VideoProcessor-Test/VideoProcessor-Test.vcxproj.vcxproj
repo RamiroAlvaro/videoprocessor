@@ -176,6 +176,22 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="VideoFrameFormatterTests.cpp" />
+    <ClCompile Include="MovingPictureTransitionTests.cpp" />
+    <ClCompile Include="LookaheadOutwardProofTests.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="PictureTransitionHandoffTests.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="FitLookaheadDiagnosticTests.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="PresentationEnvelopeCompositionTests.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="NearBlackNativeBoundaryRecoveryTests.cpp">
+      <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="AlphaSourceCropPolicyTests.cpp">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
     </ClCompile>
@@ -220,10 +236,21 @@
     <ClCompile Include="RendererPostStallResetAdvisorTests.cpp" />
     <ClCompile Include="MadVRShaderRuntimeStateTests.cpp" />
     <ClCompile Include="ActivePictureDecisionTimelineTests.cpp" />
+    <ClCompile Include="FullRasterLookaheadTests.cpp" />
     <ClCompile Include="LibplaceboPluginProxyTests.cpp" />
     <ClCompile Include="ActivePictureTransitionModelTests.cpp" />
 	<ClCompile Include="ActivePictureAnalyzerTests.cpp" />
     <ClCompile Include="ActivePictureEvidenceTests.cpp" />
+    <ClCompile Include="LocalBoundaryDiagnosticsTests.cpp" />
+    <ClCompile Include="LocalBoundaryRefinementTests.cpp" />
+    <ClCompile Include="SparseEntryEpisodeRecoveryTests.cpp" />
+    <ClCompile Include="LocalBoundaryAnchorDiagnosticsTests.cpp" />
+    <ClCompile Include="SparseBoundaryCropExperimentTests.cpp" />
+    <ClCompile Include="SparseBoundaryTransitionExperimentTests.cpp" />
+    <ClCompile Include="SidePictureDiagnosticsTests.cpp" />
+    <ClCompile Include="DimSideCompositionGuardTests.cpp" />
+    <ClCompile Include="OpposingBoundaryDiagnosticsTests.cpp" />
+    <ClCompile Include="InwardCaptionEvidenceTests.cpp" />
     <ClCompile Include="FullRasterColorEvidenceFormatTests.cpp" />
 	<ClCompile Include="InvalidCaptureStateGraceTests.cpp" />
 	<ClCompile Include="EotfTransitionStabilizerTests.cpp" />
@@ -266,4 +293,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+  <ItemGroup>
+    <ClCompile Include="RememberedEdgeReturnTests.cpp"></ClCompile>
+  </ItemGroup>
 </Project>

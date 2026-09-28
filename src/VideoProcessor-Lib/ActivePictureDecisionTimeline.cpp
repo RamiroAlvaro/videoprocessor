@@ -184,13 +184,23 @@ bool IsExactInwardActivePictureAssociationGeometry(
 	const ActivePictureTransitionDecision& transition,
 	ActivePictureClassification classification)
 {
+	// An established full raster has no bar axis. It is also a valid inward
+	// reference, but only as an exact raster, never a provisional inset.
+	const auto& base = transition.stableBounds;
+	const bool fullRasterBase = base.trustedBarAxes == ActivePictureBounds::BarAxes::NONE &&
+		base.rasterWidth > 0 && base.rasterHeight > 0 &&
+		base.left == 0 && base.top == 0 &&
+		base.right == base.rasterWidth && base.bottom == base.rasterHeight;
 	return classification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+		transition.bounds.left >= 0 && transition.bounds.top >= 0 &&
+		transition.bounds.right > transition.bounds.left &&
+		transition.bounds.bottom > transition.bounds.top &&
 		(transition.bounds.trustedBarAxes ==
 				ActivePictureBounds::BarAxes::TOP_BOTTOM ||
 			transition.bounds.trustedBarAxes ==
 				ActivePictureBounds::BarAxes::LEFT_RIGHT) &&
-		transition.stableBounds.trustedBarAxes ==
-			transition.bounds.trustedBarAxes &&
+		(fullRasterBase || transition.stableBounds.trustedBarAxes ==
+			transition.bounds.trustedBarAxes) &&
 		(transition.bounds.trustedBarAxes ==
 				ActivePictureBounds::BarAxes::TOP_BOTTOM
 			? transition.bounds.left == transition.stableBounds.left &&
@@ -354,6 +364,15 @@ void ActivePictureDecisionTimeline::InvalidateLookaheadPolicy(
 }
 
 
+void ActivePictureDecisionTimeline::InvalidateGeometryForReacquisition()
+{
+	m_transition.Reset();
+	InvalidateLookaheadPolicy(true);
+	// Accepted identities, FIFO position, and transport continuity remain valid.
+	// Only decisions derived from the withdrawn geometry must be regenerated.
+}
+
+
 bool ActivePictureDecisionTimeline::TrackLookaheadEvidence(
 	const ActivePictureFrameIdentity& identity,
 	const ActivePictureObservation& observation,
@@ -421,6 +440,27 @@ bool ActivePictureDecisionTimeline::IsDecisionCurrent(
 			m_transportGeneration;
 }
 
+
+bool ActivePictureDecisionTimeline::CanProveBufferedFrames(
+	const ActivePictureFrameIdentity* identities, size_t count) const
+{
+	if (!identities || count == 0 || count > MAX_LOOKAHEAD_FRAMES + size_t{ 1 } ||
+		identities[0].transportGeneration != m_transportGeneration ||
+		identities[0].acceptedSequence > UINT64_MAX - (count - 1))
+		return false;
+	for (size_t i = 0; i < count; ++i)
+	{
+		const auto& identity = identities[i];
+		AcceptedIdentity accepted;
+		if (identity.acceptedSequence <= m_lastConsumedSequence ||
+			identity.acceptedSequence != identities[0].acceptedSequence + i ||
+			!SameDecisionContext(identity, identities[0]) ||
+			!FindAcceptedIdentity(identity, accepted) ||
+			accepted.continuityGeneration != m_continuityGeneration)
+			return false;
+	}
+	return true;
+}
 
 void ActivePictureDecisionTimeline::RetainIdentity(
 	const ActivePictureFrameIdentity& identity,
@@ -543,7 +583,7 @@ ActivePictureDecisionTimeline::ValidateExactInwardProof(
 			evidence.observation.classification !=
 				ActivePictureClassification::BAR_CROP_TRUSTED ||
 			!evidence.nearBlackEvaluated || evidence.observation.transitionDeferred ||
-			evidence.observation.axisEvidence.HasFailedBar())
+			evidence.observation.axisEvidence.HasBlockingFailedBar(evidence.observation.bounds))
 		{
 			return ActivePictureInwardProofValidation::EVIDENCE_NOT_TRUSTED;
 		}

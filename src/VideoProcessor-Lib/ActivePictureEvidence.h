@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -13,7 +14,7 @@
 // proof. Source identity and exact measurement-base checks remain mandatory.
 bool CanRetainProvisionalSamplingCrop(const ActivePictureBounds& trusted,
 	const ActivePictureBounds& observed, ActivePictureClassification classification,
-	bool currentPresentationRetainable);
+	bool currentPresentationRetainable, bool partialSamplingReaffirmed = false);
 
 struct P010PlaneView
 {
@@ -42,6 +43,38 @@ struct ActivePictureEdgeEvidence
 };
 
 
+// Detailed side-probe samples. Only the explicit geometry-bound summary in
+// axisEvidence participates in observation identity and crop admission policy.
+struct ActivePictureSideProbeCell
+{
+	int strong = 0;
+	int nonBlack = 0;
+	int meanLuma = 0;
+	int peakLuma = 0;
+};
+struct ActivePictureSideProbe
+{
+	bool evaluated = false;
+	std::array<ActivePictureSideProbeCell, 12> cells{}; // depth-major, then top-to-bottom zone
+};
+
+// Diagnostic detail for strict inspection of excluded top/bottom bands when
+// horizontal geometry is unresolved. Admission carries the geometry-bound
+// evaluated/clean result in axisEvidence; diagnostic detail is not authority.
+struct ActivePictureVerticalBarProfile
+{
+	bool evaluated = false, completed = false, clean = false;
+	int apertureTop = 0, apertureBottom = 0;
+	size_t samples = 0;
+	double referenceY = 0.0, referenceU = 0.0, referenceV = 0.0;
+	int firstMismatchX = -1, firstMismatchY = -1;
+	int maxLumaDelta = 0, maxChromaDelta = 0;
+	int mismatchSamples = 0, boundaryMismatchSamples = 0, deepMismatchSamples = 0;
+	int topFirstMismatchY = -1, topLastMismatchY = -1;
+	int bottomFirstMismatchY = -1, bottomLastMismatchY = -1;
+	const char* reason = "not-required";
+};
+
 struct ActivePictureEvidence
 {
 	bool available = false;
@@ -54,11 +87,51 @@ struct ActivePictureEvidence
 	ActivePictureEdgeEvidence top;
 	ActivePictureEdgeEvidence right;
 	ActivePictureEdgeEvidence bottom;
+	ActivePictureSideProbe leftSideProbe, rightSideProbe;
+	ActivePictureVerticalBarProfile verticalBarProfile;
+	// Separate raw-profile diagnostics from the conservatively expanded recheck.
+	ActivePictureVerticalBarProfile verticalBarGuardProfile;
 	size_t lumaSamples = 0;
 	size_t chromaSamples = 0;
 	std::string reason;
+	ActivePictureAuthorityOrigin authorityOrigin = ActivePictureAuthorityOrigin::NATIVE;
+	SparseBoundaryTransitionProof sparseTransitionProof;
+	RememberedEdgeReturnProof rememberedEdgeReturnProof;
 };
 
+
+// Read-only measurements at actual source edges, even when the rough scan
+// proposes an inset there. Separate from axisEvidence: never crop authority.
+struct ActivePictureSideDiagnostics
+{
+    bool evaluated = false;
+    ActivePictureBounds aperture;
+    int threshold = 0;
+    int leftMinimum = -1, rightMinimum = -1;
+    ActivePictureSideProbe left, right;
+    size_t lumaSamples = 0;
+};
+ActivePictureSideDiagnostics MeasureActivePictureSideDiagnostics(
+    const AnalysisLumaSource& source, const ActivePictureEvidence& evidence);
+
+// Symmetry nominates a location only. These read-only measurements deliberately
+// do not grant authority, even if the ordinary whole-bar predicates pass.
+struct ActivePictureAdjacentBoundaryProbe
+{
+    double insideMean = 0.0, outsideMean = 0.0;
+    double outsideP90 = 0.0, outsideDispersion = 0.0, contrast = 0.0;
+    int supported = 0;
+};
+struct ActivePictureOpposingBoundaryDiagnostics
+{
+    bool evaluated = false;
+    ActivePictureBounds candidate;
+    ActivePictureEdgeEvidence top, bottom;
+    ActivePictureAdjacentBoundaryProbe topAdjacent, bottomAdjacent;
+    size_t lumaSamples = 0, chromaSamples = 0;
+};
+ActivePictureOpposingBoundaryDiagnostics MeasureActivePictureOpposingBoundaryDiagnostics(
+    const AnalysisLumaSource& source, const ActivePictureEvidence& evidence);
 
 // Shared conversion keeps live and queued observations tied to the same measurement.
 ActivePictureObservation MakeActivePictureObservation(const ActivePictureEvidence& evidence,
@@ -75,6 +148,22 @@ struct ActivePictureGlobalNearBlackEvidence
 	size_t lumaSamples = 0;
 };
 
+
+// Diagnostic witness from the actual two supporting depth lines. No additional sampling.
+struct ActivePictureVisibleExtentDiagnostic
+{
+	bool available = false;
+	int coordinate = 0; // Extent after one sample-step padding, before presentation margin.
+	int firstX = -1, firstY = -1;
+	int firstLuma = 0, firstU = 0, firstV = 0;
+	int firstReason = 0; // Bit 1: luma > cutoff; bit 2: chroma >= 64 and luma >= cutoff.
+	int firstLine = -1, secondLine = -1;
+	int firstLineSupport = 0, secondLineSupport = 0;
+	int peakLuma = 0, peakChromaDelta = 0; // Visible samples in the two supporting lines.
+	int sampleStep = 0, depthSamples = 0;
+	int lumaCutoff = 0;
+	int presentationMargin = 0;
+};
 
 // Per-frame pixel evidence for retaining an already trusted presentation
 // rectangle. This does not grant crop authority and does not apply temporal
@@ -99,6 +188,10 @@ struct ActivePicturePresentationRetentionEvidence
 	bool proposedBoundsContained = false;
 	// Retention-only proof for one provisional vertical scan step; no new authority.
 	bool samplingReaffirmed = false;
+	// Separate strict proof for an inward partial observation with only a
+	// one-step outward vertical discrepancy. Never inherits border tolerance.
+	bool partialSamplingEvaluated = false;
+	bool partialSamplingReaffirmed = false;
 	// Geometry tolerance is distinct from pixel blackness. A one-step
 	// provisional border can remain in the same established presentation even
 	// when that narrow strip contains real edge pixels. This cannot move the
@@ -128,6 +221,7 @@ struct ActivePicturePresentationRetentionEvidence
 	// already trusted presentation rectangle.
 	bool outwardVisibleBoundsAvailable = false;
 	ActivePictureBounds outwardVisibleBounds;
+	ActivePictureVisibleExtentDiagnostic visibleLeft, visibleTop, visibleRight, visibleBottom;
 	ActivePictureEvidence activePicture;
 	ActivePictureEdgeEvidence excludedLeft;
 	ActivePictureEdgeEvidence excludedTop;
@@ -141,7 +235,8 @@ struct ActivePicturePresentationRetentionEvidence
 
 // Pure, bounded P010 inspection. It has no renderer, DirectShow, configuration,
 // or mutable global dependencies, so identical bytes always produce identical
-// evidence. At 4K the fixed grids inspect fewer than 30,000 luma samples.
+// evidence. Rough scanning has a fixed budget; strict vertical crop profiles
+// additionally inspect bounded grids over the prospective excluded bands.
 ActivePictureEvidence ExtractP010ActivePictureEvidence(
 	const P010PlaneView& view);
 
@@ -247,3 +342,15 @@ struct FullRasterColorEvidence
 };
 FullRasterColorEvidence EvaluateFullRasterColorEvidence(
     const AnalysisLumaSource& source);
+
+// Pixel-only corroboration; callers must independently qualify learned geometry.
+struct RelativeBarContrastEvidence
+{
+    bool evaluated = false, valid = false;
+    ActivePictureBounds base, target;
+    uint64_t sourceGeneration = 0;
+    size_t samples = 0;
+    const char* reason = "not-evaluated";
+};
+RelativeBarContrastEvidence InspectRelativeBarContrast(const AnalysisLumaSource& source,
+    const ActivePictureEvidence& raw, const ActivePictureBounds& base);

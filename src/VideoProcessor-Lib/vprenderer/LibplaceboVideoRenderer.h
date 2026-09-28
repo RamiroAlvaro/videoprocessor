@@ -4,6 +4,9 @@
 #include <ITimingClock.h>
 #include <VideoConversionOverride.h>
 #include <ActivePictureDecisionTimeline.h>
+#include <CropDiagnosticThrottle.h>
+#include <RememberedEdgeReturn.h>
+#include <vprenderer/BufferedPictureExpansion.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -135,6 +138,11 @@ private:
 		bool activePicturePreviewAnalyzed = false;
 		bool activePicturePreviewDecisionAvailable = false;
 		ActivePictureFrameDecision activePicturePreviewDecision;
+		ActivePictureEvidence activePicturePreviewEvidence;
+		bool activePicturePreviewNearBlackEvaluated = false;
+		bool activePicturePreviewNearBlack = false;
+		AlphaSourceCrop::BufferedPictureExpansionProof bufferedPictureExpansion;
+        GuardedRememberedEdgeReturnCertificate guardedRememberedReturn;
 		int64_t enqueueQpc = 0;
 		bool cadenceRepeat = false;
 		uint64_t cadenceActionId = 0;
@@ -149,7 +157,7 @@ private:
 	void StopInternal(const std::function<void()>& drainAfterGraphStop);
 	void AnalyzeActivePictureLookahead(
 		std::vector<QueuedFrame>& previewFrames,
-		uint8_t availableLookahead,
+		size_t queuedFutureFrames,
 		uint64_t lookaheadPolicyGeneration);
 	void ClearQueue(const char* reason = "queue clear");
 	void BeginQueueGeneration(const char* reason, bool clearStopRequest = false);
@@ -217,7 +225,9 @@ private:
 	std::atomic<uint64_t> m_droppedFrames{0};
 	std::atomic<size_t> m_activePictureLookaheadFrames{0};
 	uint64_t m_activePictureLookaheadLoggedGeneration = 0;
-	uint8_t m_activePictureLookaheadLoggedAvailable = 0xff;
+	size_t m_activePictureLookaheadLoggedAvailable = 0xff;
+    CropDiagnosticThrottle m_picturePreviewDiagnostics;
+    AlphaSourceCrop::BufferedExpansionShadowTrace m_fitLookaheadShadow;
 	std::atomic<uint64_t> m_missingFrameStateDrops{0};
 	std::atomic<uint64_t> m_renderFailureDrops{0};
 	std::atomic_bool m_sceneDetectionEnabled{false};

@@ -106,6 +106,23 @@ namespace AlphaSourceCrop
 				left.trustedBarAxes != ActivePictureBounds::BarAxes::NONE;
 		}
 
+		bool SamePictureWithinDetectorStep(const ActivePictureBounds& left,
+			const ActivePictureBounds& right)
+		{
+			const int width = left.rasterWidth, height = left.rasterHeight;
+			if (!ValidBounds(left, width, height) || !ValidBounds(right, width, height) ||
+				left.trustedBarAxes == ActivePictureBounds::BarAxes::NONE ||
+				left.trustedBarAxes != right.trustedBarAxes)
+				return false;
+			const int xStep = std::max(2, width / 960);
+			const int yStep = std::max(2, height / 540);
+			return std::abs(left.left - right.left) <= xStep &&
+				std::abs(left.right - right.right) <= xStep &&
+				std::abs(left.top - right.top) <= yStep &&
+				std::abs(left.bottom - right.bottom) <= yStep;
+		}
+
+
 		bool ContainedBounds(const ActivePictureBounds& outer, const ActivePictureBounds& inner)
 		{
 			return ValidBounds(inner, outer.rasterWidth, outer.rasterHeight) &&
@@ -154,6 +171,7 @@ namespace AlphaSourceCrop
 		{
 			state.bootstrapCandidateAvailable = false;
 			state.bootstrapCandidate = {};
+			state.bootstrapCandidateOrigin = ActivePictureAuthorityOrigin::NATIVE;
 			state.bootstrapCandidateStartedTick = 0;
 			state.bootstrapLastQualifiedTick = 0;
 			state.bootstrapLastSourceSequence = 0;
@@ -182,6 +200,10 @@ namespace AlphaSourceCrop
 			return "scene-hold";
 		case DecisionOwner::AMBIGUITY_HOLD:
 			return "ambiguity-hold";
+		case DecisionOwner::MOVING_PICTURE_HOLD:
+            return "moving-picture-hold";
+		case DecisionOwner::PICTURE_CONFIRMATION:
+			return "picture-confirm";
 		case DecisionOwner::BAR_REFINEMENT:
 			return "bar-refinement";
 		case DecisionOwner::VERTICAL_INSPECTION:
@@ -450,7 +472,10 @@ namespace AlphaSourceCrop
 			(candidate.left < trustedGeometry.left || candidate.top < trustedGeometry.top ||
 			 candidate.right > trustedGeometry.right || candidate.bottom > trustedGeometry.bottom);
 		if (!compatible)
-			return decision;
+        {
+            decision.diagnosticReason = "no-compatible-expansion";
+            return decision;
+        }
 
 		const int tolerance = SamplingTolerance(trustedGeometry);
 		const bool expandsVertical = (candidate.top < trustedGeometry.top || candidate.bottom > trustedGeometry.bottom) &&
@@ -459,12 +484,20 @@ namespace AlphaSourceCrop
 			!SamplingEquivalentAxis(trustedGeometry.left, trustedGeometry.right, candidate.left, candidate.right, tolerance);
 		// Sampling jitter may reach the normal transition deadband; this grants
 		// no crop/presentation authority and never suppresses positive pixels.
-		if (!expandsVertical && !expandsHorizontal) return decision;
+		if (!expandsVertical && !expandsHorizontal)
+        {
+            decision.diagnosticReason = "measurement-step-only";
+            return decision;
+        }
 		decision.outwardTransition = true;
 		const bool stripsMatch = evidence.expansionStripsAvailable &&
 			SameBounds(evidence.expansionBase, trustedGeometry) && SameBounds(evidence.expansionCandidate, candidate);
 		// A supplied but mismatched certificate must not fall back to old strips.
-		if (evidence.expansionStripsAvailable && !stripsMatch) return decision;
+		if (evidence.expansionStripsAvailable && !stripsMatch)
+        {
+            decision.diagnosticReason = "strip-certificate-mismatch";
+            return decision;
+        }
 		const bool verticalPicture = !expandsVertical ||
 			((candidate.top >= trustedGeometry.top || BroadPictureLike(stripsMatch ? evidence.expandingTop : evidence.excludedTop)) &&
 			 (candidate.bottom <= trustedGeometry.bottom || BroadPictureLike(stripsMatch ? evidence.expandingBottom : evidence.excludedBottom)));
@@ -474,16 +507,43 @@ namespace AlphaSourceCrop
 		decision.broadOpposingPicture = evidence.analysisValid && evidence.presentationValid &&
 			verticalPicture && horizontalPicture;
 		if (!decision.broadOpposingPicture)
-			return decision;
+        {
+            decision.diagnosticReason = !evidence.analysisValid || !evidence.presentationValid
+                ? "measurement-invalid" : (!verticalPicture && !horizontalPicture
+                    ? "both-axes-not-broad" : (!verticalPicture ? "vertical-not-broad" : "horizontal-not-broad"));
+            return decision;
+        }
 
 		const bool sequenceContinuous = sourceSequence == 0 || previous.lastObservedSourceSequence == 0 ||
 			sourceSequence == previous.lastObservedSourceSequence ||
 			sourceSequence == previous.lastObservedSourceSequence + 1;
-		const bool continues = previous.sourceGeneration == sourceGeneration && sequenceContinuous &&
-			previous.confirmations != 0 && SameBounds(previous.candidate, candidate);
+		const bool sameEpisode = previous.sourceGeneration == sourceGeneration && sequenceContinuous &&
+			previous.confirmations != 0 && SameBounds(previous.base, trustedGeometry) &&
+			previous.base.trustedBarAxes == trustedGeometry.trustedBarAxes;
+		const auto& reference = previous.referenceCandidate;
+		const bool exactCandidate = SameBounds(reference, candidate) &&
+			reference.trustedBarAxes == candidate.trustedBarAxes;
+		// Only fresh exact strip evidence can bridge detector-step jitter in a
+		// trusted outward picture candidate. Each edge may move one scan step,
+		// but every comparison stays anchored to the first candidate in this
+		// confirmation run. The current candidate/certificate remain exact.
+		const bool samplingEquivalentCandidate = stripsMatch && !evidence.globalNearBlack &&
+			SameTrustedCropContract(evidence.expansionBase, trustedGeometry) &&
+			SameTrustedCropContract(evidence.expansionCandidate, candidate) &&
+			ValidBounds(reference, trustedGeometry.rasterWidth, trustedGeometry.rasterHeight) &&
+			HasAuthorityForCroppedAxes(reference, trustedGeometry.rasterWidth, trustedGeometry.rasterHeight) &&
+			HasAuthorityForCroppedAxes(candidate, trustedGeometry.rasterWidth, trustedGeometry.rasterHeight) &&
+			reference.trustedBarAxes == candidate.trustedBarAxes &&
+			ContainedBounds(reference, trustedGeometry) && ContainedBounds(candidate, trustedGeometry) &&
+			SamePictureWithinDetectorStep(reference, candidate);
+		const bool continues = sameEpisode && (exactCandidate || samplingEquivalentCandidate);
 		const bool repeatedSourceSample = continues && sourceSequence != 0 &&
 			previous.lastObservedSourceSequence == sourceSequence;
 		decision.state.candidate = candidate;
+		decision.state.base = trustedGeometry;
+		decision.state.referenceCandidate = continues ? reference : candidate;
+		decision.state.firstPictureSourceSequence = sameEpisode
+			? previous.firstPictureSourceSequence : sourceSequence;
 		decision.state.sourceGeneration = sourceGeneration;
 		decision.state.lastObservedSourceSequence = sourceSequence;
 		decision.state.confirmations = repeatedSourceSample
@@ -492,6 +552,9 @@ namespace AlphaSourceCrop
 				previous.confirmations + 1) : 1);
 		decision.authoritative = decision.state.confirmations >=
 			OUTWARD_PICTURE_CONFIRMATIONS_REQUIRED;
+        decision.diagnosticReason = decision.authoritative ? "confirmed" :
+            (repeatedSourceSample ? "repeated-source" :
+             (previous.confirmations != 0 && !continues ? "proof-restarted" : "proof-pending"));
 		return decision;
 	}
 
@@ -589,7 +652,7 @@ namespace AlphaSourceCrop
 		VerticalInspectionBridgeDecision decision;
 		if (input.sourceGeneration == 0 || input.sourceSequence == 0 ||
 			input.cropAuthorityResolved || input.fullRasterAuthorityResolved ||
-			input.confirmedVerticalFitResolved || input.samplingRetentionResolved ||
+			input.confirmedVerticalFitResolved || input.samplingRetentionResolved || input.containedRetentionResolved ||
 			input.verticalPresentationOwnerAvailable)
 		{
 			return decision;
@@ -743,6 +806,16 @@ namespace AlphaSourceCrop
 			? ConfirmOutwardPictureTransition(input.previousOutward, input.presentationBeforeObservation,
 				input.outwardCandidate, input.retention, input.sourceGeneration, input.sourceSequence)
 			: OutwardPictureConfirmationDecision{};
+		const bool continuingEpisode = decision.outward.state.confirmations != 0 &&
+			input.previousOutward.confirmations != 0 &&
+			input.previousOutward.sourceGeneration == input.sourceGeneration &&
+			SameTrustedCropContract(input.previousOutward.base, input.presentationBeforeObservation) &&
+			decision.outward.state.firstPictureSourceSequence == input.previousOutward.firstPictureSourceSequence;
+		decision.outward.state.verticalPresentationSeen =
+			input.presentation.action == VerticalBarPresentationAction::TRANSLATE ||
+			input.translationDriftActive ||
+			(!continuingEpisode && input.presentation.action == VerticalBarPresentationAction::FIT) ||
+			(continuingEpisode && input.previousOutward.verticalPresentationSeen);
 		decision.deferOutward = decision.outward.outwardTransition && !decision.outward.authoritative;
 		// Broad current picture on the expanding edges can supersede an old
 		// subtitle action; a subtitle must not pin a genuinely obsolete aspect.
@@ -765,6 +838,7 @@ namespace AlphaSourceCrop
 		};
 		decision.deferPartialComposition = input.evidence.available &&
 			input.evidence.classification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+			!input.evidence.axisEvidence.HasVerifiedVerticalCropProfile(input.evidence.trustedBounds) &&
 			(axes == ActivePictureBounds::BarAxes::TOP_BOTTOM ||
 			 axes == ActivePictureBounds::BarAxes::LEFT_RIGHT) &&
 			input.compatiblePresentation && input.trustedGeometryAvailable &&
@@ -776,12 +850,118 @@ namespace AlphaSourceCrop
 			proposed.right <= input.trustedGeometry.right && proposed.bottom <= input.trustedGeometry.bottom &&
 			coherentMargin(input.evidence.left) && coherentMargin(input.evidence.top) &&
 			coherentMargin(input.evidence.right) && coherentMargin(input.evidence.bottom);
-		// A queued decision must obey the same veto as the live model. The
-		// partial composition can retain framing but cannot admit a publication.
+		// A queued decision must obey the same veto as the live model. A strict
+		// vertical profile bypasses only this inferred-composition veto; it preserves
+		// the unresolved horizontal pixels and grants no horizontal crop authority.
 		decision.observation.transitionDeferred = decision.observation.transitionDeferred ||
 			decision.deferPartialComposition;
 		return decision;
 	}
+
+	PictureTransitionHandoff MakePictureTransitionHandoff(
+		const TransitionAdmissionInput& input, const TransitionAdmissionDecision& admission,
+		const ActivePictureTransitionDecision& transition, bool eligibleGeometryChange,
+		uint64_t presentationEpoch)
+	{
+		PictureTransitionHandoff result;
+		// A pending history recurrence can name its canonical trusted rectangle
+		// one scan step from the current target. Retaining the OLD presentation
+		// during that confirmation is safe; publication still checks current pixels.
+		const auto& base = input.trustedGeometry;
+		const auto& target = input.evidence.trustedBounds;
+		const auto& proof = admission.outward;
+		const auto& pixels = input.retention;
+		if (!eligibleGeometryChange || transition.publish || !transition.stable ||
+			!input.evidence.available || !input.trustedGeometryAvailable || !input.compatiblePresentation ||
+			input.evidence.classification != ActivePictureClassification::BAR_CROP_TRUSTED ||
+			input.sourceGeneration == 0 || input.sourceSequence == 0 ||
+			input.trustedGeneration != input.sourceGeneration ||
+			!SameTrustedCropContract(input.presentationBeforeObservation, base) ||
+			!SameTrustedCropContract(transition.stableBounds, base) ||
+			!ValidBounds(base, base.rasterWidth, base.rasterHeight) ||
+			!ValidBounds(target, base.rasterWidth, base.rasterHeight) ||
+			!CropEdgesAreChromaAligned(base, base.rasterWidth, base.rasterHeight) ||
+			!CropEdgesAreChromaAligned(target, base.rasterWidth, base.rasterHeight) ||
+			base.trustedBarAxes != ActivePictureBounds::BarAxes::TOP_BOTTOM ||
+			target.trustedBarAxes != ActivePictureBounds::BarAxes::TOP_BOTTOM ||
+			base.left != 0 || base.right != base.rasterWidth ||
+			target.left != base.left || target.right != base.right ||
+			target.top >= base.top || target.bottom <= base.bottom ||
+			!SameTrustedCropContract(input.outwardCandidate, target) ||
+			!pixels.analysisValid || !pixels.presentationValid || pixels.globalNearBlack ||
+			!pixels.expansionStripsAvailable ||
+			!SameTrustedCropContract(pixels.expansionBase, base) ||
+			!SameTrustedCropContract(pixels.expansionCandidate, target) ||
+			!proof.outwardTransition || !proof.broadOpposingPicture ||
+			proof.state.confirmations == 0 || proof.state.verticalPresentationSeen ||
+			proof.state.firstPictureSourceSequence == 0 ||
+			input.sourceSequence < proof.state.firstPictureSourceSequence ||
+			input.sourceSequence - proof.state.firstPictureSourceSequence >= PICTURE_HANDOFF_PENDING_FRAMES ||
+			proof.state.sourceGeneration != input.sourceGeneration ||
+			proof.state.lastObservedSourceSequence != input.sourceSequence ||
+			!SameTrustedCropContract(proof.state.candidate, target) ||
+			admission.deferPartialComposition ||
+			(proof.authoritative &&
+			 (transition.state != ActivePictureTransitionState::CANDIDATE_TRANSITION ||
+			  !HasAuthorityForCroppedAxes(transition.bounds, base.rasterWidth, base.rasterHeight) ||
+			  !ContainedBounds(transition.bounds, base) ||
+			  !SamePictureWithinDetectorStep(transition.bounds, target))))
+			return result;
+		result.active = true;
+		result.trustedBase = base;
+		result.sourceGeneration = input.sourceGeneration;
+		result.sourceSequence = input.sourceSequence;
+		result.presentationEpoch = presentationEpoch;
+		return result;
+	}
+
+	bool HasCurrentPictureTransitionHandoff(const Input& input)
+	{
+		const auto& handoff = input.pictureTransitionHandoff;
+		return handoff.active && input.automaticCropEnabled && input.sharedGeometryAvailable &&
+			!input.presentationFailOpen && !input.nearBlackEpisodeFullRaster &&
+			!input.nearBlackEpisodeRetainCrop && !input.fullRasterPresentationAuthoritative &&
+			!input.barCropRefinementHorizontalConflict &&
+			input.classification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+			input.latestObservationClassification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+			!input.latestObservationIsProvisional && !input.latestObservationIsUnavailable &&
+			handoff.sourceGeneration != 0 && handoff.sourceGeneration == input.frameSourceGeneration &&
+			input.geometrySourceGeneration == input.frameSourceGeneration &&
+			handoff.sourceSequence != 0 && handoff.sourceSequence == input.frameSourceSequence &&
+			handoff.presentationEpoch == input.framePresentationEpoch &&
+			SameTrustedCropContract(handoff.trustedBase, input.geometry) &&
+			ValidBounds(input.geometry, input.rasterWidth, input.rasterHeight) &&
+			HasAuthorityForCroppedAxes(input.geometry, input.rasterWidth, input.rasterHeight) &&
+			CropEdgesAreChromaAligned(input.geometry, input.rasterWidth, input.rasterHeight);
+	}
+
+    bool HasCurrentMovingPictureHold(const Input& input)
+    {
+        const auto& hold = input.movingPictureHold;
+        // Retain the exact already-established scope contract while the motion
+        // detector owns a gradual expansion. This is not new crop authority.
+        return input.movingPictureTransition && input.automaticCropEnabled &&
+            input.sharedGeometryAvailable && !input.presentationFailOpen &&
+            !input.nearBlackEpisodeFullRaster && !input.nearBlackEpisodeRetainCrop &&
+            !input.fullRasterPresentationAuthoritative &&
+            !input.barCropRefinementHorizontalConflict && !hold.competingPresentation &&
+            !input.verticalTranslationActive && !input.verticalTranslationConfirmationPending &&
+            !input.verticalFitConfirmationPending && !input.verticalTranslationBaseRetentionActive &&
+            !input.verticalTranslationEngageBaseRetentionActive &&
+            input.classification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+            input.latestObservationClassification != ActivePictureClassification::FULL_RASTER_TRUSTED &&
+            hold.sourceGeneration != 0 && hold.sourceGeneration == input.frameSourceGeneration &&
+            input.geometrySourceGeneration == input.frameSourceGeneration &&
+            hold.sourceSequence != 0 && hold.sourceSequence == input.frameSourceSequence &&
+            hold.presentationEpoch == input.framePresentationEpoch &&
+            SameTrustedCropContract(hold.base, input.geometry) &&
+            input.geometry.trustedBarAxes == ActivePictureBounds::BarAxes::TOP_BOTTOM &&
+            input.geometry.left == 0 && input.geometry.right == input.rasterWidth &&
+            input.geometry.top > 0 && input.geometry.bottom < input.rasterHeight &&
+            ValidBounds(input.geometry, input.rasterWidth, input.rasterHeight) &&
+            HasAuthorityForCroppedAxes(input.geometry, input.rasterWidth, input.rasterHeight) &&
+            CropEdgesAreChromaAligned(input.geometry, input.rasterWidth, input.rasterHeight);
+    }
 
 	PresentationObservationDecision ResolvePresentationObservation(
 		const ActivePictureBounds& base, const ActivePictureEvidence& evidence,
@@ -907,14 +1087,53 @@ namespace AlphaSourceCrop
 		return false;
 	}
 
+	static bool HasExpiredTranslationHold(const VerticalBarPresentationState& state,
+		uint64_t currentTick, uint64_t holdMs, uint64_t currentSequence)
+	{
+		return state.action == VerticalBarPresentationAction::TRANSLATE &&
+			holdMs != 0 && state.lastDetectionTick != 0 &&
+			currentTick >= state.lastDetectionTick &&
+			currentTick - state.lastDetectionTick > holdMs &&
+			state.sourceSequence != 0 && currentSequence > state.sourceSequence;
+	}
+
+	bool CanInspectRetiringTranslationFit(const HeldBarAnalysisInput& input,
+		const VerticalFitConfirmationState& fit, bool inspectionBlocked)
+	{
+		if (inspectionBlocked ||
+			!HasExpiredTranslationHold(input.presentation, input.currentTick,
+				input.holdMs, input.currentSourceSequence) ||
+			fit.confirmations < VERTICAL_FIT_CONFIRMATIONS_REQUIRED ||
+			fit.lastObservedSourceSequence == 0 ||
+			input.currentSourceSequence <= fit.lastObservedSourceSequence ||
+			input.currentSourceSequence - fit.lastObservedSourceSequence > 3 ||
+			input.trustedGeometry.left != 0 ||
+			input.trustedGeometry.right != input.trustedGeometry.rasterWidth ||
+			input.trustedGeometry.top <= 0 ||
+			input.trustedGeometry.bottom >= input.trustedGeometry.rasterHeight)
+			return false;
+
+		// Reuse the same source/base and two-edge envelope checks as pending FIT.
+		// Recent confirmed FIT grants one fresh inspection, not stale fit authority.
+		// Three source frames are the existing dense-analysis sampling interval.
+		auto inspection = input;
+		inspection.fitConfirmationPending = true;
+		return CanAnalyzeHeldVerticalBarGeometry(inspection);
+	}
+
 	VerticalBarPresentationState UpdateVerticalBarPresentation(
 		const VerticalBarPresentationUpdateInput& input)
 	{
 		const bool previousActiveByHold = IsVerticalBarPresentationActive(
 			input.previous, input.currentTick, input.holdMs,
 			input.currentSourceSequence);
+		const bool retiringTranslationFit = input.retiringTranslationFitInspection &&
+			input.current.action == VerticalBarPresentationAction::FIT &&
+			input.upperContent && input.lowerContent &&
+			HasExpiredTranslationHold(input.previous, input.currentTick,
+				input.holdMs, input.currentSourceSequence);
 		const bool previousOwnsSample = previousActiveByHold ||
-			input.previousOwnsCurrentAnalysis;
+			(input.previousOwnsCurrentAnalysis && !retiringTranslationFit);
 		VerticalBarPresentationState state = previousOwnsSample
 			? input.previous : VerticalBarPresentationState{};
 		VerticalBarContentDecision current = input.current;
@@ -960,19 +1179,53 @@ namespace AlphaSourceCrop
 			{
 				return state;
 			}
+			// Revisiting a dense FIT sample cannot renew either extent or the
+			// action timer. Translation's existing cue ownership above is separate.
+			if (input.previous.action == VerticalBarPresentationAction::FIT &&
+				input.previous.sourceSequence != 0 && input.currentSourceSequence != 0 &&
+				input.currentSourceSequence <= input.previous.sourceSequence)
+			{
+				if (input.currentSourceSequence < input.previous.sourceSequence ||
+					input.currentTick < input.previous.lastDetectionTick ||
+					(input.holdMs != 0 &&
+					 input.currentTick - input.previous.lastDetectionTick > input.holdMs))
+					return {}; // A stale sample cannot resurrect an expired FIT.
+				return input.previous;
+			}
 			const bool retainPrevious = previousOwnsSample;
 			const int retainedTop = retainPrevious ? state.detectedTop : 0;
 			const int retainedBottom = retainPrevious ? state.detectedBottom : 0;
+			// Older state has no per-extent stamps. Bind its initial extent age to
+			// the original action tick once, never to another edge's later refresh.
+			const uint64_t topTick = state.fitTopExtentTick != 0
+				? state.fitTopExtentTick : state.lastDetectionTick;
+			const uint64_t bottomTick = state.fitBottomExtentTick != 0
+				? state.fitBottomExtentTick : state.lastDetectionTick;
+			auto selectExtent = [&](int retained, uint64_t retainedTick,
+				bool present, int measured, bool upper, uint64_t& extentTick)
+			{
+				if (present && (retained == 0 ||
+					(upper ? measured <= retained : measured >= retained)))
+				{
+					extentTick = input.currentTick;
+					return measured;
+				}
+				if (retained > 0 && input.holdMs != 0 && retainedTick != 0 &&
+					input.currentTick >= retainedTick &&
+					input.currentTick - retainedTick <= input.holdMs)
+				{
+					extentTick = retainedTick;
+					return retained;
+				}
+				extentTick = present ? input.currentTick : 0;
+				return present ? measured : 0;
+			};
 			state.action = current.action;
 			state.translationPixels = 0.0f;
-			state.detectedTop = input.upperContent
-				? (retainedTop > 0
-					? std::min(retainedTop, input.upperContentTop)
-					: input.upperContentTop)
-				: retainedTop;
-			state.detectedBottom = input.lowerContent
-				? std::max(retainedBottom, input.lowerContentBottom)
-				: retainedBottom;
+			state.detectedTop = selectExtent(retainedTop, topTick,
+				input.upperContent, input.upperContentTop, true, state.fitTopExtentTick);
+			state.detectedBottom = selectExtent(retainedBottom, bottomTick,
+				input.lowerContent, input.lowerContentBottom, false, state.fitBottomExtentTick);
 			state.lastDetectionTick = input.currentTick;
 			state.sourceSequence = input.currentSourceSequence;
 			return state;
@@ -1115,6 +1368,128 @@ namespace AlphaSourceCrop
 		lastAppliedTranslationPixels = driftStartTranslationPixels +
 			(targetTranslationPixels - driftStartTranslationPixels) * progress;
 		return lastAppliedTranslationPixels;
+	}
+
+	namespace
+	{
+		bool ApprovedFitCurrentContext(const ApprovedGenericFitHoldInput& input)
+		{
+			return input.sourceGeneration != 0 && input.sourceSequence != 0 &&
+				input.currentTick != 0 && input.holdMs != 0 &&
+				input.baseGeneration == input.sourceGeneration &&
+				input.retentionGeneration == input.sourceGeneration &&
+				input.rawSequence == input.sourceSequence && input.retentionSequence == input.sourceSequence &&
+				input.rawAvailable && input.retentionValid && input.nearBlackEvaluated &&
+				!input.nearBlack && !input.moving && !input.competingOwner && !input.denseArbitrationEnabled &&
+				input.baseClassification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+				input.rawClassification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+				input.baseOrigin == ActivePictureAuthorityOrigin::NATIVE &&
+				input.rawOrigin == ActivePictureAuthorityOrigin::NATIVE &&
+				SameTrustedCropContract(input.base, input.retentionBase) &&
+				SamePictureWithinDetectorStep(input.base, input.rawBounds) &&
+				HasAuthorityForCroppedAxes(input.base, input.base.rasterWidth, input.base.rasterHeight) &&
+				HasAuthorityForCroppedAxes(input.rawBounds, input.base.rasterWidth, input.base.rasterHeight) &&
+				CropEdgesAreChromaAligned(input.base, input.base.rasterWidth, input.base.rasterHeight) &&
+				input.rawBounds.left == input.base.left && input.rawBounds.right == input.base.right;
+		}
+		bool ApprovedFitCoversCurrent(const ApprovedGenericFitHoldInput& input,
+			const ActivePictureBounds& bounds)
+		{
+			if (!ValidBounds(bounds, input.base.rasterWidth, input.base.rasterHeight) ||
+				!CropEdgesAreChromaAligned(bounds, input.base.rasterWidth, input.base.rasterHeight) ||
+				bounds.left != input.base.left || bounds.right != input.base.right ||
+				bounds.top >= input.base.top || bounds.bottom <= input.base.bottom ||
+				!ContainedBounds(bounds, input.base) || !ContainedBounds(bounds, input.rawBounds))
+				return false;
+			// A fresh occupied pixel outside the saved rectangle always vetoes the
+			// hold, even if a separate band-safety summary says otherwise.
+			return input.visibleAvailable ? ContainedBounds(bounds, input.visibleBounds) : input.excludedBandsSafe;
+		}
+	}
+
+	ApprovedGenericFitHoldDecision ResolveApprovedGenericFitHold(const ApprovedGenericFitHoldInput& input)
+	{
+		ApprovedGenericFitHoldDecision decision;
+		const auto& previous = input.previous;
+		if (!previous.available || !ApprovedFitCurrentContext(input) ||
+			previous.sourceGeneration != input.sourceGeneration ||
+			previous.presentationEpoch != input.presentationEpoch ||
+			!SameTrustedCropContract(previous.base, input.base) ||
+			previous.admittedSequence == 0 || previous.admittedSequence > input.sourceSequence ||
+			previous.admittedTick == 0 || previous.admittedTick > input.currentTick ||
+			input.currentTick - previous.admittedTick > input.holdMs ||
+			!ApprovedFitCoversCurrent(input, previous.bounds))
+			return decision; // Retire invalid snapshots, never leave them dormant.
+		decision.state = previous;
+		decision.active = true;
+		decision.bounds = previous.bounds;
+		return decision;
+	}
+	ApprovedGenericFitHoldState RecordApprovedGenericFitHold(const ApprovedGenericFitHoldInput& input,
+		const ActivePictureBounds& candidate, const ActivePictureBounds& admitted,
+		bool freshGenericBothEdgeApproved, bool admissionSucceeded)
+	{
+		if (!freshGenericBothEdgeApproved || !admissionSucceeded || !ApprovedFitCurrentContext(input) ||
+			!SameBounds(candidate, admitted) || !ApprovedFitCoversCurrent(input, candidate))
+			return {};
+		if (input.previous.available && input.previous.sourceGeneration == input.sourceGeneration &&
+			input.previous.presentationEpoch == input.presentationEpoch &&
+			input.sourceSequence <= input.previous.admittedSequence)
+		{
+			if (input.sourceSequence != input.previous.admittedSequence ||
+				!SameBounds(candidate, input.previous.bounds))
+				return {};
+			return ResolveApprovedGenericFitHold(input).state;
+		}
+		ApprovedGenericFitHoldState state;
+		state.available = true;
+		state.base = input.base;
+		state.bounds = candidate;
+		state.sourceGeneration = input.sourceGeneration;
+		state.presentationEpoch = input.presentationEpoch;
+		state.admittedSequence = input.sourceSequence;
+		state.admittedTick = input.currentTick;
+		return state;
+	}
+
+	bool CanUseSamplingRefinementOutwardFit(const SamplingRefinementOutwardFitInput& input)
+	{
+		// A small native measurement change may reveal the current pixel envelope,
+		// but cannot establish or reaffirm the logical crop. Never reuse a union
+		// of old overlays or override the detailed presentation owners.
+		if (!input.rawAvailable || !input.visibleAvailable || !input.outwardAvailable ||
+			!input.nearBlackEvaluated || input.nearBlack || input.moving ||
+			input.competingOwner || input.denseArbitrationEnabled ||
+			input.frameGeneration == 0 || input.frameSequence == 0 ||
+			input.baseGeneration != input.frameGeneration ||
+			input.visibleGeneration != input.frameGeneration ||
+			input.rawSequence != input.frameSequence || input.visibleSequence != input.frameSequence ||
+			input.baseClassification != ActivePictureClassification::BAR_CROP_TRUSTED ||
+			input.rawClassification != ActivePictureClassification::BAR_CROP_TRUSTED ||
+			input.baseOrigin != ActivePictureAuthorityOrigin::NATIVE ||
+			input.rawOrigin != ActivePictureAuthorityOrigin::NATIVE)
+			return false;
+
+		const int width = input.base.rasterWidth, height = input.base.rasterHeight;
+		if (!SameTrustedCropContract(input.base, input.visibleBase) ||
+			!SamePictureWithinDetectorStep(input.base, input.rawBounds) ||
+			!HasAuthorityForCroppedAxes(input.base, width, height) ||
+			!HasAuthorityForCroppedAxes(input.rawBounds, width, height) ||
+			!CropEdgesAreChromaAligned(input.base, width, height) ||
+			input.rawBounds.left != input.base.left || input.rawBounds.right != input.base.right ||
+			!ValidBounds(input.visibleBounds, width, height) ||
+			!ValidBounds(input.outwardBounds, width, height) ||
+			!CropEdgesAreChromaAligned(input.outwardBounds, width, height) ||
+			input.outwardBounds.left != input.base.left || input.outwardBounds.right != input.base.right)
+			return false;
+
+		return input.visibleBounds.top < input.base.top &&
+			input.visibleBounds.bottom > input.base.bottom &&
+			input.outwardBounds.top < input.base.top &&
+			input.outwardBounds.bottom > input.base.bottom &&
+			ContainedBounds(input.outwardBounds, input.base) &&
+			ContainedBounds(input.outwardBounds, input.rawBounds) &&
+			ContainedBounds(input.outwardBounds, input.visibleBounds);
 	}
 
 	VerticalBarPresentationResolution ResolveVerticalBarPresentation(
@@ -1381,8 +1756,11 @@ namespace AlphaSourceCrop
 
 	bool UpdateFullRasterPresentationAuthority(bool previouslyAuthoritative,
 		ActivePictureClassification currentClassification,
-		bool currentBoundsAreFullRaster)
+		bool currentBoundsAreFullRaster, ActivePictureAuthorityOrigin origin)
 	{
+		if (origin == ActivePictureAuthorityOrigin::SPARSE_TRANSITION_EXPERIMENT ||
+            origin == ActivePictureAuthorityOrigin::REMEMBERED_EDGE_RETURN)
+			return previouslyAuthoritative;
 		if (currentClassification ==
 			ActivePictureClassification::FULL_RASTER_TRUSTED)
 			return currentBoundsAreFullRaster;
@@ -1390,6 +1768,32 @@ namespace AlphaSourceCrop
 			ActivePictureClassification::BAR_CROP_TRUSTED)
 			return false;
 		return previouslyAuthoritative;
+	}
+
+	bool CommitSparseTransitionPresentationAuthority(bool previouslyAuthoritative,
+		const ActivePictureTransitionDecision& decision)
+	{
+		const auto& bounds = decision.bounds;
+		const bool committed = decision.publish && decision.stable && !decision.clearTransition &&
+			(decision.authorityOrigin == ActivePictureAuthorityOrigin::SPARSE_TRANSITION_EXPERIMENT ||
+             decision.authorityOrigin == ActivePictureAuthorityOrigin::REMEMBERED_EDGE_RETURN) &&
+			decision.authoritativeClassification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+			bounds.trustedBarAxes == ActivePictureBounds::BarAxes::TOP_BOTTOM &&
+			bounds.rasterWidth > 0 && bounds.rasterHeight > 0 && bounds.left == 0 &&
+			bounds.right == bounds.rasterWidth && bounds.top > 0 &&
+			bounds.bottom < bounds.rasterHeight && bounds.bottom > bounds.top;
+		return committed ? false : previouslyAuthoritative;
+	}
+
+	bool SparseTransitionMayReaffirmOwnedCrop(const ActivePictureBounds& owned,
+		ActivePictureAuthorityOrigin ownedOrigin, const ActivePictureEvidence& evidence)
+	{
+		if (evidence.authorityOrigin != ActivePictureAuthorityOrigin::SPARSE_TRANSITION_EXPERIMENT &&
+            evidence.authorityOrigin != ActivePictureAuthorityOrigin::REMEMBERED_EDGE_RETURN)
+			return true;
+		return ownedOrigin == evidence.authorityOrigin &&
+			owned.trustedBarAxes == evidence.trustedBounds.trustedBarAxes &&
+			SameBounds(owned, evidence.trustedBounds);
 	}
 
 	bool RequiresPerFramePresentationInspection(
@@ -1431,6 +1835,127 @@ namespace AlphaSourceCrop
 		return result;
 	}
 
+    PresentationEnvelopeExtentState UpdatePresentationEnvelopeExtents(
+        const PresentationEnvelopeExtentState& previous,
+        const ActivePictureBounds& base, const ActivePictureBounds& current,
+        uint64_t sourceGeneration, uint64_t sourceSequence,
+        uint64_t now, uint64_t holdMs)
+    {
+        PresentationEnvelopeExtentState result;
+        if (!sourceGeneration || !sourceSequence || !now ||
+            !ValidBounds(base,base.rasterWidth,base.rasterHeight) ||
+            !ValidBounds(current,base.rasterWidth,base.rasterHeight) ||
+            !CropEdgesAreChromaAligned(base,base.rasterWidth,base.rasterHeight) ||
+            !CropEdgesAreChromaAligned(current,base.rasterWidth,base.rasterHeight) ||
+            !ContainedBounds(current,base)) return result;
+        const bool same = previous.sourceGeneration == sourceGeneration &&
+            SameBounds(previous.base,base) && previous.base.trustedBarAxes == base.trustedBarAxes;
+        if (same && (sourceSequence < previous.lastObservationSequence ||
+            now < previous.lastObservationTick)) return result;
+        if (same && sourceSequence == previous.lastObservationSequence) return previous;
+        if (same) result=previous;
+        result.base=base; result.sourceGeneration=sourceGeneration;
+        result.lastObservationSequence=sourceSequence; result.lastObservationTick=now;
+        const bool expands=current.left<base.left || current.top<base.top ||
+            current.right>base.right || current.bottom>base.bottom;
+        // Every retained outer coordinate owns its deadline. A nearer current
+        // cue is evidence for that nearer coordinate, not a refresh of an older
+        // and wider cue on this edge (or on another edge).
+        const bool retainHistory = same && previous.available && holdMs != 0 &&
+            ValidBounds(previous.bounds,base.rasterWidth,base.rasterHeight) &&
+            CropEdgesAreChromaAligned(previous.bounds,base.rasterWidth,base.rasterHeight) &&
+            ContainedBounds(previous.bounds,base);
+        const std::array<int,4> baseEdges{{base.left,base.top,base.right,base.bottom}};
+        const std::array<int,4> currentEdges{{current.left,current.top,current.right,current.bottom}};
+        const std::array<int,4> previousEdges{{previous.bounds.left,previous.bounds.top,
+            previous.bounds.right,previous.bounds.bottom}};
+        std::array<int,4> selected=currentEdges;
+        result.bounds=base;
+        result.available=false;
+        for (size_t edge=0; edge<selected.size(); ++edge)
+        {
+            const bool growing = edge>=2;
+            const bool currentExpands = growing ? currentEdges[edge]>baseEdges[edge] :
+                currentEdges[edge]<baseEdges[edge];
+            const bool currentReachesPrevious = growing ? currentEdges[edge]>=previousEdges[edge] :
+                currentEdges[edge]<=previousEdges[edge];
+            const uint64_t priorTick=previous.extentTicks[edge];
+            const bool liveExtent = retainHistory && priorTick != 0 && now>=priorTick &&
+                now-priorTick<=holdMs;
+            if (liveExtent && !currentReachesPrevious)
+            {
+                selected[edge]=previousEdges[edge];
+                result.extentTicks[edge]=priorTick;
+            }
+            else
+                result.extentTicks[edge]=currentExpands ? now : 0;
+            result.available = result.available || selected[edge]!=baseEdges[edge];
+        }
+        result.bounds.left=selected[0]; result.bounds.top=selected[1];
+        result.bounds.right=selected[2]; result.bounds.bottom=selected[3];
+        if (expands)
+        {
+            result.sourceSequence=sourceSequence;
+            result.lastDetectionTick=now;
+        }
+        result.bounds.aspectRatio=static_cast<double>(result.bounds.right-result.bounds.left)/
+            std::max(1,result.bounds.bottom-result.bounds.top);
+        result.bounds.trustedBarAxes=ActivePictureBounds::BarAxes::NONE;
+        return result;
+    }
+    ActivePictureBounds SelectPresentationEnvelopeBounds(const PresentationEnvelopeSelectionInput& input)
+    {
+        const int width=input.effectiveBase.rasterWidth, height=input.effectiveBase.rasterHeight;
+        if (!input.envelopeActive || !input.frameGeneration || !input.frameSequence ||
+            !ValidBounds(input.effectiveBase,width,height) ||
+            !CropEdgesAreChromaAligned(input.effectiveBase,width,height))
+            return input.effectiveBase;
+        // Only current pixels may follow a same-frame native publication to a
+        // different base. Historical extents keep their exact original contract.
+        const bool sameBase=SameBounds(input.history.base,input.effectiveBase) &&
+            input.history.base.trustedBarAxes==input.effectiveBase.trustedBarAxes;
+        if (input.history.available && sameBase &&
+            input.history.sourceGeneration==input.frameGeneration &&
+            ValidBounds(input.history.bounds,width,height) &&
+            CropEdgesAreChromaAligned(input.history.bounds,width,height) &&
+            ContainedBounds(input.history.bounds,input.effectiveBase))
+            return input.history.bounds;
+        if (input.currentGeneration==input.frameGeneration &&
+            input.currentSequence==input.frameSequence &&
+            ValidBounds(input.currentBounds,width,height) &&
+            CropEdgesAreChromaAligned(input.currentBounds,width,height))
+            return input.currentBounds;
+        return input.effectiveBase;
+    }
+    ActivePictureBounds SelectGenericFitEnvelope(const PresentationEnvelopeSelectionInput& input)
+    {
+        const auto& current=input.currentBounds;
+        const auto& base=input.effectiveBase;
+        const auto& history=input.history;
+        // This is presentation retention, never new crop authority. The caller
+        // has already admitted the current generic FIT. Do not refresh the
+        // history's per-edge deadlines or hide any newly visible pixels.
+        if (!input.envelopeActive || !history.available ||
+            !input.frameGeneration || !input.frameSequence ||
+            input.currentGeneration!=input.frameGeneration ||
+            input.currentSequence!=input.frameSequence ||
+            history.sourceGeneration!=input.frameGeneration ||
+            !SameBounds(history.base,base) || history.base.trustedBarAxes!=base.trustedBarAxes ||
+            !ValidBounds(current,base.rasterWidth,base.rasterHeight) ||
+            !ValidBounds(history.bounds,base.rasterWidth,base.rasterHeight) ||
+            !CropEdgesAreChromaAligned(current,base.rasterWidth,base.rasterHeight) ||
+            !CropEdgesAreChromaAligned(history.bounds,base.rasterWidth,base.rasterHeight) ||
+            !ContainedBounds(current,base) || !ContainedBounds(history.bounds,base) ||
+            history.bounds.top>current.top || history.bounds.bottom<current.bottom ||
+            !SamplingEquivalentAxis(history.bounds.top,history.bounds.bottom,
+                current.top,current.bottom,SamplingTolerance(base)))
+            return current;
+        auto selected=current;
+        selected.top=history.bounds.top;
+        selected.bottom=history.bounds.bottom;
+        selected.aspectRatio=static_cast<double>(selected.right-selected.left)/(selected.bottom-selected.top);
+        return selected;
+    }
 	PresentationEnvelopeDecision EvaluatePresentationEnvelope(
 		const PresentationEnvelopeInput& input)
 	{
@@ -1552,6 +2077,53 @@ namespace AlphaSourceCrop
 		return decision;
 	}
 
+	PresentationEnvelopeGeometryDecision BuildComposedPresentationEnvelope(
+		const PresentationEnvelopeCompositionInput& input)
+	{
+		auto complete = [&](const PresentationEnvelopeContent& content,
+			int horizontalPadding, int verticalPadding)
+		{
+			PresentationEnvelopeGeometryInput geometry;
+			geometry.trustedPicture = input.trustedPicture;
+			geometry.observedContent = content.bounds;
+			geometry.observedContentAvailable = content.expandLeft ||
+				content.expandTop || content.expandRight || content.expandBottom;
+			geometry.expandLeft = content.expandLeft;
+			geometry.expandTop = content.expandTop;
+			geometry.expandRight = content.expandRight;
+			geometry.expandBottom = content.expandBottom;
+			geometry.horizontalPadding = horizontalPadding;
+			geometry.verticalPadding = verticalPadding;
+			return BuildPresentationEnvelope(geometry);
+		};
+
+		// Detector bounds already include whatever safety extent their producer
+		// supplied. Only raw dense measurements receive subtitle clearance here.
+		// Complete selected edges separately so an unrelated detector edge cannot
+		// acquire that clearance, or override vertical translation routing.
+		const auto detector = complete(input.detectorContent, 0, 0);
+		if (!detector.valid)
+			return detector;
+		const auto dense = complete(input.denseContent,
+			input.horizontalPadding, input.verticalPadding);
+		if (!dense.valid)
+			return dense;
+
+		PresentationEnvelopeGeometryInput combined;
+		combined.trustedPicture = input.trustedPicture;
+		combined.observedContent = detector.bounds;
+		combined.observedContent.left = std::min(detector.bounds.left, dense.bounds.left);
+		combined.observedContent.top = std::min(detector.bounds.top, dense.bounds.top);
+		combined.observedContent.right = std::max(detector.bounds.right, dense.bounds.right);
+		combined.observedContent.bottom = std::max(detector.bounds.bottom, dense.bounds.bottom);
+		combined.observedContentAvailable = detector.expanded || dense.expanded;
+		combined.expandLeft = combined.expandTop = true;
+		combined.expandRight = combined.expandBottom = true;
+		// The completed envelopes contain their own clearance. Union without a
+		// second padding pass; this changes presentation, never aspect authority.
+		return BuildPresentationEnvelope(combined);
+	}
+
 	CenteredFitDecision FitAspect(double contentAspect,
 		const PresentationRect& screen,
 		VerticalPictureAlignment verticalAlignment)
@@ -1659,6 +2231,31 @@ namespace AlphaSourceCrop
 			decision.reason = "aspect limit or screen aspect is invalid";
 			return decision;
 		}
+        decision.referenceAspect = decision.contentAspect;
+        if (input.contentReferenceAvailable)
+        {
+            const auto& reference = input.contentReferenceBounds;
+            if (!ValidBounds(reference, input.sourceBounds.rasterWidth, input.sourceBounds.rasterHeight) ||
+                !ValidBounds(input.sourceBounds, input.sourceBounds.rasterWidth, input.sourceBounds.rasterHeight))
+            {
+                decision.reason = "fill content reference is invalid";
+                return decision;
+            }
+            decision.referenceAspect = static_cast<double>(reference.right - reference.left) /
+                (reference.bottom - reference.top);
+            // Overlay/retention expansion is not a new content format. It may
+            // restrict existing fill eligibility, never create it or swap sides.
+            const bool narrower = decision.contentAspect < input.screenAspect - 1e-6;
+            const bool wider = decision.contentAspect > input.screenAspect + 1e-6;
+            if ((narrower && (decision.referenceAspect >= input.screenAspect - 1e-6 ||
+                    (input.narrowerLimitConfigured && decision.referenceAspect + 1e-6 < input.narrowerAspectLimit))) ||
+                (wider && (decision.referenceAspect <= input.screenAspect + 1e-6 ||
+                    (input.widerLimitConfigured && decision.referenceAspect - 1e-6 > input.widerAspectLimit))))
+            {
+                decision.reason = "trusted content reference does not permit this aspect-limit fill";
+                return decision;
+            }
+        }
 		const double epsilon = 1e-6;
 		if (decision.contentAspect < input.screenAspect - epsilon)
 		{
@@ -1860,6 +2457,32 @@ namespace AlphaSourceCrop
 			ownerSourceGeneration == sourceGeneration;
 	}
 
+	bool IsNearBlackNativeSamplingExpansion(const ActivePictureBounds& entry,
+		const ActivePictureBounds& candidate)
+	{
+		const int width = entry.rasterWidth, height = entry.rasterHeight;
+		if (!ValidBounds(entry, width, height) || !ValidBounds(candidate, width, height) ||
+			!HasAuthorityForCroppedAxes(entry, width, height) ||
+			!HasAuthorityForCroppedAxes(candidate, width, height) ||
+			entry.trustedBarAxes != candidate.trustedBarAxes ||
+			candidate.rasterWidth != width || candidate.rasterHeight != height ||
+			(candidate.left == 0 && candidate.top == 0 &&
+			 candidate.right == width && candidate.bottom == height) ||
+			candidate.left > entry.left || candidate.top > entry.top ||
+			candidate.right < entry.right || candidate.bottom < entry.bottom ||
+			SameBounds(entry, candidate))
+			return false;
+		// Same sampling allowance used by crop reaffirmation. Bound total size
+		// as well as each edge; two outward edges cannot double the allowance.
+		const int tolerance = SamplingTolerance(entry);
+		return entry.left - candidate.left <= tolerance &&
+			entry.top - candidate.top <= tolerance &&
+			candidate.right - entry.right <= tolerance &&
+			candidate.bottom - entry.bottom <= tolerance &&
+			(candidate.right - candidate.left) - (entry.right - entry.left) <= tolerance &&
+			(candidate.bottom - candidate.top) - (entry.bottom - entry.top) <= tolerance;
+	}
+
 	NearBlackPresentationEpisodeDecision EvaluateNearBlackPresentationEpisode(
 		const NearBlackPresentationEpisodeInput& input)
 	{
@@ -1944,10 +2567,18 @@ namespace AlphaSourceCrop
 			decision.state.sourceGeneration = input.sourceGeneration;
 			decision.state.startedSourceSequence = input.sourceSequence;
 			decision.state.presentationEpoch = input.presentationEpoch;
-			decision.state.entryTrustedCropAvailable =
-				decision.state.mode == NearBlackPresentationMode::RETAIN_CROP;
+			decision.state.startedAtFullRaster =
+				decision.state.mode == NearBlackPresentationMode::FULL_RASTER;
+			// Outward pixels select a safe presentation, not the lifetime of the
+			// existing picture contract. Save it even when those pixels coincide
+			// with episode entry, so the unchanged recovery proof can revalidate
+			// this exact crop after the excluded bands become safe again.
+			decision.state.entryTrustedCropAvailable = input.trustedCropAvailable;
 			if (decision.state.entryTrustedCropAvailable)
+			{
 				decision.state.entryTrustedCrop = input.trustedCrop;
+				decision.state.entryTrustedCropOrigin = input.trustedCropOrigin;
+			}
 			if (decision.state.mode == NearBlackPresentationMode::FULL_RASTER)
 				decision.state.fullRasterStartedSourceSequence =
 					input.sourceSequence;
@@ -2036,7 +2667,18 @@ namespace AlphaSourceCrop
 			decision.state.entryTrustedCropAvailable && distinctEntrySample)
 		{
 			decision.state.lastEvaluatedSourceSequence = input.sourceSequence;
-			const bool exactEntryContract =
+			// A sparse startup entry cannot obtain the native association below:
+			// episode suppression intentionally blocks new native publications.
+			// Independent current native bars may corroborate only that existing
+			// rectangle, without upgrading its origin or learning a format.
+			const bool sparseEntryNativeReaffirmed =
+				decision.state.entryTrustedCropOrigin == ActivePictureAuthorityOrigin::SPARSE_EXPERIMENT &&
+				input.trustedCropAvailable &&
+				input.trustedCropOrigin == ActivePictureAuthorityOrigin::SPARSE_EXPERIMENT &&
+				SameTrustedCropContract(input.trustedCrop, decision.state.entryTrustedCrop) &&
+				input.currentNativeObservationReaffirmsSparseEntry &&
+				input.retentionExcludedBandsPixelSafe;
+			const bool exactEntryContract = sparseEntryNativeReaffirmed || (
 				input.knownTrustedGeometryReacquired &&
 				input.reacquiredTrustedClassification ==
 					ActivePictureClassification::BAR_CROP_TRUSTED &&
@@ -2050,7 +2692,7 @@ namespace AlphaSourceCrop
 				input.reacquiredPresentationEpoch ==
 					decision.state.presentationEpoch &&
 				SameTrustedCropContract(input.reacquiredTrustedGeometry,
-					decision.state.entryTrustedCrop);
+					decision.state.entryTrustedCrop));
 			const bool samplingReaffirmed = input.currentObservationAvailable &&
 				input.currentObservationClassification == ActivePictureClassification::BAR_CROP_TRUSTED &&
 				IsPixelSafeCropReaffirmation(decision.state.entryTrustedCrop,
@@ -2125,31 +2767,49 @@ namespace AlphaSourceCrop
 				decision.state = {};
 				decision.releasedToTrustedCrop = true;
 				decision.ended = true;
-				decision.reason =
-					wasRetainingCrop
-					? "non-near-black scope revalidated; normal presentation resumed"
-					: "exact entry crop revalidated after pixel-safe dwell";
+				decision.reason = sparseEntryNativeReaffirmed
+					? "independent native bars revalidated sparse entry after pixel-safe dwell"
+					: wasRetainingCrop
+						? "non-near-black scope revalidated; normal presentation resumed"
+						: "exact entry crop revalidated after pixel-safe dwell";
 			}
 		}
 
+		// A tiny outward native correction cannot revalidate an undersized entry:
+		// its excluded rows contain real picture. Verify the candidate's own bars
+		// through the existing independent bootstrap proof, then withdraw the old
+		// authority so normal acquisition can accept current geometry afterward.
+		const bool nativeSamplingExpansion = decision.state.entryTrustedCropAvailable &&
+			decision.state.entryTrustedCropOrigin == ActivePictureAuthorityOrigin::NATIVE &&
+			input.nativeBootstrapOrigin == ActivePictureAuthorityOrigin::NATIVE &&
+			input.nativeBootstrapContractAvailable &&
+			IsNearBlackNativeSamplingExpansion(decision.state.entryTrustedCrop,
+				input.nativeBootstrapContract);
+		// Preserve the pre-existing native bootstrap route for full-raster entry.
+		// A partial exact-entry proof must not stall independent native acquisition.
 		if (decision.state.mode == NearBlackPresentationMode::FULL_RASTER &&
-			!decision.state.entryTrustedCropAvailable)
+			(!decision.state.entryTrustedCropAvailable ||
+			 decision.state.startedAtFullRaster || nativeSamplingExpansion))
 		{
+			uint32_t bootstrapGates = RECOVERY_OK;
 			if (!input.measurementCurrent || !input.nativeBootstrapRetentionEvaluated ||
 				input.nativeBootstrapSourceSequence != input.sourceSequence)
-				decision.revalidationGates |= RECOVERY_MEASUREMENT;
-			if (!input.nativeBootstrapContractAvailable) decision.revalidationGates |= RECOVERY_CONTRACT;
+				bootstrapGates |= RECOVERY_MEASUREMENT;
+			if (!input.nativeBootstrapContractAvailable) bootstrapGates |= RECOVERY_CONTRACT;
 			if (input.nativeBootstrapOutwardVisible ||
 				(input.measurementCurrent && input.nativeBootstrapRetentionEvaluated &&
 				 input.nativeBootstrapSourceSequence == input.sourceSequence &&
 				 !input.nativeBootstrapRetentionSafe))
-				decision.revalidationGates |= RECOVERY_UNSAFE_BANDS;
+				bootstrapGates |= RECOVERY_UNSAFE_BANDS;
 			if (!input.nearBlackEvaluated || input.globalNearBlack)
-				decision.revalidationGates |= RECOVERY_NEAR_BLACK;
-			if (input.fullRasterAuthorityAvailable) decision.revalidationGates |= RECOVERY_FULL_AUTHORITY;
+				bootstrapGates |= RECOVERY_NEAR_BLACK;
+			if (input.fullRasterAuthorityAvailable) bootstrapGates |= RECOVERY_FULL_AUTHORITY;
 			if (input.nativeBootstrapSourceGeneration != input.sourceGeneration ||
 				input.nativeBootstrapPresentationEpoch != decision.state.presentationEpoch)
-				decision.revalidationGates |= RECOVERY_CONTEXT;
+				bootstrapGates |= RECOVERY_CONTEXT;
+			// Saved-entry diagnostics describe that independent recovery path.
+			if (!decision.state.entryTrustedCropAvailable)
+				decision.revalidationGates |= bootstrapGates;
 			const bool bootstrapQualifies = input.measurementCurrent &&
 				input.nearBlackEvaluated && !input.globalNearBlack &&
 				!input.fullRasterAuthorityAvailable &&
@@ -2166,6 +2826,7 @@ namespace AlphaSourceCrop
 					input.nativeBootstrapContract);
 			const bool sameCandidate = bootstrapQualifies &&
 				decision.state.bootstrapCandidateAvailable &&
+				decision.state.bootstrapCandidateOrigin == input.nativeBootstrapOrigin &&
 				SameTrustedCropContract(decision.state.bootstrapCandidate,
 					input.nativeBootstrapContract);
 			const bool timingContinuous = input.currentTick == 0 ||
@@ -2178,6 +2839,7 @@ namespace AlphaSourceCrop
 			{
 				decision.state.bootstrapCandidateAvailable = true;
 				decision.state.bootstrapCandidate = input.nativeBootstrapContract;
+				decision.state.bootstrapCandidateOrigin = input.nativeBootstrapOrigin;
 				decision.state.bootstrapCandidateStartedTick = input.currentTick;
 				decision.state.bootstrapLastQualifiedTick = input.currentTick;
 				decision.state.bootstrapLastSourceSequence = input.sourceSequence;
@@ -2229,6 +2891,7 @@ namespace AlphaSourceCrop
 			const bool pausedDwellComplete = bootstrapQualifies &&
 				input.cadenceRepeat &&
 				decision.state.bootstrapCandidateAvailable &&
+				decision.state.bootstrapCandidateOrigin == input.nativeBootstrapOrigin &&
 				input.sourceSequence ==
 					decision.state.bootstrapLastSourceSequence &&
 				SameTrustedCropContract(decision.state.bootstrapCandidate,
@@ -2243,10 +2906,18 @@ namespace AlphaSourceCrop
 				decision.state = {};
 				decision.bootstrapReleased = true;
 				decision.resetTransitionEvidence = true;
+				decision.resetTrustedGeometry = nativeSamplingExpansion;
 				decision.ended = true;
-				decision.reason =
-					"startup crop bootstrap verified; normal acquisition reopened";
+				decision.reason = nativeSamplingExpansion
+					? "native sampling expansion verified; undersized crop withdrawn for fresh acquisition"
+					: "startup crop bootstrap verified; normal acquisition reopened";
 			}
+		}
+		else
+		{
+			// Eligibility itself can disappear while a saved-entry episode remains
+			// active. Do not carry partial proof across an inward/oversized candidate.
+			ResetNearBlackBootstrap(decision.state);
 		}
 
 		if (!decision.releasedToTrustedCrop)
@@ -2295,6 +2966,7 @@ namespace AlphaSourceCrop
 		add(RECOVERY_FULL_AUTHORITY, "full-raster-authority");
 		add(RECOVERY_SEQUENCE_GAP, "source-sequence-gap");
 		add(RECOVERY_OWNER, "presentation-owner-unresolved");
+		add(RECOVERY_INSPECTION_REENTRY, "inspection-would-contract-occupied-fit");
 		return names;
 	}
 
@@ -2340,6 +3012,76 @@ namespace AlphaSourceCrop
 		return IsPixelSafeCropReaffirmation(trusted, comparison, excludedBandsPixelSafe);
 	}
 
+	bool CanResolveContainedInspectionRetention(
+		const VerticalInspectionBridgeState& inspection, const PresentationRecoveryInput& input)
+	{
+		const auto& crop = input.crop;
+		const auto& recovery = input.previous;
+		const auto& admitted = input.previousAdmission;
+		const auto& base = crop.geometry;
+		// Resolve only the already displayed outward-fit/recovery trap. A logical
+		// crop, a stale admission, or an unspent inspection is not this contract.
+		if (!inspection.active || !inspection.failOpenLatched || !recovery.active ||
+			!admitted.available || !admitted.outwardPresentationAvailable ||
+			!crop.automaticCropEnabled || !crop.sharedGeometryAvailable ||
+			crop.classification != ActivePictureClassification::BAR_CROP_TRUSTED ||
+			!ValidBounds(base, crop.rasterWidth, crop.rasterHeight) ||
+			!HasAuthorityForCroppedAxes(base, crop.rasterWidth, crop.rasterHeight) ||
+			!CropEdgesAreChromaAligned(base, crop.rasterWidth, crop.rasterHeight) ||
+			!SameTrustedCropContract(inspection.trustedBase, base) ||
+			!SameTrustedCropContract(recovery.trustedCrop, base) ||
+			!SameTrustedCropContract(admitted.trustedCrop, base) ||
+			!SameTrustedCropContract(input.retentionBounds, base))
+			return false;
+		const uint64_t generation = crop.frameSourceGeneration;
+		const uint64_t sequence = crop.frameSourceSequence;
+		if (generation == 0 || sequence == 0 ||
+			crop.geometrySourceGeneration != generation ||
+			inspection.sourceGeneration != generation || recovery.sourceGeneration != generation ||
+			admitted.sourceGeneration != generation || input.retentionSourceGeneration != generation ||
+			inspection.presentationEpoch != input.presentationEpoch ||
+			recovery.presentationEpoch != input.presentationEpoch ||
+			admitted.presentationEpoch != input.presentationEpoch ||
+			input.retentionSourceSequence != sequence || input.cadenceRepeat ||
+			inspection.firstCandidateSourceSequence == 0 || sequence <= inspection.firstCandidateSourceSequence ||
+			recovery.lastSourceSequence == 0 || sequence <= recovery.lastSourceSequence ||
+			admitted.presentationSourceSequence == 0 || sequence <= admitted.presentationSourceSequence ||
+			sequence - admitted.presentationSourceSequence != 1)
+			return false;
+		if (!ValidBounds(admitted.outwardPresentation, crop.rasterWidth, crop.rasterHeight) ||
+			!CropEdgesAreChromaAligned(admitted.outwardPresentation, crop.rasterWidth, crop.rasterHeight) ||
+			!ContainedBounds(admitted.outwardPresentation, base) ||
+			SameBounds(admitted.outwardPresentation, base))
+			return false;
+		// Do not turn inspection resolution into authority, or override another
+		// current presentation owner. presentationFailOpen is intentionally not
+		// checked: the caller preserves independent fail-open causes separately.
+		if (!input.measurementCurrent || !input.retentionEvaluated || !input.excludedBandsPixelSafe ||
+			!crop.frameLocalPresentationRetentionEvaluated || !crop.frameLocalPresentationRetentionSafe ||
+			!input.observationAvailable || !crop.latestObservationIsProvisional ||
+			crop.latestObservationIsUnavailable || crop.latestObservationSupportsCrop ||
+			input.observationClassification != ActivePictureClassification::PROVISIONAL ||
+			crop.latestObservationClassification != ActivePictureClassification::PROVISIONAL ||
+			!ValidBounds(input.observation, crop.rasterWidth, crop.rasterHeight) ||
+			!ContainedBounds(base, input.observation) ||
+			!input.nearBlackEvaluated || input.globalNearBlack || input.confirmedPresentationResolved ||
+			crop.fullRasterPresentationAuthoritative || crop.movingPictureTransition ||
+			crop.nearBlackEpisodeFullRaster || crop.nearBlackEpisodeRetainCrop ||
+			crop.outwardPresentationActive || crop.verticalTranslationActive ||
+			crop.verticalTranslationConfirmationPending || crop.verticalFitConfirmationPending ||
+			crop.verticalTranslationBaseRetentionActive || crop.verticalTranslationEngageBaseRetentionActive ||
+			crop.barCropRefinementPending || crop.barCropRefinementHorizontalConflict ||
+			crop.pictureTransitionHandoff.active || crop.movingPictureHold.competingPresentation)
+			return false;
+		if (crop.currentVisibleBoundsAvailable &&
+			(crop.currentVisibleSourceGeneration != generation || crop.currentVisibleSourceSequence != sequence ||
+			 !SameTrustedCropContract(crop.currentVisibleBase, base) ||
+			 !ValidBounds(crop.currentVisibleBounds, crop.rasterWidth, crop.rasterHeight) ||
+			 !ContainedBounds(base, crop.currentVisibleBounds)))
+			return false;
+		return true;
+	}
+
 	PresentationRecoveryDecision EvaluatePresentationRecovery(
 		const PresentationRecoveryInput& input)
 	{
@@ -2368,12 +3110,43 @@ namespace AlphaSourceCrop
 			result.state = {};
 			return result;
 		}
-		// Episode full-raster recovery has its own saved contract. Do not stack
-		// another dwell on it, but preserve a pre-existing general withdrawal.
-		if (!result.state.active && !input.cadenceRepeat && currentContract &&
-			!input.candidate.applyCrop && !crop.nearBlackEpisodeFullRaster &&
-			(input.candidate.withdrawalCause == WithdrawalCause::LATEST_OBSERVATION_UNREAFFIRMED ||
-			 crop.barCropRefinementHorizontalConflict || crop.presentationFailOpen))
+        // Inspection may retain a logical crop only if that is still what we
+        // were showing. When a dense FIT expires over occupied former bars,
+        // restoring the smaller logical base would manufacture a zoom flash.
+        // The prior admitted fit is a continuity floor, never current pixel
+        // proof: recovery below must still expose this frame's visible extent.
+        const auto& prior = input.previousAdmission;
+        const bool continuousPresentation = prior.presentationSourceSequence != 0 &&
+            (crop.frameSourceSequence > prior.presentationSourceSequence
+                ? crop.frameSourceSequence - prior.presentationSourceSequence == 1
+                : crop.frameSourceSequence == prior.presentationSourceSequence);
+        const bool inspectionReentry = !result.state.active && currentContract &&
+            !crop.nearBlackEpisodeFullRaster && !crop.movingPictureTransition &&
+            !crop.latestObservationSupportsCrop &&
+            input.candidate.applyCrop && input.candidate.owner == DecisionOwner::VERTICAL_INSPECTION &&
+            SameBounds(input.candidate.sourceBounds, crop.geometry) &&
+            prior.available && prior.outwardPresentationAvailable && continuousPresentation &&
+            prior.sourceGeneration != 0 && prior.sourceGeneration == crop.frameSourceGeneration &&
+            prior.presentationEpoch == input.presentationEpoch &&
+            SameTrustedCropContract(prior.trustedCrop, crop.geometry) &&
+            ValidBounds(prior.outwardPresentation, crop.rasterWidth, crop.rasterHeight) &&
+            CropEdgesAreChromaAligned(prior.outwardPresentation, crop.rasterWidth, crop.rasterHeight) &&
+            ContainedBounds(prior.outwardPresentation, crop.geometry) &&
+            !SameBounds(prior.outwardPresentation, crop.geometry) &&
+            input.measurementCurrent && input.retentionEvaluated &&
+            input.retentionSourceGeneration == crop.frameSourceGeneration &&
+            input.retentionSourceSequence == crop.frameSourceSequence &&
+            SameTrustedCropContract(input.retentionBounds, crop.geometry) &&
+            !input.excludedBandsPixelSafe && input.nearBlackEvaluated && !input.globalNearBlack;
+        // Episode full-raster recovery has its own saved contract. Do not stack
+        // another dwell on it, but preserve a pre-existing general withdrawal.
+        // Repeated frames may preserve an existing FIT; they never earn votes.
+        if (!result.state.active && currentContract &&
+            (inspectionReentry || (!input.cadenceRepeat &&
+             !input.candidate.applyCrop && !crop.nearBlackEpisodeFullRaster &&
+             !crop.movingPictureTransition &&
+             (input.candidate.withdrawalCause == WithdrawalCause::LATEST_OBSERVATION_UNREAFFIRMED ||
+              crop.barCropRefinementHorizontalConflict || crop.presentationFailOpen))))
 		{
 			result.state.active = true;
 			result.state.trustedCrop = crop.geometry;
@@ -2381,6 +3154,13 @@ namespace AlphaSourceCrop
 			result.state.presentationEpoch = input.presentationEpoch;
 			result.state.startedSourceSequence = crop.frameSourceSequence;
 			result.state.startedTick = input.currentTick;
+            if (inspectionReentry)
+            {
+                result.state.inspectionReentryPending = true;
+                result.state.fallbackBoundsAvailable = true;
+                result.state.fallbackBounds = prior.outwardPresentation;
+                result.gates |= RECOVERY_INSPECTION_REENTRY;
+            }
 			result.started = true;
 		}
 		if (!result.state.active) return result;
@@ -2411,11 +3191,43 @@ namespace AlphaSourceCrop
 			return result;
 		}
 
-		if (!currentContract || !SameTrustedCropContract(crop.geometry, result.state.trustedCrop))
+        const bool inspectionOriginalContract =
+            SameTrustedCropContract(crop.geometry, result.state.trustedCrop);
+        bool fallbackRevalidatedForContract = false;
+		if (!currentContract || !inspectionOriginalContract)
 		{
-			// A newly published contract must earn its own current pixel proof.
-			// Never carry partial proof between different crop rectangles.
+            // Reset logical crop proof, but keep a wider presentation when THIS
+            // frame proves every pixel outside the new, contained crop is safe.
+            // A contract change alone must not enlarge a safe envelope to raster.
+            const auto& held = result.state.fallbackBounds;
+            fallbackRevalidatedForContract = currentContract &&
+                result.state.fallbackBoundsAvailable &&
+                crop.frameSourceGeneration != 0 && !input.cadenceRepeat &&
+                crop.frameSourceSequence != 0 && crop.frameSourceSequence > result.state.lastSourceSequence &&
+                !crop.movingPictureTransition && !crop.nearBlackEpisodeFullRaster &&
+                input.measurementCurrent && input.retentionEvaluated &&
+                input.retentionSourceGeneration == crop.frameSourceGeneration &&
+                input.retentionSourceSequence == crop.frameSourceSequence &&
+                SameTrustedCropContract(input.retentionBounds, crop.geometry) &&
+                input.excludedBandsPixelSafe && input.nearBlackEvaluated && !input.globalNearBlack &&
+                input.observationAvailable && !crop.latestObservationIsUnavailable && !crop.latestObservationIsProvisional &&
+                input.observationClassification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+                crop.latestObservationClassification == ActivePictureClassification::BAR_CROP_TRUSTED &&
+                SameTrustedCropContract(input.observedTrustedCrop, crop.geometry) &&
+                ValidBounds(input.observation, crop.rasterWidth, crop.rasterHeight) &&
+                ContainedBounds(crop.geometry, input.observation) &&
+                input.candidate.applyCrop && verifiedCandidate.applyCrop &&
+                SameBounds(verifiedCandidate.sourceBounds, input.candidate.sourceBounds) &&
+                ValidBounds(held, crop.rasterWidth, crop.rasterHeight) &&
+                CropEdgesAreChromaAligned(held, crop.rasterWidth, crop.rasterHeight) &&
+                CropEdgesAreChromaAligned(crop.geometry, crop.rasterWidth, crop.rasterHeight) &&
+                ContainedBounds(held, crop.geometry) && ContainedBounds(held, input.observation);
 			result.gates |= RECOVERY_CONTRACT;
+            // Even repeats/older observations must not carry votes to a new
+            // contract; the normal per-frame counting branch skips repeats.
+            result.proofReset = result.state.samples != 0;
+            result.state.samples = 0;
+			result.state.fallbackBoundsAvailable = fallbackRevalidatedForContract;
 			if (currentContract) result.state.trustedCrop = crop.geometry;
 		}
 		if (!input.measurementCurrent || !input.retentionEvaluated ||
@@ -2438,9 +3250,47 @@ namespace AlphaSourceCrop
 			crop.frameLocalPresentationRetentionEvaluated && input.excludedBandsPixelSafe &&
 			CanRetainProvisionalSamplingCrop(result.state.trustedCrop,
 				input.observation, input.observationClassification,
-				crop.frameLocalPresentationRetentionSafe);
+				crop.frameLocalPresentationRetentionSafe, crop.frameLocalPartialSamplingReaffirmed);
 		result.samplingReaffirmed = currentRetentionMeasurement && input.observationAvailable &&
 			(trustedSampling || provisionalSampling);
+        // Inspection already permits a current proven picture to resolve
+        // immediately. Preserve that timing for native and pixel-safe sampling
+        // owners; do not add general recovery dwell to this short bridge.
+        if (result.state.inspectionReentryPending &&
+            (!inspectionOriginalContract || input.candidate.owner != DecisionOwner::VERTICAL_INSPECTION))
+        {
+            const bool nativeResolution = trustedSampling && crop.latestObservationSupportsCrop &&
+                !crop.latestObservationIsProvisional &&
+                input.candidate.owner == DecisionOwner::TRUSTED_CROP &&
+                verifiedCandidate.owner == DecisionOwner::TRUSTED_CROP;
+            const bool samplingResolution = provisionalSampling &&
+                crop.latestObservationIsProvisional &&
+                input.candidate.owner == DecisionOwner::PIXEL_SAFE_RETENTION &&
+                verifiedCandidate.owner == DecisionOwner::PIXEL_SAFE_RETENTION;
+            const bool currentResolution = currentContract && inspectionOriginalContract &&
+                currentRetentionMeasurement && input.observationAvailable &&
+                input.nearBlackEvaluated && !input.globalNearBlack &&
+                !crop.movingPictureTransition && !crop.nearBlackEpisodeFullRaster &&
+                !crop.presentationFailOpen && !crop.latestObservationIsUnavailable &&
+                input.candidate.applyCrop && verifiedCandidate.applyCrop &&
+                (nativeResolution || samplingResolution) &&
+                SameBounds(input.candidate.sourceBounds, crop.geometry) &&
+                SameBounds(verifiedCandidate.sourceBounds, crop.geometry);
+            if (currentResolution && !input.cadenceRepeat &&
+                crop.frameSourceSequence > result.state.startedSourceSequence &&
+                crop.frameSourceSequence > result.state.lastSourceSequence)
+            {
+                result.released = result.ended = true;
+                result.state = {};
+                result.presentation.reason = "current pixel-safe crop resolved outward fit inspection";
+                return result;
+            }
+            // An idempotent safe repeat neither earns a vote nor consumes the
+            // shortcut for the next fresh frame. Any actual unresolved owner,
+            // changed contract, expiry or backward frame ends the bridge.
+            if (!currentResolution || crop.frameSourceSequence < result.state.lastSourceSequence)
+                result.state.inspectionReentryPending = false;
+        }
 		if (!input.observationAvailable ||
 			(!ContainedBounds(result.state.trustedCrop, input.observation) && !result.samplingReaffirmed))
 			result.gates |= RECOVERY_OBSERVATION;
@@ -2462,7 +3312,7 @@ namespace AlphaSourceCrop
 		{
 			const bool gap = result.state.samples != 0 &&
 				crop.frameSourceSequence != result.state.lastSourceSequence + 1;
-			result.proofReset = result.state.samples != 0 && (result.gates != 0 || gap);
+			result.proofReset = result.proofReset || (result.state.samples != 0 && (result.gates != 0 || gap));
 			if (result.gates == 0)
 				result.state.samples = gap ? 1 : result.state.samples + 1;
 			else result.state.samples = 0;
@@ -2477,11 +3327,149 @@ namespace AlphaSourceCrop
 			result.state = {};
 			return result;
 		}
-		// Keep visible pixels exposed. Trusted/refinement labels alone do not
-		// override an unresolved current outside-band conflict (VP-0189 log).
+		// Recovery concerns the smaller logical crop, not necessarily every edge
+		// of the raster. Current pixel extents can expose an unresolved expansion
+		// without throwing away independently safe boundaries. This is geometry
+		// evidence only: no subtitle/menu classification or new aspect authority.
+		const bool currentBoundsProof = currentContract && currentRetentionMeasurement &&
+			crop.frameSourceGeneration != 0 && crop.frameSourceSequence != 0 && !crop.movingPictureTransition &&
+			!crop.nearBlackEpisodeFullRaster &&
+			input.nearBlackEvaluated && !input.globalNearBlack &&
+			input.observationAvailable && !crop.latestObservationIsUnavailable &&
+			(input.observationClassification == ActivePictureClassification::PROVISIONAL ||
+			 input.observationClassification == ActivePictureClassification::BAR_CROP_TRUSTED) &&
+			crop.latestObservationClassification == input.observationClassification &&
+			ValidBounds(input.observation, crop.rasterWidth, crop.rasterHeight) &&
+			CropEdgesAreChromaAligned(crop.geometry, crop.rasterWidth, crop.rasterHeight);
+		auto fallback = FullRaster(crop.rasterWidth, crop.rasterHeight);
+		if (currentBoundsProof && crop.currentVisibleBoundsAvailable &&
+			crop.currentVisibleSourceGeneration == crop.frameSourceGeneration &&
+			crop.currentVisibleSourceSequence == crop.frameSourceSequence &&
+			SameTrustedCropContract(crop.currentVisibleBase, crop.geometry) &&
+			ValidBounds(crop.currentVisibleBounds, crop.rasterWidth, crop.rasterHeight) &&
+			ContainedBounds(crop.currentVisibleBounds, crop.geometry) &&
+			ContainedBounds(crop.currentVisibleBounds, input.observation))
+		{
+			fallback = crop.currentVisibleBounds;
+			// Round outward for chroma, never cut off an odd measured edge.
+			fallback.left &= ~1;
+			fallback.top &= ~1;
+			fallback.right = std::min(crop.rasterWidth, (fallback.right + 1) & ~1);
+			fallback.bottom = std::min(crop.rasterHeight, (fallback.bottom + 1) & ~1);
+		}
+		else if (currentBoundsProof && input.excludedBandsPixelSafe &&
+			result.state.fallbackBoundsAvailable &&
+			ContainedBounds(result.state.fallbackBounds, input.observation))
+		{
+			// Bars are clear again. Keep the outward envelope until the existing
+			// adjacent-source recovery proof permits the inward return.
+			fallback = result.state.fallbackBounds;
+		}
+		if (result.state.fallbackBoundsAvailable)
+		{
+			// Never pump inward/outward with small extent changes during one
+			// unresolved episode. Larger real content is exposed immediately.
+			const auto& held = result.state.fallbackBounds;
+			fallback.left = std::min(fallback.left, held.left);
+			fallback.top = std::min(fallback.top, held.top);
+			fallback.right = std::max(fallback.right, held.right);
+			fallback.bottom = std::max(fallback.bottom, held.bottom);
+		}
+		fallback.trustedBarAxes = ActivePictureBounds::BarAxes::NONE;
+		fallback.aspectRatio = double(fallback.right - fallback.left) /
+			std::max(1, fallback.bottom - fallback.top);
+		result.state.fallbackBoundsAvailable = true;
+		result.state.fallbackBounds = fallback;
 		result.presentation = {};
-		result.presentation.sourceBounds = FullRaster(crop.rasterWidth, crop.rasterHeight);
-		result.presentation.reason = "full raster retained pending current crop recovery proof";
+		result.presentation.sourceBounds = fallback;
+		result.boundedPresentation = fallback.left > 0 || fallback.top > 0 ||
+			fallback.right < crop.rasterWidth || fallback.bottom < crop.rasterHeight;
+		result.presentation.applyCrop = result.boundedPresentation;
+		result.presentation.outwardExpanded = result.boundedPresentation;
+		result.presentation.owner = result.boundedPresentation
+			? DecisionOwner::OUTWARD_FIT : DecisionOwner::FULL_RASTER;
+		result.presentation.reason = result.boundedPresentation
+			? (fallbackRevalidatedForContract
+                ? "current pixel-safe envelope retained across trusted crop change"
+                : "current pixel-bounded expansion retained pending inward crop recovery proof")
+			: "full raster retained pending current crop recovery proof";
+		return result;
+	}
+
+
+	CropPresentationAdmissionDecision AdmitCropPresentation(
+		const CropPresentationAdmissionState& previous,
+		const Input& input, const Decision& candidate,
+		uint64_t presentationEpoch)
+	{
+		CropPresentationAdmissionDecision result;
+		result.state = previous;
+		result.presentation = candidate;
+		if (!input.automaticCropEnabled || input.fullRasterPresentationAuthoritative ||
+			(result.state.available &&
+			 (result.state.sourceGeneration != input.frameSourceGeneration ||
+			  result.state.presentationEpoch != presentationEpoch ||
+			  result.state.trustedCrop.rasterWidth != input.rasterWidth ||
+			  result.state.trustedCrop.rasterHeight != input.rasterHeight)))
+			result.state = {};
+        // Logical admission survives temporary withdrawal; the last displayed
+        // fit does not. Clear it on every attempt, including blocked/no-crop.
+        result.state.outwardPresentationAvailable = false;
+        result.state.outwardPresentation = {};
+        result.state.presentationSourceSequence = 0;
+		if (!candidate.applyCrop) return result;
+
+		// Evaluate (and then recovery) already validated this candidate. A
+		// retention owner is permission to reuse an admitted picture contract,
+		// not permission to acquire one. In particular, subtitle confirmation
+		// must wait for picture authority instead of manufacturing it.
+		const bool previouslyPresented = result.state.available &&
+			SameTrustedCropContract(result.state.trustedCrop, input.geometry);
+		// Only resolved picture/fit/translation owners may introduce a new
+		// presentation. A freshly published detector rectangle does not turn
+		// a pending retention owner into acquisition proof.
+		const bool retentionOnly = candidate.owner != DecisionOwner::TRUSTED_CROP &&
+			candidate.owner != DecisionOwner::OUTWARD_FIT &&
+			candidate.owner != DecisionOwner::VERTICAL_TRANSLATION;
+		if ((!input.latestObservationSupportsCrop || retentionOnly) && !previouslyPresented)
+		{
+			result.blocked = true;
+			result.presentation = {};
+			result.presentation.sourceBounds = FullRaster(input.rasterWidth, input.rasterHeight);
+			result.presentation.reason =
+				"unpresented crop requires current picture acquisition authority";
+			return result;
+		}
+		// Current visible pixels are a veto, never new authority. Check the final
+		// resolved rectangle, so a complete caption/FIT envelope still acquires.
+		// Established contracts keep their existing bounded overlay handling.
+		const bool currentVisibleWitness = input.currentVisibleBoundsAvailable &&
+			input.frameSourceGeneration != 0 && input.frameSourceSequence != 0 &&
+			input.currentVisibleSourceGeneration == input.frameSourceGeneration &&
+			input.currentVisibleSourceSequence == input.frameSourceSequence &&
+			SameTrustedCropContract(input.currentVisibleBase, input.geometry) &&
+			ValidBounds(input.currentVisibleBounds, input.rasterWidth, input.rasterHeight) &&
+			ContainedBounds(input.currentVisibleBounds, input.geometry);
+		if (!previouslyPresented && currentVisibleWitness &&
+			!ContainedBounds(candidate.sourceBounds, input.currentVisibleBounds))
+		{
+			result.blocked = true;
+			result.presentation = {};
+			result.presentation.sourceBounds = FullRaster(input.rasterWidth, input.rasterHeight);
+			result.presentation.reason = "unpresented crop excludes current visible pixels";
+			return result;
+		}
+		result.state.available = true;
+		result.state.trustedCrop = input.geometry;
+		result.state.sourceGeneration = input.frameSourceGeneration;
+		result.state.presentationEpoch = presentationEpoch;
+        result.state.outwardPresentationAvailable = candidate.outwardExpanded &&
+            candidate.owner == DecisionOwner::OUTWARD_FIT;
+        if (result.state.outwardPresentationAvailable)
+        {
+            result.state.outwardPresentation = candidate.sourceBounds;
+            result.state.presentationSourceSequence = input.frameSourceSequence;
+        }
 		return result;
 	}
 
@@ -2529,6 +3517,29 @@ namespace AlphaSourceCrop
 				ActivePictureClassification::FULL_RASTER_TRUSTED
 				? "shared authority is full raster"
 				: "shared geometry lacks crop authority";
+			return decision;
+		}
+        if (input.movingPictureTransition)
+        {
+            if (HasCurrentMovingPictureHold(input))
+            {
+                decision.sourceBounds = input.geometry;
+                decision.applyCrop = true;
+                decision.owner = DecisionOwner::MOVING_PICTURE_HOLD;
+                decision.reason = "established crop retained while moving picture edges settle";
+            }
+            else
+                decision.reason = "moving picture hold unavailable, stale, or conflicting";
+            return decision;
+        }
+		if (HasCurrentPictureTransitionHandoff(input))
+		{
+			// Preserve the old admitted contract; do not acquire the candidate,
+			// apply subtitle padding, or bypass recovery/final admission.
+			decision.sourceBounds = input.geometry;
+			decision.applyCrop = true;
+			decision.owner = DecisionOwner::PICTURE_CONFIRMATION;
+			decision.reason = "broad picture transition awaiting model publication";
 			return decision;
 		}
 		// Horizontal visibility and vertical subtitle ownership are independent.
@@ -2966,4 +3977,39 @@ namespace AlphaSourceCrop
 			input.retainedMappingCompatible;
 		return decision;
 	}
+    GuardedSceneHoldDecision EvaluateGuardedSceneHold(const GuardedSceneHoldInput& input, bool committed)
+    {
+        GuardedSceneHoldDecision result;
+        result.hold = input.hold;
+        const auto& base = input.currentNativeBase;
+        const auto sameReference = [](const ActivePictureBounds& a, const ActivePictureBounds& b)
+        {
+            return SameBounds(a, b) && a.trustedBarAxes == b.trustedBarAxes;
+        };
+        // Full raster is a legitimate native reference with no cropped axes.
+        const bool fullRaster = base.left == 0 && base.top == 0 &&
+            base.right == base.rasterWidth && base.bottom == base.rasterHeight;
+        if (!input.certificateAvailable || input.cutOrDiscontinuity || input.hold.nlsActive ||
+            !input.currentNativeAvailable || !input.currentGeneration ||
+            !ValidBounds(base, base.rasterWidth, base.rasterHeight) ||
+            (!fullRaster && !HasAuthorityForCroppedAxes(base, base.rasterWidth, base.rasterHeight)) ||
+            !sameReference(base, input.nominationBase))
+            return result;
+        if (input.hold.cropActive && (!input.snapshotAvailable ||
+            input.snapshotGeneration != input.currentGeneration ||
+            !sameReference(input.snapshotBounds, base)))
+            return result;
+        // A hold bounds use of old geometry; it must not postpone verification
+        // of fresh complete source-frame proof for that same reference.
+        result.mayVerify = true;
+        if (committed)
+        {
+            // The caller sets this only after current pixel/history validation
+            // and ordinary presentation-owner admission actually commit.
+            result.clearSnapshot = true;
+            result.hold = {};
+        }
+        return result;
+    }
+
 }

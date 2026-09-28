@@ -7,6 +7,7 @@
  */
 
 #pragma once
+#include <ConfigurationLiveApply.h>
 
 
 
@@ -673,9 +674,9 @@ protected:
 	
 
 	CString m_defaultRendererName;
-	bool m_frameOffsetAutoStart = false;
-	CString m_defaultFrameOffset = TEXT("90");
-	int m_directShowFrameOffsetMs = 90;
+	bool m_frameOffsetAutoStart = true;
+	CString m_defaultFrameOffset = std::to_wstring(ConfigurationLiveApply::DefaultDirectShowFrameOffsetMs).c_str();
+	int m_directShowFrameOffsetMs = ConfigurationLiveApply::DefaultDirectShowFrameOffsetMs;
 	bool m_alphaFrameOffsetDisabled = false;
 	CString m_defaultQueueSize = TEXT("32");
 	size_t m_profileBaseQueueCapacity = 32;
@@ -831,9 +832,8 @@ protected:
 	EventActionLauncher::PendingActionCoalescer m_unifiedActionCoalescer;
 	std::mutex m_profileActionLaunchMutex;
 	std::atomic<uint64_t> m_profileActionDebounceGeneration = 0;
-	// Profile actions are serialized. This flag lets us ignore profile changes
-	// caused by a running action's own keyboard injection, while still allowing
-	// an explicit cycle request to replace the pending final selection.
+	// Profile actions are serialized. Only Rendering-profile feedback is filtered
+	// while a script runs; independent screen/color/queue intent stays eligible.
 	std::atomic<bool> m_profileActionProcessActive = false;
 	std::vector<std::thread> m_unifiedActionWorkers;
 	std::map<WORD, CString> m_unifiedProfileShortcutKeys;
