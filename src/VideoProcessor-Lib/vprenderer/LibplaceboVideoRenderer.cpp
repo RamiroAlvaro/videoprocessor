@@ -3,6 +3,7 @@
 #include "LibplaceboVideoRenderer.h"
 #include <vprenderer/PresentationResetEpoch.h>
 #include <vprenderer/ViewportIntentMailbox.h>
+#include <vprenderer/NvidiaBt2020Reporter.h>
 
 #include <ConfigFile.h>
 #include <DisplayRefreshRatePolicy.h>
@@ -494,14 +495,6 @@ namespace
 	std::mutex g_runtimeDisplayRuleMutex;
 	std::string g_runtimeManualDisplayRule;
 
-	std::string NvApiStatusText(NvAPI_Status status)
-	{
-		NvAPI_ShortString text{};
-		if (NvAPI_GetErrorMessage(status, text) == NVAPI_OK)
-			return text;
-		return std::to_string(static_cast<int>(status));
-	}
-
 	std::string NarrowDisplayName(const wchar_t* value)
 	{
 		if (!value || !*value)
@@ -514,201 +507,6 @@ namespace
 		result.pop_back();
 		return result;
 	}
-
-	class NvidiaBt2020Reporter
-	{
-	public:
-		~NvidiaBt2020Reporter()
-		{
-			if (!Restore())
-			{
-				DebugLog::Log(
-					"NVIDIA BT.2020 report: final AVI InfoFrame restore "
-					"failed for %s; residual driver state is unverified",
-					m_displayName.c_str());
-				Shutdown();
-			}
-		}
-
-		bool IsActive() const { return m_active; }
-		bool IsReadbackVerified() const { return m_readbackVerified; }
-
-		bool Enable(const wchar_t* displayName)
-		{
-			const std::string name = NarrowDisplayName(displayName);
-			if (name.empty())
-			{
-				DebugLog::Log("NVIDIA BT.2020 report: display name unavailable; BT.2020 rendering continues without NVIDIA signaling");
-				return false;
-			}
-			if (m_active && name == m_displayName)
-				return true;
-			if (!Restore())
-			{
-				DebugLog::Log(
-					"NVIDIA BT.2020 report: refusing a new target while "
-					"the previous AVI InfoFrame restore remains pending");
-				return false;
-			}
-
-			NvAPI_Status status = NvAPI_Initialize();
-			if (status != NVAPI_OK)
-			{
-				DebugLog::Log("NVIDIA BT.2020 report: NvAPI_Initialize failed: %s; BT.2020 rendering continues", NvApiStatusText(status).c_str());
-				return false;
-			}
-			m_initialized = true;
-			status = NvAPI_DISP_GetDisplayIdByDisplayName(name.c_str(), &m_displayId);
-			if (status != NVAPI_OK)
-			{
-				DebugLog::Log("NVIDIA BT.2020 report: display %s lookup failed: %s; BT.2020 rendering continues", name.c_str(), NvApiStatusText(status).c_str());
-				Shutdown();
-				return false;
-			}
-
-			m_originalInfoFrame = {};
-			m_originalInfoFrame.version = NV_INFOFRAME_DATA_VER;
-			m_originalInfoFrame.size = sizeof(m_originalInfoFrame);
-			m_originalInfoFrame.cmd = NV_INFOFRAME_CMD_GET;
-			m_originalInfoFrame.type = INFOFRAME_TYPE_AVI;
-			status = NvAPI_Disp_InfoFrameControl(m_displayId, &m_originalInfoFrame);
-			if (status != NVAPI_OK)
-			{
-				DebugLog::Log("NVIDIA BT.2020 report: AVI InfoFrame read failed for %s: %s; BT.2020 rendering continues", name.c_str(), NvApiStatusText(status).c_str());
-				Shutdown();
-				return false;
-			}
-
-			NV_INFOFRAME_DATA requested = m_originalInfoFrame;
-			requested.cmd = NV_INFOFRAME_CMD_SET;
-			requested.type = INFOFRAME_TYPE_AVI;
-			requested.infoframe.video.colorimetry =
-				NV_INFOFRAME_FIELD_VALUE_AVI_COLORIMETRY_USE_EXTENDED_COLORIMETRY;
-			// CTA-861 extended-colorimetry value 6 identifies BT.2020
-			// RGB/Y'C'bC'r. The NVAPI header retains its historical RESERVED06
-			// name even though this is the value used by the NVIDIA InfoFrame
-			// path that madVR relies upon.
-			requested.infoframe.video.extendedColorimetry =
-				NV_INFOFRAME_FIELD_VALUE_AVI_EXTENDEDCOLORIMETRY_RESERVED06;
-			status = NvAPI_Disp_InfoFrameControl(m_displayId, &requested);
-			if (status != NVAPI_OK)
-			{
-				DebugLog::Log("NVIDIA BT.2020 report: AVI InfoFrame SET failed for %s: %s; BT.2020 rendering continues", name.c_str(), NvApiStatusText(status).c_str());
-				Shutdown();
-				return false;
-			}
-
-			NV_INFOFRAME_DATA verified{};
-			verified.version = NV_INFOFRAME_DATA_VER;
-			verified.size = sizeof(verified);
-			verified.cmd = NV_INFOFRAME_CMD_GET;
-			verified.type = INFOFRAME_TYPE_AVI;
-			status = NvAPI_Disp_InfoFrameControl(m_displayId, &verified);
-			const bool readbackMatches =
-				status == NVAPI_OK &&
-				verified.infoframe.video.colorimetry ==
-					NV_INFOFRAME_FIELD_VALUE_AVI_COLORIMETRY_USE_EXTENDED_COLORIMETRY &&
-				verified.infoframe.video.extendedColorimetry ==
-					NV_INFOFRAME_FIELD_VALUE_AVI_EXTENDEDCOLORIMETRY_RESERVED06;
-			const LibplaceboOutput::OneShotSignalAcceptance acceptance =
-				LibplaceboOutput::ClassifyOneShotSignal(
-					true, status == NVAPI_OK, readbackMatches);
-			if (acceptance !=
-				LibplaceboOutput::OneShotSignalAcceptance::READBACK_VERIFIED)
-			{
-				// SET is a one-shot InfoFrame flushed to the display. A later GET
-				// is valuable evidence, but some driver versions report their
-				// automatic state rather than the one-shot value. Do not undo a
-				// successful physical transmission solely for that reason.
-				m_active = true;
-				m_readbackVerified = false;
-				m_displayName = name;
-				DebugLog::Log("NVIDIA BT.2020 report: AVI InfoFrame SET accepted for %s but GET did not echo the one-shot value status=%s colorimetry=%u extended=%u; retaining BT.2020 signal with unverified readback", name.c_str(), NvApiStatusText(status).c_str(), static_cast<unsigned int>(verified.infoframe.video.colorimetry), static_cast<unsigned int>(verified.infoframe.video.extendedColorimetry));
-				return true;
-			}
-
-			m_active = true;
-			m_readbackVerified = true;
-			m_displayName = name;
-			DebugLog::Log("NVIDIA BT.2020 report: AVI InfoFrame enabled on %s display_id=0x%08X previous_colorimetry=%u previous_extended=%u verified_colorimetry=%u verified_extended=%u", name.c_str(), m_displayId, static_cast<unsigned int>(m_originalInfoFrame.infoframe.video.colorimetry), static_cast<unsigned int>(m_originalInfoFrame.infoframe.video.extendedColorimetry), static_cast<unsigned int>(verified.infoframe.video.colorimetry), static_cast<unsigned int>(verified.infoframe.video.extendedColorimetry));
-			return true;
-		}
-
-		bool Restore()
-		{
-			if (!m_active)
-			{
-				Shutdown();
-				return true;
-			}
-
-			// A modeset can invalidate the NvAPI display ID. Resolve the saved
-			// display name again immediately before the restoration SET.
-			NvU32 currentDisplayId = 0;
-			NvAPI_Status status = NvAPI_DISP_GetDisplayIdByDisplayName(
-				m_displayName.c_str(), &currentDisplayId);
-			if (status != NVAPI_OK)
-			{
-				DebugLog::Log(
-					"NVIDIA BT.2020 report: AVI InfoFrame restore pending "
-					"for %s because display lookup failed: %s",
-					m_displayName.c_str(), NvApiStatusText(status).c_str());
-				return false;
-			}
-			m_displayId = currentDisplayId;
-
-			NV_INFOFRAME_DATA restore = m_originalInfoFrame;
-			restore.cmd = NV_INFOFRAME_CMD_SET;
-			restore.type = INFOFRAME_TYPE_AVI;
-			status = NvAPI_Disp_InfoFrameControl(m_displayId, &restore);
-			DebugLog::Log("NVIDIA BT.2020 report: AVI InfoFrame restore on %s display_id=0x%08X colorimetry=%u extended=%u result=%s", m_displayName.c_str(), m_displayId, static_cast<unsigned int>(restore.infoframe.video.colorimetry), static_cast<unsigned int>(restore.infoframe.video.extendedColorimetry), NvApiStatusText(status).c_str());
-			if (status != NVAPI_OK)
-			{
-				DebugLog::Log(
-					"NVIDIA BT.2020 report: restore remains pending; "
-					"ownership is retained for retry");
-				return false;
-			}
-
-			m_active = false;
-			m_readbackVerified = false;
-			m_displayName.clear();
-			Shutdown();
-			return true;
-		}
-
-		void AbandonPendingRestoreForShutdown()
-		{
-			if (m_active)
-			{
-				DebugLog::Log(
-					"NVIDIA BT.2020 report: pending AVI InfoFrame restore "
-					"released for application shutdown target=%s "
-					"external_state=unverified",
-					m_displayName.c_str());
-			}
-			m_active = false;
-			m_readbackVerified = false;
-			m_displayName.clear();
-			Shutdown();
-		}
-
-	private:
-		void Shutdown()
-		{
-			if (m_initialized)
-				NvAPI_Unload();
-			m_initialized = false;
-		}
-
-		bool m_initialized = false;
-		bool m_active = false;
-		bool m_readbackVerified = false;
-		NvU32 m_displayId = 0;
-		std::string m_displayName;
-		NV_INFOFRAME_DATA m_originalInfoFrame{};
-		static constexpr NvU8 INFOFRAME_TYPE_AVI = 2;
-	};
 
 	std::string ShaderCachePath()
 	{
@@ -1000,6 +798,7 @@ namespace
         std::string configurationPath;
 		std::string sdrTargetPrimaries = "rec709";
 		bool reportBt2020ToDisplay = false;
+
 		std::string sdrInputTransfer = "2.4";
 		// SDR gamma conversion is opt-in and independent of HDR tone mapping.
 		std::string sdrAdjustGamma = "passthrough";
@@ -3792,7 +3591,7 @@ struct LibplaceboVideoRenderer::Impl
 		}
 	}
 	bool reportBt2020ToDisplay = false;
-	bool bt2020SignalingFailed = false;
+	uint64_t nextSignalTargetCheckTick = 0;
 	std::wstring negotiatedDisplayDeviceName;
 	NvidiaBt2020Reporter nvidiaBt2020Reporter;
 	bool swapchainBlit = true;
@@ -3896,6 +3695,7 @@ struct LibplaceboVideoRenderer::Impl
 	ActivePicturePresentationRetentionEvidence latestCropRetentionEvidence;
 	AlphaSourceCrop::PresentationRecoveryState cropPresentationRecovery;
 	AlphaSourceCrop::CropPresentationAdmissionState cropPresentationAdmission;
+    bool weakFringeFillPreviouslyRetained = false;
 	bool cropAdmissionPreviouslyBlocked = false;
 	std::string cropAdmissionPreviousReason;
 	uint64_t cropAdmissionLastLogTick = 0;
@@ -6214,6 +6014,23 @@ struct LibplaceboVideoRenderer::Impl
 		return true;
 	}
 
+	void RequestBt2020Signal(bool restart)
+	{
+		// Re-resolve the presentation output on every profile/mode transition.
+		// A failed lookup must never reuse a stale name or fall back to primary.
+		std::string target;
+		CComPtr<IDXGISwapChain> native;
+		if (vpOwnedSwapchain)
+			native = vpOwnedSwapchain;
+		else if (swapchain)
+			// unwrap returns an owned reference; adopt it so each poll releases it.
+			native.Attach(pl_d3d11_swapchain_unwrap(swapchain));
+		CComPtr<IDXGIOutput> output;
+		DXGI_OUTPUT_DESC desc{};
+		if (native && SUCCEEDED(native->GetContainingOutput(&output)) && output &&
+			SUCCEEDED(output->GetDesc(&desc))) target = NarrowDisplayName(desc.DeviceName);
+		nvidiaBt2020Reporter.Request(target, TargetIsBt2020() && reportBt2020ToDisplay, restart);
+	}
 	void ConfigureSwapchainOutput(const char* trigger)
 	{
 		using namespace LibplaceboOutput;
@@ -6616,25 +6433,7 @@ struct LibplaceboVideoRenderer::Impl
 			actualOutput.safeToRender ? 1 : 0,
 			actualOutput.reason.c_str());
 
-		if (TargetIsBt2020() && reportBt2020ToDisplay)
-		{
-			if (!nvidiaBt2020Reporter.Enable(negotiatedDisplayDeviceName.c_str()))
-			{
-				// HDMI reporting is optional metadata. Preserve the selected BT.2020
-				// render target and the proven P709 transport if it is unavailable.
-				DebugLog::Log(
-					"libplacebo: NVIDIA BT.2020 InfoFrame SET failed; retaining the BT.2020 target with P709 transport and marking HDMI signaling unavailable");
-				reportBt2020ToDisplay = false;
-				bt2020SignalingFailed = true;
-			}
-			else
-				bt2020SignalingFailed = false;
-		}
-		else
-		{
-			nvidiaBt2020Reporter.Restore();
-			bt2020SignalingFailed = false;
-		}
+		RequestBt2020Signal(true);
         WindowsDisplayDiagnostics::Log(videoHwnd, "vp-after-colorspace", L"VP Renderer", this, nativeSwapchain);
 	}
 
@@ -7083,7 +6882,6 @@ struct LibplaceboVideoRenderer::Impl
 				: settings.sdrTargetPrimaries == "p3_d65"
 					? LibplaceboOutput::SdrTargetPrimaries::P3_D65
 					: LibplaceboOutput::SdrTargetPrimaries::REC709;
-		bt2020SignalingFailed = false;
 		const LibplaceboOutput::SdrOutputContract outputContract =
 			LibplaceboOutput::MakeSdrOutputContract(
 				outputRequest, requestedTarget, settings.reportBt2020ToDisplay);
@@ -7700,7 +7498,6 @@ struct LibplaceboVideoRenderer::Impl
 		outputDiagnostics = settings.outputDiagnostics;
 		targetPrimaries = contract.target;
 		reportBt2020ToDisplay = contract.reportBt2020ToDisplay;
-		bt2020SignalingFailed = false;
 		// F5/F6 retain the already negotiated P709/sRGB transport. Do not replace
 		// observed output state with a newly requested plan, and do not submit a
 		// lazy swapchain color hint without a matching output negotiation. The
@@ -7719,18 +7516,7 @@ struct LibplaceboVideoRenderer::Impl
 		ConfigureRenderParams(settings, "live profile update");
 		PublishSettingsState(settings);
 
-		if (TargetIsBt2020() && reportBt2020ToDisplay)
-		{
-			if (!nvidiaBt2020Reporter.Enable(negotiatedDisplayDeviceName.c_str()))
-			{
-				reportBt2020ToDisplay = false;
-				bt2020SignalingFailed = true;
-			}
-		}
-		else
-		{
-			nvidiaBt2020Reporter.Restore();
-		}
+		RequestBt2020Signal(false);
 		DebugLog::Log(
 			"libplacebo profile settings applied live: target=%s luminance=%.1f nits black=%.4f nits LUT=%s processing=updated negotiated_output=preserved DXGI_transport=P709/sRGB NVIDIA_AVI=%s swapchain_recreated=0",
 			TargetPrimariesName(),
@@ -10192,6 +9978,12 @@ struct LibplaceboVideoRenderer::Impl
 			std::lock_guard<std::mutex> guard(ingressStatusMutex);
 			ingressStatus = std::move(status);
 		};
+		const uint64_t signalTick = GetTickCount64();
+		if (signalTick >= nextSignalTargetCheckTick)
+		{
+			nextSignalTargetCheckTick = signalTick + 1000;
+			RequestBt2020Signal(false);
+		}
 		const HMONITOR currentMonitor = MonitorFromWindow(
 			videoHwnd,
 			MONITOR_DEFAULTTONEAREST);
@@ -12040,6 +11832,37 @@ struct LibplaceboVideoRenderer::Impl
 			episodeInput.presentationEpoch = viewportRequestSerial;
 			episodeInput.sourceGeneration = frameGeneration;
 			episodeInput.sourceSequence = sourceSequence;
+            AlphaSourceCrop::AspectLimitFillInput configuredFillInput;
+            configuredFillInput.cropNarrowerContentToFillScreen = cropNarrowerContentToFillScreen;
+            configuredFillInput.narrowerLimitConfigured = cropNarrowerContentAspectLimitConfigured;
+            configuredFillInput.narrowerAspectLimit = cropNarrowerContentAspectLimit;
+            configuredFillInput.cropWiderContentToFillScreen = cropWiderContentToFillScreen;
+            configuredFillInput.widerLimitConfigured = cropWiderContentAspectLimitConfigured;
+            configuredFillInput.widerAspectLimit = cropWiderContentAspectLimit;
+            configuredFillInput.screenAspect = configuredScreenAspect;
+            auto fringeFillInput = configuredFillInput;
+            fringeFillInput.trustedContentAuthorityAccepted = episodeInput.trustedCropAvailable;
+            fringeFillInput.sourceBounds = fringeFillInput.contentReferenceBounds = episodeInput.trustedCrop;
+            fringeFillInput.contentReferenceAvailable = true;
+            const bool fringeCompetingPresentation = !automaticSourceCrop || !configuredScreenActive ||
+                fixedCropAspectConfigured || nlsRequested || inwardCaptionProtected ||
+                verticalFailOpen || outwardExpansionInvalid || pictureTransitionHandoff.active ||
+                releaseDriftBaseRetention || engageDriftBaseRetention ||
+                verticalTranslationActive || verticalFitActive || scopeSubtitleTranslationConfirmation.confirmations != 0 ||
+                scopeSubtitleFitConfirmation.confirmations != 0 || cropPresentationRecovery.active ||
+                scopeVerticalInspectionBridge.active || scopeVerticalInspectionBridge.failOpenLatched ||
+                movingPictureTransition.active || movingPictureTransition.awaitingPublication;
+            episodeInput.weakFringeFillRetained = AlphaSourceCrop::CanRetainWeakFringeWithFill(
+                episodeInput, cropPresentationAdmission, fringeFillInput,
+                latestCropRetentionEvidence.IsWeakBoundedFringe(episodeInput.trustedCrop),
+                fringeCompetingPresentation);
+            if (episodeInput.weakFringeFillRetained != weakFringeFillPreviouslyRetained)
+                DebugLog::Log("Alpha weak-fringe fill retention: instance=%s generation=%llu sequence=%llu epoch=%llu retained=%d base=%d,%d-%d,%d reason=\"two weak source rows; established optional fill\"",
+                    diagnosticInstanceId.c_str(), frameGeneration, sourceSequence, viewportRequestSerial,
+                    episodeInput.weakFringeFillRetained ? 1 : 0,
+                    episodeInput.trustedCrop.left, episodeInput.trustedCrop.top,
+                    episodeInput.trustedCrop.right, episodeInput.trustedCrop.bottom);
+            weakFringeFillPreviouslyRetained = episodeInput.weakFringeFillRetained;
 			const AlphaSourceCrop::NearBlackPresentationEpisodeDecision
 				episodeDecision =
 					AlphaSourceCrop::EvaluateNearBlackPresentationEpisode(
@@ -12128,8 +11951,7 @@ struct LibplaceboVideoRenderer::Impl
 			}
 			nearBlackPresentationEpisode = episodeDecision.state;
 			const bool nearBlackEpisodeRetainCrop =
-				nearBlackPresentationEpisode.mode ==
-					AlphaSourceCrop::NearBlackPresentationMode::RETAIN_CROP;
+				AlphaSourceCrop::NearBlackEpisodeOwnsCropThisFrame(episodeDecision);
 			const bool nearBlackEpisodeFullRaster =
 				episodeDecision.resetTrustedGeometry ||
 				nearBlackPresentationEpisode.mode ==
@@ -12373,7 +12195,7 @@ struct LibplaceboVideoRenderer::Impl
 				verticalFitConfirmationPending || verticalTranslationActive ||
 				verticalFitActive;
 			inspectionInput.samplingRetentionResolved = currentSamplingRetention;
-			inspectionInput.containedRetentionResolved = currentContainedInspectionRetention;
+			inspectionInput.containedRetentionResolved = currentContainedInspectionRetention || AlphaSourceCrop::NearBlackEpisodeResolvesInspection(episodeDecision);
 			inspectionInput.cropAuthorityResolved = effectiveLatestSupportsCrop;
 			inspectionInput.fullRasterAuthorityResolved =
 				latestActivePictureEvidenceClassification ==
@@ -12422,6 +12244,26 @@ struct LibplaceboVideoRenderer::Impl
 			const auto recoveryDecision = AlphaSourceCrop::EvaluatePresentationRecovery(recoveryInput);
 			cropPresentationRecovery = recoveryDecision.state;
 			cropDecision = recoveryDecision.presentation;
+			// The episode still owns recovery timing. Only replace its full-raster
+			// presentation with an independently current bounded visible envelope.
+			auto nearBlackBoundedInput = recoveryInput;
+			nearBlackBoundedInput.previous = recoveryDecision.state;
+			nearBlackBoundedInput.candidate = cropDecision;
+			const auto nearBlackBoundedDecision = AlphaSourceCrop::EvaluateNearBlackBoundedPresentation(
+				nearBlackPresentationEpisode, nearBlackBoundedInput);
+			if (nearBlackBoundedDecision.state.boundedPresentationAvailable != nearBlackPresentationEpisode.boundedPresentationAvailable ||
+				nearBlackBoundedDecision.state.boundedPresentationFailed != nearBlackPresentationEpisode.boundedPresentationFailed ||
+				(nearBlackBoundedDecision.boundedPresentation &&
+				 !sameBounds(nearBlackBoundedDecision.presentation.sourceBounds, nearBlackPresentationEpisode.boundedPresentation)))
+				DebugLog::Log("Alpha near-black bounded presentation: instance=%s generation=%llu sequence=%llu epoch=%llu bounded=%d failed=%d rect=%d,%d-%d,%d reason=\"%s\"",
+					diagnosticInstanceId.c_str(), frameGeneration, sourceSequence, viewportRequestSerial,
+					nearBlackBoundedDecision.boundedPresentation ? 1 : 0,
+					nearBlackBoundedDecision.state.boundedPresentationFailed ? 1 : 0,
+					nearBlackBoundedDecision.presentation.sourceBounds.left, nearBlackBoundedDecision.presentation.sourceBounds.top,
+					nearBlackBoundedDecision.presentation.sourceBounds.right, nearBlackBoundedDecision.presentation.sourceBounds.bottom,
+					nearBlackBoundedDecision.presentation.reason.c_str());
+			nearBlackPresentationEpisode = nearBlackBoundedDecision.state;
+			cropDecision = nearBlackBoundedDecision.presentation;
 			const auto admissionDecision = AlphaSourceCrop::AdmitCropPresentation(
 				cropPresentationAdmission, cropInput, cropDecision, viewportRequestSerial);
 			const auto admissionLogTick = GetTickCount64();
@@ -12528,7 +12370,8 @@ struct LibplaceboVideoRenderer::Impl
 				aspectLimitFill = AlphaSourceCrop::EvaluateFixedAspectCrop(
 					fixedCropInput);
 			}
-			else if (protectedCaptionFit || nlsPresentationFailOpen || recoveryDecision.boundedPresentation)
+			else if (protectedCaptionFit || nlsPresentationFailOpen || recoveryDecision.boundedPresentation ||
+                nearBlackBoundedDecision.boundedPresentation)
 			{
 				aspectLimitFill.sourceBounds = cropDecision.sourceBounds;
 				aspectLimitFill.reason =
@@ -12556,7 +12399,7 @@ struct LibplaceboVideoRenderer::Impl
 			}
 			else
 			{
-				AlphaSourceCrop::AspectLimitFillInput aspectLimitInput;
+				auto aspectLimitInput = configuredFillInput;
 				// Explicit fill can crop a current trusted full raster (for example
 				// 16:9 content on a 2.35:1 screen) as well as a trusted detected
 				// active picture, including an explicitly admitted presentation hold.
@@ -12564,19 +12407,6 @@ struct LibplaceboVideoRenderer::Impl
 				aspectLimitInput.trustedContentAuthorityAccepted =
 					cropDecision.applyCrop ||
 					cropInput.fullRasterPresentationAuthoritative;
-				aspectLimitInput.cropNarrowerContentToFillScreen =
-					cropNarrowerContentToFillScreen;
-				aspectLimitInput.narrowerLimitConfigured =
-					cropNarrowerContentAspectLimitConfigured;
-				aspectLimitInput.narrowerAspectLimit =
-					cropNarrowerContentAspectLimit;
-				aspectLimitInput.cropWiderContentToFillScreen =
-					cropWiderContentToFillScreen;
-				aspectLimitInput.widerLimitConfigured =
-					cropWiderContentAspectLimitConfigured;
-				aspectLimitInput.widerAspectLimit =
-					cropWiderContentAspectLimit;
-				aspectLimitInput.screenAspect = configuredScreenAspect;
 				aspectLimitInput.sourceBounds = cropDecision.sourceBounds;
                 aspectLimitInput.contentReferenceAvailable = true;
                 if (cropInput.fullRasterPresentationAuthoritative)
@@ -12589,6 +12419,18 @@ struct LibplaceboVideoRenderer::Impl
 				aspectLimitFill = AlphaSourceCrop::EvaluateAspectLimitFill(
 					aspectLimitInput);
 			}
+            // Keep only an actually applied optional fill on this admitted native base.
+            // Recording presentation never publishes or refreshes detector authority.
+            cropPresentationAdmission.optionalFillApplied = aspectLimitFill.applied &&
+                cropDecision.applyCrop && !fixedCropAspectConfigured && !nlsRequested &&
+                !protectedCaptionFit && !cropDecision.outwardExpanded && !cropDecision.verticallyTranslated &&
+                !cropInput.movingPictureTransition && !recoveryDecision.state.active &&
+                episodeInput.trustedCropOrigin == ActivePictureAuthorityOrigin::NATIVE &&
+                sameBounds(cropDecision.sourceBounds, cropInput.geometry);
+            cropPresentationAdmission.optionalFillSourceBounds = cropPresentationAdmission.optionalFillApplied
+                ? aspectLimitFill.sourceBounds : ActivePictureBounds{};
+            cropPresentationAdmission.optionalFillSourceSequence = sourceSequence;
+            cropPresentationAdmission.optionalFillScreenAspect = configuredScreenAspect;
 			const ActivePictureBounds& presentationCropBounds =
 				aspectLimitFill.applied ? aspectLimitFill.sourceBounds :
 				cropDecision.sourceBounds;
@@ -15938,33 +15780,10 @@ bool LibplaceboVideoRenderer::GetOutputModeInfo(CString& details) const
 		}
 	};
 	CStringA value;
-	const char* outputSignal = "Rec.709";
-	const char* outputTarget = m_impl->TargetIsBt2020()
-		? (m_impl->reportBt2020ToDisplay
-			? (m_impl->nvidiaBt2020Reporter.IsReadbackVerified()
-				? "SDR BT.2020 / HDMI BT.2020 (verified)"
-				: (m_impl->nvidiaBt2020Reporter.IsActive()
-					? "SDR BT.2020 / HDMI BT.2020 (SET)"
-					: "SDR BT.2020 / HDMI signal unavailable"))
-			: (m_impl->bt2020SignalingFailed
-				? "SDR BT.2020 / HDMI signal unavailable"
-				: "SDR BT.2020 / display manual"))
-		: (m_impl->TargetIsP3D65() ? "SDR P3-D65 / display manual" : "SDR Rec.709");
-	if (m_impl->TargetIsBt2020())
-	{
-		if (m_impl->reportBt2020ToDisplay)
-		{
-			outputSignal = m_impl->nvidiaBt2020Reporter.IsReadbackVerified()
-				? "BT.2020 (verified)"
-				: (m_impl->nvidiaBt2020Reporter.IsActive()
-					? "BT.2020 (set)" : "BT.2020 (unavailable)");
-		}
-		else
-		{
-			outputSignal = m_impl->bt2020SignalingFailed
-				? "BT.2020 (unavailable)" : "BT.2020 (manual)";
-		}
-	}
+	const std::string signalStatus = m_impl->nvidiaBt2020Reporter.Status();
+	const char* outputSignal = signalStatus.c_str();
+	const char* outputTarget = m_impl->TargetIsBt2020() ? "SDR BT.2020" :
+		(m_impl->TargetIsP3D65() ? "SDR P3-D65 / display manual" : "SDR Rec.709");
 	value.Format(
 		"Target %s | Req %s/%s/%s/%s -> %s/%s/%s/%s",
 		outputTarget,
@@ -16192,8 +16011,7 @@ bool LibplaceboVideoRenderer::GetOutputContractStatus(
         << "\nLUT: " << m_impl->displayLutStatus
         << "; SDR LUT input gamma: " << settings.sdrLutInputGamma
         << "; HDR tone-map target gamma: " << settings.hdrToneMapTargetGamma
-        << "; BT.2020 signaling: " << (!m_impl->reportBt2020ToDisplay ? "not requested / not applicable" :
-            m_impl->bt2020SignalingFailed ? "failed" : "requested (wire unverified)")
+        << "; BT.2020 signaling: " << m_impl->nvidiaBt2020Reporter.Status()
         << "\n" << status.reason;
     status.uiSummary = summary.str();
 	return true;
